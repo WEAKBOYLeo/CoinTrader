@@ -1,0 +1,19 @@
+# CoinTrader 实盘执行器 systemd 单元模板（计划 1.0 T3 / AC-05）。
+# 由 deploy/install-systemd.sh 渲染 @PROJECT_DIR@ 后安装，本模板不得含任何
+# 密钥/绝对路径硬编码（只有占位符）。
+[Unit]
+Description=CoinTrader live executor
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=12
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@PROJECT_DIR@/.venv/bin/python -m cointrader.cli live run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

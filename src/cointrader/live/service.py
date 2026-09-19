@@ -441,6 +441,13 @@ class LiveService:
         self.lease_holder = lease.holder
 
         try:
+            # 重启恢复（§断点重连）：把上次非优雅退出（kill -9/断电）遗留的
+            # RUNNING/RECOVERY 会话补记为 INTERRUPTED。标记失败（StoreError）视为
+            # 账本硬错误，走下方 except 路径（释放锁、关流）拒绝启动。
+            interrupted = self.store.mark_interrupted_sessions(now_ms=int(self._now() * 1000))
+            if interrupted > 0:
+                logger.info("【重启恢复】已标记 %d 个中断会话", interrupted)
+
             # 4. 校准 server time（§3.1/-1021 防线）
             report.time_offset_spot_ms = int(self.spot.calibrate())
             report.time_offset_perp_ms = int(self.futures.calibrate())
@@ -552,6 +559,14 @@ class LiveService:
         """执行一轮主循环。可独立单测（不阻塞、不 sleep）。"""
         if self._state is ServiceState.STOPPED:
             return {"state": "STOPPED"}
+
+        # 单实例锁续期（长跑韧性）：TTL 30s、主循环 5s 间隔，裕量 6 倍。
+        # 刷新失败只告警不崩溃（DB 写坏会在后续步骤自然暴露）。
+        if self.lease_holder is not None:
+            try:
+                self.store.refresh_lease(self.lease_name, self.lease_holder)
+            except StoreError as exc:
+                logger.warning("单实例锁刷新失败（后续写账本会自然暴露）: %s", exc)
 
         # 风控闸门状态同步
         gate_state = self.gate.state
@@ -766,11 +781,35 @@ class LiveService:
             reconcile_ok=self._reconcile_ok,
         )
 
-    def run_forever(self, *, tick_seconds: float = 5.0, stop_check: Callable[[], bool] | None = None) -> None:
-        """阻塞主循环（CLI 用）。stop_check 返回 True 时退出。"""
+    def run_forever(self, *, tick_seconds: float = 5.0, stop_check: Callable[[], bool] | None = None) -> bool:
+        """阻塞主循环（CLI 用）。stop_check 返回 True 时退出。
+
+        长跑容错（§断点重连）：单轮 ``run_once()`` 异常只进 RECOVERY 并计数，
+        不崩溃进程；连续异常达到 ``execution.max_consecutive_tick_errors``
+        时优雅停机并返回 False（CLI 以退出码 1 结束，交给 systemd 重启）。
+        任一轮成功则计数清零。
+
+        Returns:
+            True = 正常停止（stop_check/外部信号）；False = 连续 tick 失败超限。
+        """
+        max_errors = self.config.execution.max_consecutive_tick_errors
+        consecutive_errors = 0
         while not (stop_check and stop_check()):
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception as exc:  # noqa: BLE001 tick 级容错是长跑设计：瞬时故障（网络抖动/瞬时 DB 错误）不得崩溃进程；KeyboardInterrupt 等 BaseException 不被捕获
+                consecutive_errors += 1
+                logger.error("【主循环 tick 异常】连续 %d/%d: %s", consecutive_errors, max_errors, exc)
+                self.enter_recovery(f"主循环 tick 异常: {exc}")
+                if consecutive_errors >= max_errors:
+                    self._on_alert("TICK_LOOP_FAILURE",
+                                   f"连续 {consecutive_errors} 轮 tick 异常，优雅停机等待守护进程重启")
+                    self.stop()
+                    return False
+            else:
+                consecutive_errors = 0
             time.sleep(tick_seconds)
+        return True
 
     # -- 停机 --------------------------------------------------------------
 

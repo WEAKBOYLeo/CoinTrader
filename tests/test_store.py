@@ -200,6 +200,47 @@ class TestLease:
             store.acquire_lease("executor", holder="process-B")
 
 
+class TestRunSessionInterruption:
+    """断点重连：非优雅退出会话的 INTERRUPTED 标记（计划 1.0 T1）。"""
+
+    def _start(self, store: StateStore, run_id: str, started_ms: int) -> None:
+        store.start_run_session(
+            run_id=run_id, started_ms=started_ms, mode="testnet",
+            strategy_version="t", config_hash="h", code_revision="rev",
+            spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+        )
+
+    def test_marks_running_and_recovery_null_sessions(self, store: StateStore) -> None:
+        self._start(store, "run-a", 1000)
+        self._start(store, "run-b", 2000)
+        store.update_run_session("run-a", status="RECOVERY")  # 模拟处于 RECOVERY 时进程被杀
+
+        n = store.mark_interrupted_sessions(now_ms=9000)
+        assert n == 2
+        for run_id in ("run-a", "run-b"):
+            row = store.run_session(run_id)
+            assert row is not None
+            assert row["status"] == "INTERRUPTED"
+            assert row["ended_ms"] == 9000
+            assert row["stop_reason"] == "process_exited_without_graceful_stop"
+
+    def test_closed_sessions_untouched(self, store: StateStore) -> None:
+        self._start(store, "run-a", 1000)
+        store.end_run_session("run-a", ended_ms=5000, status="STOPPED", stop_reason="graceful_stop")
+        self._start(store, "run-b", 6000)
+
+        n = store.mark_interrupted_sessions(now_ms=9000)
+        assert n == 1
+        closed = store.run_session("run-a")
+        assert closed is not None
+        assert closed["status"] == "STOPPED" and closed["ended_ms"] == 5000
+
+    def test_idempotent_second_call_returns_zero(self, store: StateStore) -> None:
+        self._start(store, "run-a", 1000)
+        assert store.mark_interrupted_sessions(now_ms=9000) == 1
+        assert store.mark_interrupted_sessions(now_ms=9100) == 0
+
+
 class TestReconciliationRecord:
     def test_record_reconciliation_roundtrip(self, store: StateStore) -> None:
         result = ReconciliationResult(

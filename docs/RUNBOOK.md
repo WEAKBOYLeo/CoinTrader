@@ -176,6 +176,80 @@ uv run cointrader scenarios --capital 5000 --exchange-exposure 1.0
 如果你只打算用一家交易所，把 `--exchange-exposure` 设为 `1.0`，
 你会看到"交易所暴雷 = 全部损失"，这通常是促使你分散的理由。
 
+### 2.6 长期运行（服务器守护与断点重连）
+
+`live run` 设计为服务器上长期不间断运行：主循环单轮异常只进 RECOVERY 不崩溃；
+进程被 kill -9 / 关机 / 断电后重新拉起即可从上次状态继续（SQLite 事件账本 +
+交易所对账恢复，历史数据零丢失）。
+
+#### 2.6.1 systemd 守护部署与排障
+
+```bash
+# 安装（root；用户级 unit 加 --user）
+deploy/install-systemd.sh install --project-dir /path/to/CoinTrader
+
+# 查看状态 / 日志
+deploy/install-systemd.sh status --project-dir /path/to/CoinTrader
+journalctl -u cointrader -f
+
+# 停止 / 重启（SIGTERM → 优雅停机：关流+释放锁+关闭 run_session）
+systemctl stop cointrader
+systemctl restart cointrader
+
+# 卸载（回到 tmux 手工运行方式）
+deploy/install-systemd.sh uninstall --project-dir /path/to/CoinTrader
+```
+
+排障要点：
+
+- **崩溃循环**：连续 tick 异常达到 `execution.max_consecutive_tick_errors`（默认 10，
+  5s 轮询 ≈ 50s 持续故障）后进程退出码 1，systemd `Restart=always` 拉起并重新
+  预检/对账。若 600s 内重启超过 12 次（`StartLimitBurst=12`）systemd 停止拉起，
+  `journalctl -u cointrader` 看最后错误，修复后 `systemctl reset-failed cointrader && systemctl start cointrader`。
+- **看历史**：`cointrader live status` 的运行连续性块显示当前/历史 run、停止原因、
+  未完结 pair 与锁持有者；`cointrader live pnl --all-runs` 看跨重启的 PnL 汇总。
+
+#### 2.6.2 断点重连演练（kill -9 后重启）
+
+```bash
+# 1. 确认当前 run_id 与数据基线
+cointrader live status
+sqlite3 data/live/trading.sqlite3 "SELECT COUNT(*) FROM orders; SELECT COUNT(*) FROM fills;"
+
+# 2. 非优雅杀掉进程（模拟 kill -9/断电）
+pkill -9 -f 'cointrader.cli live run'
+systemctl start cointrader   # 或重新执行 live run
+
+# 3. 核验：旧会话被标 INTERRUPTED，新会话 RUNNING，数据行数不变
+sqlite3 data/live/trading.sqlite3 \
+  "SELECT run_id,status,stop_reason FROM run_sessions ORDER BY started_ms DESC LIMIT 2;"
+cointrader live status       # 当前 run 已恢复；锁由新实例持有
+```
+
+预期：旧会话 `INTERRUPTED / process_exited_without_graceful_stop`；orders/fills 行数不变；
+持仓从交易所对账恢复（日志「实际持仓」/「重启恢复」行）。
+
+#### 2.6.3 demo ↔ 主网切换检查清单
+
+模式切换四个要素，**缺一不可**（env 覆盖优先级高于 config，但不能绕过任何闸门）：
+
+1. `execution.mode`（config）或 `COINTRADER_EXEC_MODE`（env，精确小写：paper/testnet/shadow/live）；
+2. `COINTRADER_USE_TESTNET`（true=demo/测试网，false=主网）；
+3. `COINTRADER_TRADING_ENABLED`（主网必须精确等于 `YES_I_AM_SURE`）；
+4. `--confirm-live`（主网启动命令行显式确认）。
+
+切换后必做：`cointrader live doctor` 确认「模式（来源）」与「端点」两行符合预期，
+再 `systemctl restart cointrader`。密钥环境变量需对应切换（demo key / 主网 key）。
+
+⚠️ **主网启动前必须走完开发设计文档 §13 完整清单**，本清单不替代 §13。
+
+#### 2.6.4 KILL_SWITCH 在 systemd 下的路径说明
+
+停机开关默认是**相对工作目录**的 `KILL_SWITCH` 文件。systemd 单元的
+`WorkingDirectory` 固定为项目目录，因此 `touch <项目目录>/KILL_SWITCH` 即全局急停。
+若想用绝对路径（任意目录都可触发），在 `.env` 里设 `COINTRADER_KILL_SWITCH_FILE` 为绝对路径。
+急停后恢复仍需重新预检+对账（RECOVERY 不自动解除）。
+
 ---
 
 ## 3. 如何解读回测报告

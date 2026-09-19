@@ -342,6 +342,22 @@ class PnlAggregator:
         now_ms = int(self._now() * 1000)
         rows = self.store.pair_executions(limit=100000)
         pairs = [r for r in rows if str(r.get("run_id") or "") == run_id]
+        return self._aggregate(pairs, quotes=quotes, now_ms=now_ms)
+
+    def for_all_runs(self, *, quotes: dict[str, tuple[Decimal, Decimal]] | None = None) -> PnlSummary:
+        """跨所有 run 聚合（断点重连后的全局视图）：不限 run_id，
+        未平仓 pair 自然跨 run 保留。聚合路径与 ``for_run`` 完全共享。"""
+        now_ms = int(self._now() * 1000)
+        pairs = self.store.pair_executions(limit=100000)
+        return self._aggregate(pairs, quotes=quotes, now_ms=now_ms)
+
+    def _aggregate(
+        self,
+        pairs: list[dict[str, Any]],
+        *,
+        quotes: dict[str, tuple[Decimal, Decimal]] | None,
+        now_ms: int,
+    ) -> PnlSummary:
         per_pair: list[PairPnl] = []
         start_ms, end_ms = now_ms, 0
         for open_row, close_row in self._round_trips(pairs):

@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import contextlib
 import io
+import time
 from pathlib import Path
 
 import pytest
 
 from cointrader.cli import build_parser, cmd_costs, cmd_doctor, main
+from cointrader.config import load_config
+from cointrader.errors import ConfigError
 
 
 class TestParserStructure:
@@ -219,6 +222,207 @@ class TestCostsCommand:
         )
 
         assert "核对" in output
+
+
+class TestLivePnlAllRuns:
+    """live pnl --all-runs（断点重连后的跨 run 视图，计划 1.0 T2 / AC-04）。"""
+
+    def test_all_runs_and_run_id_mutually_exclusive(self) -> None:
+        parser = build_parser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["live", "pnl", "--all-runs", "--run-id", "run-x"])
+        assert exc_info.value.code == 2, "argparse 互斥组应退出码 2"
+
+    def test_all_runs_flag_parsed(self) -> None:
+        args = build_parser().parse_args(["live", "pnl", "--all-runs"])
+        assert args.all_runs is True
+        assert args.run_id is None
+
+    def test_all_runs_output_aggregates_across_runs(self, clean_env, tmp_path: Path) -> None:
+        import json as _json
+
+        from cointrader.cli import cmd_live_pnl
+        from cointrader.execution.store import StateStore
+        from test_pnl import _seed_closed_trip_b, _seed_round_trip
+
+        db = tmp_path / "t.sqlite3"
+        store = StateStore(db)
+        _seed_round_trip(store, run_id="run-a")   # +0.497
+        _seed_closed_trip_b(store)                # run-b −0.003
+        now = int(time.time() * 1000)
+        for run_id, started in (("run-a", now - 2 * 3600_000), ("run-b", now - 3600_000)):
+            store.start_run_session(
+                run_id=run_id, started_ms=started, mode="testnet",
+                strategy_version="t", config_hash="h", code_revision="r",
+                spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+            )
+            store.end_run_session(run_id, ended_ms=started + 1000,
+                                  status="STOPPED", stop_reason="graceful_stop")
+        store.close()
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(
+            cmd_live_pnl,
+            config=config_path,
+            run_id=None,
+            all_runs=True,
+            since="24h",
+            until=None,
+            symbol=None,
+            json=True,
+        )
+        assert code == 0
+        payload = _json.loads(output)
+        assert payload["run_id"] == "ALL"
+        assert len(payload["pnl"]["per_pair"]) == 2
+        from decimal import Decimal
+
+        assert Decimal(payload["pnl"]["net_pnl"]) == Decimal("0.494")
+
+
+class TestLiveStatusContinuity:
+    """live status 运行连续性块（计划 1.0 T2 / AC-04）。"""
+
+    def test_status_shows_continuity_block(self, clean_env, tmp_path: Path) -> None:
+        import time as _time
+
+        from cointrader.cli import cmd_live_status
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        store = StateStore(db)
+        now = int(_time.time() * 1000)
+        store.start_run_session(
+            run_id="run-1", started_ms=now - 7200_000, mode="testnet",
+            strategy_version="t", config_hash="h", code_revision="r",
+            spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+        )
+        store.end_run_session("run-1", ended_ms=now - 3600_000,
+                              status="INTERRUPTED",
+                              stop_reason="process_exited_without_graceful_stop")
+        store.start_run_session(
+            run_id="run-2", started_ms=now - 3600_000, mode="testnet",
+            strategy_version="t", config_hash="h", code_revision="r",
+            spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+        )
+        store.acquire_lease("live-executor", holder="pid-4242")
+        store.close()
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(cmd_live_status, config=config_path, json=False)
+        assert code == 0, output
+        assert "运行连续性" in output
+        assert "run-2" in output and "RUNNING" in output
+        assert "run-1" in output and "INTERRUPTED" in output
+        assert "process_exited_without_graceful_stop" in output
+        assert "pid-4242" in output
+
+    def test_status_without_sessions_shows_hint(self, clean_env, tmp_path: Path) -> None:
+
+        from cointrader.cli import cmd_live_status
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        StateStore(db).close()  # 建库（无 run_session）
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(cmd_live_status, config=config_path, json=False)
+        assert code == 0, output
+        assert "运行连续性" in output
+        assert "无 run_session" in output
+
+
+class TestExecModeEnv:
+    """COINTRADER_EXEC_MODE 模式覆盖（计划 1.0 T4 / AC-06）。"""
+
+    def _config(self, project_root: Path):
+        return load_config(project_root / "config" / "config.yaml")
+
+    def test_no_env_uses_config_source(self, clean_env, project_root: Path) -> None:
+        from cointrader.cli import _resolve_live_mode
+
+        mode, source = _resolve_live_mode(self._config(project_root))
+        assert (mode, source) == ("testnet", "config")
+
+    @pytest.mark.parametrize("env_mode", ["shadow", "paper", "testnet"])
+    def test_env_overrides_config(self, clean_env, monkeypatch, project_root: Path, env_mode: str) -> None:
+        from cointrader.cli import _resolve_live_mode
+
+        monkeypatch.setenv("COINTRADER_EXEC_MODE", env_mode)
+        mode, source = _resolve_live_mode(self._config(project_root))
+        assert mode == env_mode
+        assert source == "env:COINTRADER_EXEC_MODE"
+
+    @pytest.mark.parametrize("bad", ["LIVE", "prod", "Testnet", " live"])
+    def test_invalid_env_rejected_with_legal_values(self, clean_env, monkeypatch, project_root: Path, bad: str) -> None:
+        from cointrader.cli import _resolve_live_mode
+
+        monkeypatch.setenv("COINTRADER_EXEC_MODE", bad)
+        with pytest.raises(ConfigError, match="paper/testnet/shadow/live"):
+            _resolve_live_mode(self._config(project_root))
+
+    def test_live_via_env_still_requires_magic_string(self, clean_env, monkeypatch, project_root: Path) -> None:
+        """闸门不削弱：env=live 且未设魔法串 → 仍拒绝。"""
+        from cointrader.cli import _resolve_live_mode
+
+        monkeypatch.setenv("COINTRADER_EXEC_MODE", "live")
+        with pytest.raises(ConfigError, match="双重确认"):
+            _resolve_live_mode(self._config(project_root))
+
+    def test_doctor_rejects_bogus_env_nonzero(self, clean_env, monkeypatch, project_root: Path) -> None:
+        from cointrader.cli import cmd_live_doctor
+
+        monkeypatch.setenv("COINTRADER_EXEC_MODE", "bogus")
+        code, output = run_command(cmd_live_doctor, config=project_root / "config" / "config.yaml")
+        assert code == 1
+        assert "COINTRADER_EXEC_MODE 非法" in output
+        assert "paper/testnet/shadow/live" in output
+
+    def test_doctor_shows_mode_source_and_endpoint(self, clean_env, project_root: Path) -> None:
+        from cointrader.cli import cmd_live_doctor
+
+        code, output = run_command(cmd_live_doctor, config=project_root / "config" / "config.yaml")
+        assert "（来源: config）" in output
+        assert "端点: " in output
+        assert "spot=" in output and "perp=" in output
+
+    def test_status_shows_mode_source_from_env(self, clean_env, monkeypatch, tmp_path: Path) -> None:
+        from cointrader.cli import cmd_live_status
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        StateStore(db).close()
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+        monkeypatch.setenv("COINTRADER_EXEC_MODE", "shadow")
+
+        code, output = run_command(cmd_live_status, config=config_path, json=False)
+        assert code == 0, output
+        assert "（来源: env:COINTRADER_EXEC_MODE，当前解析: shadow）" in output
+        assert "端点选择" in output
+
+
+class TestSigTermHandler:
+    """SIGTERM → 优雅停机路径（计划 1.0 T4 / AC-07）。"""
+
+    def test_handler_registered_and_raises_keyboard_interrupt(self, monkeypatch) -> None:
+        import signal as _signal
+
+        from cointrader import cli as cli_mod
+
+        installed: dict[int, object] = {}
+        monkeypatch.setattr(cli_mod.signal, "signal", lambda sig, handler: installed.setdefault(sig, handler))
+        cli_mod._install_sigterm_handler()
+        assert _signal.SIGTERM in installed, "必须在 startup 前注册 SIGTERM handler"
+        handler = installed[_signal.SIGTERM]
+        with pytest.raises(KeyboardInterrupt):
+            handler(_signal.SIGTERM, None)
 
 
 class TestMainEntry:

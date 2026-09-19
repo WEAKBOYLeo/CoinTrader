@@ -69,7 +69,7 @@ backtest:
   history_days: 365
 
   # 回测专用滑点：基准情景每条成交腿 0.15%
-  slippage_per_leg: 0.0015
+  slippage_per_leg: 0.003
 
   # 样本内/外时间分割（前推式，不可随机分割）
   in_sample_ratio: 0.70
@@ -180,6 +180,8 @@ execution:
   max_leg_slippage_pct: 0.001    # 单腿滑点保护 0.1%
   hedge_tolerance_pct: 0.005     # 两腿数量容差 0.5%
   canary_notional: 10.0          # 单 pair 名义额硬顶（USDT），canary 期极小
+  # 主循环连续 tick 异常阈值：达到后优雅停机（退出码 1），由 systemd Restart=always 拉起
+  max_consecutive_tick_errors: 10
   leverage: 1                    # 只允许 1 或 2，禁止动态加杠杆
   margin_type: isolated
   one_way_position_mode: true

@@ -325,6 +325,8 @@ class ExecutionConfig:
     # server time 周期性重校准（秒）：代理链路 RTT 漂移会让启动时一次性偏移过期，
     # 导致签名请求 -1021。长跑必须定期重校准（§3.5 防线）。
     time_resync_seconds: float = 300.0
+    # 主循环连续 tick 异常阈值：达到后优雅停机并退出码 1，交给 systemd Restart 拉起。
+    max_consecutive_tick_errors: int = 10
     # 实时策略候选池（§7.1：初期固定高流动性 USDT symbol，完成单 pair 闭环后再开放）
     live_symbols: tuple[str, ...] = ("BTCUSDT",)
     # 候选指标低频刷新周期（秒）；主循环不用全市场扫描
@@ -344,6 +346,10 @@ class ExecutionConfig:
         if self.user_stream_mode not in ("stream", "poll"):
             raise ConfigError(
                 f"execution.user_stream_mode 必须是 ('stream', 'poll')，当前: {self.user_stream_mode!r}"
+            )
+        if self.max_consecutive_tick_errors < 1:
+            raise ConfigError(
+                f"execution.max_consecutive_tick_errors 必须 >= 1，当前 {self.max_consecutive_tick_errors}"
             )
         if not 1_000 <= self.recv_window_ms <= 60_000:
             raise ConfigError(f"recv_window_ms 必须在 [1000, 60000]，当前 {self.recv_window_ms}")
@@ -511,6 +517,7 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         candidate_refresh_seconds=float(sec.get("candidate_refresh_seconds", 300.0)),
         max_candidate_data_age_seconds=float(sec.get("max_candidate_data_age_seconds", 1800.0)),
         snapshot_interval_seconds=int(sec.get("snapshot_interval_seconds", 30)),
+        max_consecutive_tick_errors=int(sec.get("max_consecutive_tick_errors", 10)),
         report_dir=Path(sec.get("report_dir", "reports/live")),
     )
 

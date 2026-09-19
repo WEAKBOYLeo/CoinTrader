@@ -229,6 +229,83 @@ class TestForRun:
         assert summary.net_pnl == Decimal("0")
 
 
+def _seed_closed_trip_b(store: StateStore) -> None:
+    """run-b 的已平仓 round trip：零基差、无资金费 → net = −fee = −0.003。"""
+    store.upsert_pair(PairExecution(
+        pair_execution_id="pair-open-3", symbol="BTCUSDT",
+        target_notional=Decimal("1"), status="COMPLETE", kind="open",
+        strategy_version="t", run_id="run-b",
+        created_ms=T1, updated_ms=T1, completed_ts_ms=T1,
+    ))
+    store.upsert_pair(PairExecution(
+        pair_execution_id="pair-close-3", symbol="BTCUSDT",
+        target_notional=Decimal("0"), status="COMPLETE", kind="close",
+        strategy_version="t", run_id="run-b",
+        created_ms=T1 + 8 * 3600 * 1000, updated_ms=T1 + 8 * 3600 * 1000,
+        completed_ts_ms=T1 + 8 * 3600 * 1000,
+    ))
+    for o in (_order("co3-open-spot", "pair-open-3", Market.SPOT, OrderSide.BUY),
+              _order("co3-open-perp", "pair-open-3", Market.PERP, OrderSide.SELL),
+              _order("co3-close-spot", "pair-close-3", Market.SPOT, OrderSide.SELL),
+              _order("co3-close-perp", "pair-close-3", Market.PERP, OrderSide.BUY)):
+        store.upsert_order(o)
+    store.record_fill(_fill("h1", "co3-open-spot", Market.SPOT, OrderSide.BUY, "100", "0.001", T1))
+    store.record_fill(_fill("h2", "co3-open-perp", Market.PERP, OrderSide.SELL, "100", "0.0005", T1))
+    store.record_fill(_fill("h3", "co3-close-spot", Market.SPOT, OrderSide.SELL, "100", "0.001", T1 + 8 * 3600 * 1000))
+    store.record_fill(_fill("h4", "co3-close-perp", Market.PERP, OrderSide.BUY, "100", "0.0005", T1 + 8 * 3600 * 1000))
+
+
+def _seed_open_eth_trip(store: StateStore) -> None:
+    """run-a 开仓后一直未平（跨 run 未平仓）：funding − fee 计入未实现。"""
+    open_pair = PairExecution(
+        pair_execution_id="pair-open-4", symbol="ETHUSDT",
+        target_notional=Decimal("1"), status="COMPLETE", kind="open",
+        strategy_version="t", run_id="run-a",
+        created_ms=T0, updated_ms=T0, completed_ts_ms=T0,
+    )
+    store.upsert_pair(open_pair)
+    for o in (_order("co4-open-spot", "pair-open-4", Market.SPOT, OrderSide.BUY),
+              _order("co4-open-perp", "pair-open-4", Market.PERP, OrderSide.SELL)):
+        store.upsert_order(o)
+    store.record_fill(_fill("i1", "co4-open-spot", Market.SPOT, OrderSide.BUY, "100", "0.001", T0))
+    store.record_fill(_fill("i2", "co4-open-perp", Market.PERP, OrderSide.SELL, "100", "0.0005", T0))
+    store.record_funding_cashflow(
+        cashflow_id="cf-eth", symbol="ETHUSDT",
+        funding_ts_ms=T0 + 8 * 3600 * 1000,
+        funding_rate=Decimal("0.0005"), interval_hours=8,
+        amount=Decimal("0.3"), source="test", run_id="run-a",
+    )
+
+
+class TestForAllRuns:
+    """跨 run 聚合（断点重连后的全局视图，计划 1.0 T2 / AC-04）。"""
+
+    def test_all_runs_equals_sum_of_run_views(self, tmp_path):
+        store = StateStore(tmp_path / "t.sqlite3")
+        _seed_round_trip(store, run_id="run-a")
+        _seed_closed_trip_b(store)
+        _seed_open_eth_trip(store)
+        agg = PnlAggregator(store, now_fn=lambda: T1 / 1000)
+
+        sa, sb = agg.for_run("run-a"), agg.for_run("run-b")
+        total = agg.for_all_runs()
+
+        assert len(total.per_pair) == 3
+        assert {p.symbol for p in total.per_pair} == {"BTCUSDT", "ETHUSDT"}
+        assert sa.net_pnl + sb.net_pnl == Decimal("0.7925")
+        assert total.net_pnl == sa.net_pnl + sb.net_pnl
+        assert total.funding_pnl == sa.funding_pnl + sb.funding_pnl
+        assert total.trading_fee == sa.trading_fee + sb.trading_fee
+        assert total.realized_pnl == sa.realized_pnl + sb.realized_pnl
+        assert total.unrealized_pnl == sa.unrealized_pnl + sb.unrealized_pnl
+
+    def test_all_runs_empty_store(self, tmp_path):
+        store = StateStore(tmp_path / "t.sqlite3")
+        total = PnlAggregator(store, now_fn=lambda: T1 / 1000).for_all_runs()
+        assert total.per_pair == []
+        assert total.net_pnl == Decimal("0")
+
+
 class TestPersist:
     def test_persist_round_trip_writes_ledger(self, tmp_path):
         store = StateStore(tmp_path / "t.sqlite3")

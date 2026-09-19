@@ -17,6 +17,7 @@ from cointrader.config import (
     BacktestConfig,
     Config,
     CostsConfig,
+    ExecutionConfig,
     PerpFeeConfig,
     RateLimitConfig,
     RiskConfig,
@@ -40,7 +41,7 @@ class TestLoadConfig:
         assert config.backtest.execution_lag_bars >= 1
         assert config.backtest.rolling_window_periods == 30
         assert config.backtest.history_days == 365
-        assert config.backtest.slippage_per_leg == pytest.approx(0.0015)
+        assert config.backtest.slippage_per_leg == pytest.approx(0.003)
         assert config.strategy.entry.min_annualized_rate == pytest.approx(0.30)
         assert config.strategy.entry.lookback_periods == 10
         assert config.strategy.exit.exit_annualized_rate == pytest.approx(0.03)
@@ -136,6 +137,21 @@ class TestBacktestConfigValidation:
     def test_rejects_nonpositive_capital(self) -> None:
         with pytest.raises(ConfigError, match="initial_capital"):
             BacktestConfig(initial_capital=0.0)
+
+
+class TestExecutionTickErrorLimit:
+    """主循环连续 tick 异常阈值（长跑韧性，计划 1.0 T1）。"""
+
+    def test_default_is_ten(self) -> None:
+        assert ExecutionConfig().max_consecutive_tick_errors == 10
+
+    def test_explicit_value_accepted(self) -> None:
+        assert ExecutionConfig(max_consecutive_tick_errors=5).max_consecutive_tick_errors == 5
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_rejects_below_one(self, value: int) -> None:
+        with pytest.raises(ConfigError, match="max_consecutive_tick_errors"):
+            ExecutionConfig(max_consecutive_tick_errors=value)
 
 
 class TestCostsConfigValidation:

@@ -21,14 +21,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import signal
 import sys
 import time
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from . import __version__
-from .config import Config, load_config
+from .config import EXECUTION_MODES, Config, load_config
 from .errors import ConfigError
 from .logging_setup import setup_logging
 from .research.costs import CostModel, LiquidityTier, pessimistic_config
@@ -662,7 +665,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="时间范围（如 24h/7d），或 run_start 从 run 开始")
     live_pnl.add_argument("--until", default=None, help="截止时间（同 --since 格式）")
     live_pnl.add_argument("--symbol", default=None, help="按 symbol 过滤")
-    live_pnl.add_argument("--run-id", default=None, help="指定 run（默认最近一个）")
+    run_group = live_pnl.add_mutually_exclusive_group()
+    run_group.add_argument("--run-id", default=None, help="指定 run（默认最近一个）")
+    run_group.add_argument("--all-runs", action="store_true",
+                           help="跨所有 run 聚合（含跨 run 未平仓 pair）")
     live_pnl.add_argument("--json", action="store_true", help="JSON 输出")
     live_pnl.set_defaults(func=cmd_live_pnl)
 
@@ -743,6 +749,12 @@ def _print_json(payload: dict) -> int:
 
 def cmd_live_status(args: argparse.Namespace) -> int:
     config = load_config(args.config)
+    try:
+        mode, mode_source = _mode_source_and_value(config)
+    except ConfigError as exc:
+        print(f"  模式解析失败: {exc}", file=sys.stderr)
+        return 1
+    endpoint_label, spot_base, perp_base = _describe_endpoints(config)
     store = _open_live_store(config)
     try:
         runtime = store.runtime_state()
@@ -760,6 +772,9 @@ def cmd_live_status(args: argparse.Namespace) -> int:
             "run_id": runtime.get("run_id", {}).get("value") or (latest_run or {}).get("run_id"),
             "run": latest_run,
             "mode": runtime.get("mode", {}).get("value"),
+            "resolved_mode": mode,
+            "mode_source": mode_source,
+            "endpoints": {"label": endpoint_label, "spot": spot_base, "futures": perp_base},
             "can_open": runtime.get("can_open", {}).get("value") == "1",
             "account_snapshot": {
                 "ts_ms": acct.get("ts_ms") if acct else None,
@@ -777,6 +792,7 @@ def cmd_live_status(args: argparse.Namespace) -> int:
                 else None
             ),
             "recent_alerts": [{"ts_ms": a.get("recv_ts"), "market": a.get("market"), "type": a.get("event_type"), "payload": a.get("payload")} for a in alerts],
+            "run_continuity": _run_continuity(store, now_ms),
             "schema_version": store.schema_version(),
         }
     finally:
@@ -786,7 +802,8 @@ def cmd_live_status(args: argparse.Namespace) -> int:
     print(f"  服务状态     : {payload['service_state'] or '未知'}"
           + (f"（{payload['recovery_reason']}）" if payload.get("recovery_reason") else ""))
     print(f"  run_id       : {payload['run_id'] or '无'}")
-    print(f"  模式         : {payload['mode'] or '未知'}")
+    print(f"  模式         : {payload['mode'] or '未知'}（来源: {payload['mode_source']}，当前解析: {payload['resolved_mode']}）")
+    print(f"  端点选择     : {payload['endpoints']['label']}（spot={payload['endpoints']['spot']} perp={payload['endpoints']['futures']}）")
     print(f"  允许开仓     : {'是' if payload['can_open'] else '否'}")
     acct = payload["account_snapshot"]
     print(f"  账户快照年龄 : {acct['age_ms'] if acct['age_ms'] is not None else '无'} ms"
@@ -795,6 +812,32 @@ def cmd_live_status(args: argparse.Namespace) -> int:
     print(f"  最后对账     : {'一致' if recon['consistent'] else '不一致'}"
           f"（{recon['ts_ms']}）差异: {recon['mismatches'] or '无'}")
     print(f"  对账年龄     : {payload['last_reconcile_age_ms']} ms")
+    cont = payload["run_continuity"]
+    print("  运行连续性   :")
+    if not cont["has_any_session"]:
+        print("    无 run_session（尚未运行过 live run）")
+    else:
+        cur = cont["current_run"]
+        cur_line = f"    当前 run : {cur['run_id']} [{cur['status']}] 时长 {cur['duration_ms']} ms"
+        if cur["stop_reason"]:
+            cur_line += f"  停止原因: {cur['stop_reason']}"
+        print(cur_line)
+        prev = cont["previous_run"]
+        if prev["run_id"] is not None:
+            print(f"    历史 run : {prev['run_id']} [{prev['status']}] 时长 {prev['duration_ms']} ms"
+                  f"  停止原因: {prev['stop_reason'] or '无'}")
+        else:
+            print("    历史 run : 无")
+        if cont["open_pairs"]:
+            symbols = ", ".join(sorted({p["symbol"] for p in cont["open_pairs"]}))
+            print(f"    未完结 pair: {len(cont['open_pairs'])} 个（{symbols}）")
+        else:
+            print("    未完结 pair: 无")
+        if cont["lease_holders"]:
+            for h in cont["lease_holders"]:
+                print(f"    锁持有者   : {h['holder']} (pid={h['pid']}, expires_ms={h['expires_ms']})")
+        else:
+            print("    锁持有者   : 无（当前无实例持有锁）")
     if payload["recent_alerts"]:
         print("  最近告警     :")
         for alert in payload["recent_alerts"][:5]:
@@ -907,16 +950,60 @@ def cmd_live_trades(args: argparse.Namespace) -> int:
     return 0
 
 
+def _describe_run_session(session: dict[str, Any] | None, now_ms: int) -> dict[str, Any]:
+    """run_session → 连续性块字段（未结束的会话用当前时刻估算时长）。"""
+    if session is None:
+        return {"run_id": None}
+    started = int(session.get("started_ms") or 0)
+    ended = session.get("ended_ms")
+    end_ms = int(ended) if ended is not None else now_ms
+    return {
+        "run_id": session.get("run_id"),
+        "status": session.get("status"),
+        "stop_reason": session.get("stop_reason") or "",
+        "started_ms": started or None,
+        "ended_ms": ended,
+        "duration_ms": end_ms - started if started else None,
+    }
+
+
+def _run_continuity(store: Any, now_ms: int) -> dict[str, Any]:
+    """运行连续性块（断点重连诊断：跨重启看当前/历史 run、未完结 pair、锁持有者）。"""
+    sessions = store.run_sessions(limit=2)
+    latest = sessions[0] if sessions else None
+    previous = sessions[1] if len(sessions) > 1 else None
+    return {
+        "has_any_session": latest is not None,
+        "current_run": _describe_run_session(latest, now_ms),
+        "previous_run": _describe_run_session(previous, now_ms),
+        "open_pairs": [
+            {"pair_execution_id": str(r.get("pair_execution_id")),
+             "symbol": str(r.get("symbol")), "kind": str(r.get("kind")),
+             "run_id": r.get("run_id")}
+            for r in store.open_pairs()
+        ],
+        "lease_holders": store.lease_holders(),
+    }
+
+
 def cmd_live_pnl(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     store = _open_live_store(config)
     try:
-        run = store.run_session(args.run_id) if args.run_id else store.latest_run_session()
+        all_runs = bool(getattr(args, "all_runs", False))
+        run = store.latest_run_session()
         if run is None:
             raise ConfigError("没有找到 run_session（先运行 live run）")
+        if not all_runs and args.run_id:
+            run = store.run_session(args.run_id)
+            if run is None:
+                raise ConfigError(f"没有找到 run_session: {args.run_id}")
         since_arg = (args.since or "24h").strip().lower()
-        if since_arg in ("run_start", "runstart"):
+        if since_arg in ("run_start", "runstart") and not all_runs:
             since_ms = int(run.get("started_ms") or 0)
+        elif since_arg in ("run_start", "runstart"):
+            sessions = store.run_sessions(limit=100000)
+            since_ms = min(int(s.get("started_ms") or 0) for s in sessions) if sessions else 0
         else:
             since_ms = int(time.time() * 1000) - _parse_since_ms(args.since)
         if args.until:
@@ -930,9 +1017,14 @@ def cmd_live_pnl(args: argparse.Namespace) -> int:
         from .reporting.pnl import PnlAggregator
 
         aggregator = PnlAggregator(store)
-        summary = aggregator.for_run(str(run["run_id"]), quotes=quotes)
-        payload = {
-            "run_id": run["run_id"],
+        if all_runs:
+            summary = aggregator.for_all_runs(quotes=quotes)
+            run_id = "ALL"
+        else:
+            summary = aggregator.for_run(str(run["run_id"]), quotes=quotes)
+            run_id = str(run["run_id"])
+        payload: dict[str, Any] = {
+            "run_id": run_id,
             "since_ms": since_ms,
             "until_ms": until_ms,
             "pnl": summary.to_dict(),
@@ -1008,17 +1100,53 @@ def cmd_live_report(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_live_mode(config: Config) -> str:
-    """解析并校验实盘模式。LIVE 需要双重开关（secrets 层）同时打开。"""
+EXEC_MODE_ENV = "COINTRADER_EXEC_MODE"
+
+
+def _mode_source_and_value(config: Config) -> tuple[str, str]:
+    """(mode, source)：诊断用解析，不含 live 闸门检查。
+
+    ``COINTRADER_EXEC_MODE`` 精确覆盖 ``config.execution.mode``（白名单精确匹配，
+    小写；不做大小写折叠，``LIVE`` 不是合法值）。非法 → ConfigError 并列合法值。
+    """
+    mode = config.execution.mode
+    source = "config"
+    raw_env = os.environ.get(EXEC_MODE_ENV, "")
+    if raw_env:
+        if raw_env not in EXECUTION_MODES:
+            raise ConfigError(
+                f"COINTRADER_EXEC_MODE 非法: {raw_env!r}，合法值: paper/testnet/shadow/live"
+            )
+        mode = raw_env
+        source = f"env:{EXEC_MODE_ENV}"
+    return mode, source
+
+
+def _resolve_live_mode(config: Config) -> tuple[str, str]:
+    """解析并校验实盘执行模式，返回 (mode, source)。
+
+    env 覆盖不得绕过任何闸门：``live`` 仍要求 secrets 层双重开关
+    （魔法串 + USE_TESTNET=false）与 --confirm-live（后者在调用方检查）。
+    """
     from .secrets import is_trading_enabled, use_testnet
 
-    mode = config.execution.mode
+    mode, source = _mode_source_and_value(config)
     if mode == "live" and not (is_trading_enabled() and not use_testnet()):
         raise ConfigError(
             "execution.mode=live 要求 COINTRADER_TRADING_ENABLED 魔法字符串 "
             "且 COINTRADER_USE_TESTNET=false 同时生效。这是有意的双重确认（§4.2）。"
         )
-    return mode
+    return mode, source
+
+
+def _describe_endpoints(config: Config) -> tuple[str, str, str]:
+    """端点选择（与 build_live_context 一致）：use_testnet() 为真 → testnet base（demo/经典测试网），否则 mainnet。"""
+    from .secrets import use_testnet
+
+    api = config.api
+    if use_testnet():
+        return "demo/testnet", api.spot_testnet_base, api.futures_testnet_base
+    return "mainnet", api.spot_base, api.futures_base
 
 
 def cmd_live_doctor(args: argparse.Namespace) -> int:
@@ -1027,11 +1155,17 @@ def cmd_live_doctor(args: argparse.Namespace) -> int:
     failures: list[str] = []
 
     print("\n  【live doctor】实盘启动预检")
-    mode = _resolve_live_mode(config)
-    exc = config.execution
-    print(f"  模式: {mode.upper()}")
-    print(f"  状态账本: {config.resolved_path(exc.state_db)}")
-    print(f"  canary 名义额: {exc.canary_notional} USDT   杠杆: {exc.leverage}x   保证金: {exc.margin_type}")
+    try:
+        mode, mode_source = _resolve_live_mode(config)
+    except ConfigError as exc:
+        print(f"  模式解析失败: {exc}")
+        return 1
+    exc_cfg = config.execution
+    print(f"  模式: {mode.upper()}（来源: {mode_source}）")
+    endpoint_label, spot_base, perp_base = _describe_endpoints(config)
+    print(f"  端点: {endpoint_label}（spot={spot_base} perp={perp_base}）")
+    print(f"  状态账本: {config.resolved_path(exc_cfg.state_db)}")
+    print(f"  canary 名义额: {exc_cfg.canary_notional} USDT   杠杆: {exc_cfg.leverage}x   保证金: {exc_cfg.margin_type}")
 
     posture = describe_security_posture()
     print(f"  停机开关: {posture['kill_switch_file']} "
@@ -1053,7 +1187,7 @@ def cmd_live_doctor(args: argparse.Namespace) -> int:
         with BinancePublicClient(config.api, config.data) as client:  # type: ignore[arg-type]
             spot_offset = client.spot_time() - int(time.time() * 1000)
             perp_offset = client.futures_time() - int(time.time() * 1000)
-        limit = exc.server_time_offset_limit_ms
+        limit = exc_cfg.server_time_offset_limit_ms
         print(f"  时钟偏移: spot {spot_offset:+d}ms / perp {perp_offset:+d}ms（阈值 ±{limit}ms）")
         if abs(spot_offset) > limit or abs(perp_offset) > limit:
             failures.append("时钟偏移超阈：同步系统 NTP 后重试")
@@ -1069,10 +1203,23 @@ def cmd_live_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _install_sigterm_handler() -> None:
+    """SIGTERM → KeyboardInterrupt，复用既有 Ctrl-C 优雅停机路径（systemd stop 用）。"""
+
+    def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
 def cmd_live_run(args: argparse.Namespace) -> int:
-    """启动实盘主循环。Ctrl-C → 优雅停机（关流 + 释放锁）。"""
+    """启动实盘主循环。Ctrl-C / SIGTERM → 优雅停机（关流 + 释放锁 + 关闭 run_session）。"""
     config = load_config(args.config)
-    mode = _resolve_live_mode(config)
+    try:
+        mode, mode_source = _resolve_live_mode(config)
+    except ConfigError as exc:
+        print(f"  ❌ 模式解析失败: {exc}", file=sys.stderr)
+        return 1
 
     if mode == "paper":
         print("  PAPER 模式不走实盘执行服务（本地模拟请用 backtest/broker 路径）。")
@@ -1091,8 +1238,6 @@ def cmd_live_run(args: argparse.Namespace) -> int:
         print("  缺少 API 凭证（环境变量），无法启动。", file=sys.stderr)
         return 1
     # Spot 与 Futures 可用同一对 Key；也可用独立环境变量覆盖（不同 Key 场景）。
-    import os
-
     spot_key = os.environ.get("COINTRADER_SPOT_API_KEY", "") or creds.key
     spot_secret = os.environ.get("COINTRADER_SPOT_API_SECRET", "") or creds.secret
     fut_key = os.environ.get("COINTRADER_FUTURES_API_KEY", "") or creds.key
@@ -1107,7 +1252,10 @@ def cmd_live_run(args: argparse.Namespace) -> int:
         is_testnet=creds.is_testnet,
     )
 
-    print(f"\n  【live run】mode={mode.upper()} 启动中…（Ctrl-C 优雅停机）")
+    # SIGTERM 处理必须在 startup() 之前注册（systemd stop → 优雅停机，不留 ended_ms=NULL）
+    _install_sigterm_handler()
+
+    print(f"\n  【live run】mode={mode.upper()}（来源: {mode_source}）启动中…（Ctrl-C/SIGTERM 优雅停机）")
     try:
         report = service.startup()
     except Exception as exc:  # noqa: BLE001
@@ -1117,13 +1265,17 @@ def cmd_live_run(args: argparse.Namespace) -> int:
     if service.state.value != "RUNNING":
         print(f"  ⚠️ 处于 {service.state.value}：{service._recovery_reason}（只允许减仓，禁止开仓）")  # noqa: SLF001
 
+    ok = True
     try:
-        service.run_forever(tick_seconds=min(5.0, config.execution.reconciliation_interval_seconds))
+        ok = service.run_forever(tick_seconds=min(5.0, config.execution.reconciliation_interval_seconds))
     except KeyboardInterrupt:
-        print("\n  收到 Ctrl-C，优雅停机…")
+        print("\n  收到停止信号（Ctrl-C/SIGTERM），优雅停机…")
     finally:
         service.stop()
         service.store.close()
+    if not ok:
+        print("  ❌ 连续 tick 失败超限，退出码 1（守护进程将重启并重新预检/对账）", file=sys.stderr)
+        return 1
     return 0
 
 

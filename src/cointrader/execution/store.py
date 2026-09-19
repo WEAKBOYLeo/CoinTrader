@@ -621,6 +621,20 @@ class StateStore:
             (ended_ms, status, stop_reason, run_id, ended_ms),
         )
 
+    def mark_interrupted_sessions(self, *, now_ms: int) -> int:
+        """把非优雅退出（kill -9/断电）遗留的会话补记为 INTERRUPTED（§断点重连）。
+
+        只处理 ``ended_ms IS NULL`` 且状态仍为 RUNNING/RECOVERY 的行；
+        幂等（重复调用返回 0）；返回被标记的行数。
+        """
+        cur = self._execute(
+            "UPDATE run_sessions SET ended_ms = ?, status = 'INTERRUPTED',"
+            " stop_reason = 'process_exited_without_graceful_stop'"
+            " WHERE ended_ms IS NULL AND status IN ('RUNNING', 'RECOVERY')",
+            (now_ms,),
+        )
+        return cur.rowcount
+
     def run_session(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
@@ -646,6 +660,24 @@ class StateStore:
         if row is None:
             return None
         return self.run_session(str(row[0]))
+
+    def run_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
+        """按开始时间倒序的最近 N 个 run_session（只读诊断用）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT run_id FROM run_sessions ORDER BY started_ms DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [r for r in (self.run_session(str(row[0])) for row in rows) if r is not None]
+
+    def lease_holders(self) -> list[dict[str, Any]]:
+        """当前 service_leases 表内容（只读诊断用）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT lease_name, pid, holder, acquired_ms, expires_ms FROM service_leases"
+            )
+            rows = cur.fetchall()
+            names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=False)) for row in rows]
 
     # -- 策略决策（每个候选必须可解释，拒绝也落盘） ---------------------------
 
