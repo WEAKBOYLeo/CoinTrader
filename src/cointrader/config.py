@@ -327,6 +327,10 @@ class ExecutionConfig:
     time_resync_seconds: float = 300.0
     # 主循环连续 tick 异常阈值：达到后优雅停机并退出码 1，交给 systemd Restart 拉起。
     max_consecutive_tick_errors: int = 10
+    # WebUI 实时仪表盘（live run 进程内独立守护线程；只读，故障与主循环隔离）
+    webui_enabled: bool = True
+    webui_host: str = "0.0.0.0"  # noqa: S104 —— 需局域网/tailscale 访问，见 config.yaml 注释
+    webui_port: int = 8888
     # 实时策略候选池（§7.1：初期固定高流动性 USDT symbol，完成单 pair 闭环后再开放）
     live_symbols: tuple[str, ...] = ("BTCUSDT",)
     # 候选指标低频刷新周期（秒）；主循环不用全市场扫描
@@ -518,6 +522,9 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         max_candidate_data_age_seconds=float(sec.get("max_candidate_data_age_seconds", 1800.0)),
         snapshot_interval_seconds=int(sec.get("snapshot_interval_seconds", 30)),
         max_consecutive_tick_errors=int(sec.get("max_consecutive_tick_errors", 10)),
+        webui_enabled=bool(sec.get("webui_enabled", True)),
+        webui_host=str(sec.get("webui_host", "0.0.0.0")),  # noqa: S104
+        webui_port=int(sec.get("webui_port", 8888)),
         report_dir=Path(sec.get("report_dir", "reports/live")),
     )
 

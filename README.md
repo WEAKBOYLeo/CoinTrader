@@ -153,6 +153,22 @@ uv run cointrader live pnl --all-runs  # 跨所有 run 的 PnL 汇总
 
 排障与断点重连演练步骤见 docs/RUNBOOK.md §2.6。
 
+### WebUI 实时仪表盘
+
+`live run` 启动时会在进程内独立守护线程里拉起只读 Web 仪表盘，
+浏览器访问 **http://<本机IP>:8888/**（默认 `webui_host: 0.0.0.0`，
+局域网/Tailscale 均可访问）：
+
+- 实时展示：服务状态/模式/允许开仓/对账/账户资金、持仓与未实现 PnL、
+  最近订单/成交、PnL 分项（funding/fee/basis/realized/unrealized/net）、最近告警；
+- 页面每 3 秒轮询 `/api/state`（JSON 接口，可单独 fetch/接入）；`/healthz` 供探活；
+- 纯只读：数据来自 LiveService 内存快照 + 状态账本（独立 SQLite 连接），
+  WebUI 任何异常/端口冲突只告警，绝不影响主循环；`live run` 停止时自动关闭；
+- 配置：`config.yaml → execution.webui_enabled / webui_host / webui_port`。
+
+⚠️ 页面展示交易数据（不含 API 密钥）；生产环境请仅在可信网络内暴露，
+或用 SSH 隧道/反代加认证。
+
 ⚠️ 当前处于 **M4（Demo Trading 端到端 7 天长跑）** 阶段（见 docs/开发日志.md）。
 M4 与 M6（主网 canary）尚未通过，`live run` 目前只应在 demo 环境使用；
 主网启动必须走完开发设计文档 §13 清单，在此之前主网放量（M7）一律禁止。

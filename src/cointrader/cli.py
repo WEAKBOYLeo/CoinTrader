@@ -1266,17 +1266,52 @@ def cmd_live_run(args: argparse.Namespace) -> int:
         print(f"  ⚠️ 处于 {service.state.value}：{service._recovery_reason}（只允许减仓，禁止开仓）")  # noqa: SLF001
 
     ok = True
+    webui = _start_live_webui(config, service)
     try:
         ok = service.run_forever(tick_seconds=min(5.0, config.execution.reconciliation_interval_seconds))
     except KeyboardInterrupt:
         print("\n  收到停止信号（Ctrl-C/SIGTERM），优雅停机…")
     finally:
+        _stop_live_webui(webui)
         service.stop()
         service.store.close()
     if not ok:
         print("  ❌ 连续 tick 失败超限，退出码 1（守护进程将重启并重新预检/对账）", file=sys.stderr)
         return 1
     return 0
+
+
+def _start_live_webui(config: Config, service) -> object | None:
+    """随 live run 启动只读 WebUI 仪表盘（独立守护线程）。
+
+    任何失败（端口占用/模板缺失/意外异常）只告警，绝不影响主循环。
+    """
+    if not config.execution.webui_enabled:
+        print("  WebUI      : 已禁用（execution.webui_enabled）")
+        return None
+    try:
+        from .webui.server import LiveWebUI
+
+        webui = LiveWebUI(config=config, state_provider=service.web_snapshot)
+        if webui.start():
+            host, port = webui.address or ("?", 0)
+            shown = "0.0.0.0" if host == "0.0.0.0" else host  # noqa: S104
+            print(f"  WebUI      : http://{shown}:{port}/（只读实时仪表盘，故障不影响主循环）")
+            return webui
+        print(f"  ⚠️ WebUI 未启动: {webui.last_error}（不影响主循环）", file=sys.stderr)
+        return None
+    except Exception as exc:  # noqa: BLE001 —— 故障隔离底线
+        print(f"  ⚠️ WebUI 启动异常（不影响主循环）: {exc}", file=sys.stderr)
+        return None
+
+
+def _stop_live_webui(webui: object | None) -> None:
+    if webui is None:
+        return
+    try:
+        webui.stop()  # type: ignore[union-attr]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ WebUI 停止异常（忽略）: {exc}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

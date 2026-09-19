@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoinTrader · 实时交易</title>
+<style>
+:root {
+  --bg: #070b12;
+  --bg-glow1: rgba(56, 132, 255, 0.07);
+  --bg-glow2: rgba(45, 212, 168, 0.05);
+  --panel: rgba(15, 22, 34, 0.82);
+  --panel-solid: #0f1622;
+  --panel2: #141d2c;
+  --border: rgba(96, 130, 180, 0.16);
+  --border-strong: rgba(96, 130, 180, 0.30);
+  --text: #e6edf7;
+  --dim: #7d8ca3;
+  --dimmer: #56637a;
+  --green: #2fd674;
+  --green-bg: rgba(47, 214, 116, 0.12);
+  --red: #ff5a64;
+  --red-bg: rgba(255, 90, 100, 0.12);
+  --amber: #ffb648;
+  --amber-bg: rgba(255, 182, 72, 0.12);
+  --blue: #4cc9f0;
+  --blue-bg: rgba(76, 201, 240, 0.12);
+  --radius: 14px;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(1100px 500px at 85% -10%, var(--bg-glow1), transparent 60%),
+    radial-gradient(900px 460px at -10% 30%, var(--bg-glow2), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font: 14px/1.55 var(--sans);
+  min-height: 100vh;
+}
+::selection { background: rgba(76, 201, 240, 0.28); }
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  background: rgba(7, 11, 18, 0.78);
+  border-bottom: 1px solid var(--border);
+}
+.topbar-inner {
+  max-width: 1360px; margin: 0 auto; padding: 12px 20px;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-mark {
+  width: 30px; height: 30px; border-radius: 9px; flex: none;
+  background: linear-gradient(135deg, #2aa9e0 0%, #1f7ac2 55%, #2fd674 130%);
+  display: grid; place-items: center;
+  font: 700 15px var(--mono); color: #04121c;
+  box-shadow: 0 0 18px rgba(76, 201, 240, 0.35);
+}
+.brand-name { font-size: 15.5px; font-weight: 700; letter-spacing: 0.2px; }
+.brand-sub { font-size: 11.5px; color: var(--dim); margin-top: -2px; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 4px 12px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.3px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel2); color: var(--dim);
+  white-space: nowrap;
+}
+.chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dimmer); flex: none; }
+.chip.running { color: var(--green); border-color: rgba(47, 214, 116, 0.4); background: var(--green-bg); }
+.chip.running .dot { background: var(--green); animation: pulse 1.6s ease-in-out infinite; }
+.chip.starting { color: var(--amber); border-color: rgba(255, 182, 72, 0.4); background: var(--amber-bg); }
+.chip.starting .dot { background: var(--amber); animation: pulse 1.6s ease-in-out infinite; }
+.chip.recovery, .chip.halted, .chip.error, .chip.UNKNOWN { color: var(--red); border-color: rgba(255, 90, 100, 0.4); background: var(--red-bg); }
+.chip.recovery .dot, .chip.halted .dot, .chip.error .dot, .chip.UNKNOWN .dot { background: var(--red); }
+.chip.stopped { color: var(--dim); }
+.chip.ok { color: var(--green); border-color: rgba(47, 214, 116, 0.4); background: var(--green-bg); }
+.chip.ok .dot { background: var(--green); }
+.chip.no { color: var(--red); border-color: rgba(255, 90, 100, 0.4); background: var(--red-bg); }
+.chip.no .dot { background: var(--red); }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(47, 214, 116, 0.45); }
+  50% { box-shadow: 0 0 0 5px rgba(47, 214, 116, 0); }
+}
+
+.updated {
+  margin-left: auto; display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--dim);
+  font-family: var(--mono);
+}
+.updated .conn { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+.updated.offline .conn { background: var(--red); }
+
+/* ---------- 布局 ---------- */
+.wrap { max-width: 1360px; margin: 0 auto; padding: 18px 20px 40px; }
+
+.banner {
+  display: none; align-items: flex-start; gap: 10px;
+  border-radius: 12px; padding: 11px 16px; margin-bottom: 14px;
+  font-size: 13px; line-height: 1.5;
+}
+.banner.show { display: flex; }
+.banner .ic { flex: none; margin-top: 1px; }
+.banner.error { background: rgba(255, 90, 100, 0.10); border: 1px solid rgba(255, 90, 100, 0.35); color: #ffb9be; }
+.banner.warn { background: rgba(255, 182, 72, 0.09); border: 1px solid rgba(255, 182, 72, 0.35); color: #ffd9a0; }
+
+/* ---------- KPI 卡片 ---------- */
+.cards {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+.card {
+  position: relative; overflow: hidden;
+  background: linear-gradient(180deg, rgba(20, 29, 44, 0.9), rgba(13, 20, 32, 0.9));
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 13px 16px 14px;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+.card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+.card::before {
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+  background: var(--accent, transparent); opacity: 0.85;
+}
+.card .k {
+  color: var(--dim); font-size: 11.5px; font-weight: 600;
+  letter-spacing: 0.6px; text-transform: uppercase; margin-bottom: 6px;
+  display: flex; align-items: center; gap: 6px;
+}
+.card .v {
+  font-size: 19px; font-weight: 650; font-family: var(--mono);
+  font-variant-numeric: tabular-nums; letter-spacing: -0.2px;
+  overflow-wrap: anywhere;
+}
+.card .s { font-size: 11.5px; color: var(--dimmer); margin-top: 3px; font-family: var(--mono); }
+.card.good { --accent: var(--green); } .card.good .v { color: var(--green); }
+.card.bad { --accent: var(--red); } .card.bad .v { color: var(--red); }
+.card.warn { --accent: var(--amber); } .card.warn .v { color: var(--amber); }
+.card.info { --accent: var(--blue); }
+
+/* ---------- 面板 ---------- */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
+
+section.panel {
+  background: var(--panel);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  margin-bottom: 14px; overflow: hidden;
+}
+section.panel.flush { margin-bottom: 0; }
+.panel-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.panel-head .p-ic {
+  width: 26px; height: 26px; border-radius: 8px; flex: none;
+  display: grid; place-items: center;
+  background: var(--blue-bg); color: var(--blue); font-size: 13px;
+}
+.panel-head h2 { margin: 0; font-size: 13.5px; font-weight: 700; letter-spacing: 0.3px; }
+.panel-head .count {
+  font-family: var(--mono); font-size: 11px; color: var(--dim);
+  background: var(--panel2); border: 1px solid var(--border);
+  padding: 1px 8px; border-radius: 999px;
+}
+.panel-head .hint { margin-left: auto; font-size: 11.5px; color: var(--dimmer); }
+.panel-body { padding: 6px 0; overflow-x: auto; }
+.panel-body.padded { padding: 12px 16px; }
+
+/* ---------- 表格 ---------- */
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th {
+  text-align: left; color: var(--dimmer); font-weight: 600; font-size: 11px;
+  letter-spacing: 0.7px; text-transform: uppercase;
+  padding: 9px 14px; border-bottom: 1px solid var(--border); white-space: nowrap;
+  position: sticky; top: 0; background: var(--panel-solid);
+}
+td {
+  padding: 8px 14px; border-bottom: 1px solid rgba(96, 130, 180, 0.08);
+  font-family: var(--mono); font-size: 12px; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+tbody tr { transition: background 0.1s ease; }
+tbody tr:hover { background: rgba(76, 201, 240, 0.05); }
+tbody tr:last-child td { border-bottom: none; }
+.num { text-align: right; }
+.sym { font-weight: 700; color: var(--text); letter-spacing: 0.3px; }
+.sym small { display: block; color: var(--dimmer); font-weight: 400; font-size: 10px; }
+.pos { color: var(--green); } .neg { color: var(--red); }
+.dim-cell { color: var(--dim); }
+
+.pill {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px;
+  font-family: var(--mono); border: 1px solid var(--border-strong);
+  color: var(--dim); background: var(--panel2);
+}
+.pill.FILLED, .pill.REJECTED_DONE { color: var(--green); border-color: rgba(47, 214, 116, 0.4); background: var(--green-bg); }
+.pill.NEW, .pill.PARTIALLY_FILLED, .pill.OPEN { color: var(--amber); border-color: rgba(255, 182, 72, 0.4); background: var(--amber-bg); }
+.pill.REJECTED, .pill.CANCELED, .pill.CANCELLED { color: var(--red); border-color: rgba(255, 90, 100, 0.4); background: var(--red-bg); }
+
+.side {
+  display: inline-block; padding: 2px 8px; border-radius: 6px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.5px; font-family: var(--mono);
+}
+.side.BUY, .side.buy { color: var(--green); background: var(--green-bg); }
+.side.SELL, .side.sell { color: var(--red); background: var(--red-bg); }
+
+/* ---------- PnL ---------- */
+.pnl-hero {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  padding: 14px 16px 6px;
+}
+.pnl-hero .label { font-size: 11.5px; color: var(--dim); font-weight: 600; letter-spacing: 0.6px; text-transform: uppercase; }
+.pnl-hero .value { font-size: 30px; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.5px; }
+.pnl-hero .sub { font-size: 12px; color: var(--dimmer); font-family: var(--mono); margin-left: auto; }
+.pnl-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px; padding: 10px 16px 16px;
+}
+.mini {
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 13px;
+}
+.mini .k { color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: 0.5px; margin-bottom: 4px; }
+.mini .v { font-size: 15px; font-weight: 650; font-family: var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+/* ---------- 告警 ---------- */
+.alert-row {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 9px 16px; border-left: 3px solid var(--amber);
+  background: rgba(255, 182, 72, 0.04);
+  font-family: var(--mono); font-size: 12px; color: #e8d5ac;
+  overflow-wrap: anywhere;
+}
+.alert-row + .alert-row { border-top: 1px solid rgba(255, 182, 72, 0.12); }
+.alert-row .t { color: var(--dimmer); flex: none; }
+.alert-row .m { color: var(--amber); font-weight: 700; flex: none; }
+
+/* ---------- 空态 / 页脚 ---------- */
+.empty {
+  color: var(--dimmer); padding: 22px 16px; text-align: center; font-size: 12.5px;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+}
+.empty .e-ic { font-size: 20px; opacity: 0.5; }
+
+footer {
+  max-width: 1360px; margin: 0 auto; padding: 0 20px 28px;
+  display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  color: var(--dimmer); font-size: 11.5px; font-family: var(--mono);
+}
+
+@media (max-width: 720px) {
+  .topbar-inner { padding: 10px 14px; gap: 8px; }
+  .updated { margin-left: 0; width: 100%; justify-content: flex-end; }
+  .wrap { padding: 14px 12px 30px; }
+  .card .v { font-size: 16.5px; }
+  .pnl-hero .value { font-size: 24px; }
+}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="brand-mark">₮</div>
+      <div>
+        <div class="brand-name">CoinTrader</div>
+        <div class="brand-sub">资金费套利 · 实时仪表盘</div>
+      </div>
+    </div>
+    <span id="state-badge" class="chip"><span class="dot"></span>连接中…</span>
+    <span id="mode-badge" class="chip">-</span>
+    <span id="open-badge" class="chip">开仓: -</span>
+    <div id="updated" class="updated offline"><span class="conn"></span><span id="updated-text">等待数据…</span></div>
+  </div>
+</div>
+
+<div class="wrap">
+  <div id="errbar" class="banner error"><span class="ic">⚠</span><span id="errbar-text"></span></div>
+  <div id="recoverybar" class="banner warn"><span class="ic">⚠</span><span id="recoverybar-text"></span></div>
+
+  <div class="cards" id="cards"></div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div class="p-ic">◈</div>
+      <h2>持仓 · 现货多 + 永续空对冲</h2>
+      <span id="positions-count" class="count">0</span>
+      <span class="hint">快照口径（最新 tick）</span>
+    </div>
+    <div class="panel-body" id="positions"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div class="p-ic">Σ</div>
+      <h2>PnL 分项</h2>
+      <span id="pnl-count" class="count">当前 run</span>
+      <span class="hint" id="pnl-version"></span>
+    </div>
+    <div class="panel-body padded" id="pnl"></div>
+  </section>
+
+  <div class="grid2">
+    <section class="panel flush">
+      <div class="panel-head">
+        <div class="p-ic">⇅</div>
+        <h2>最近订单</h2>
+        <span id="orders-count" class="count">0</span>
+      </div>
+      <div class="panel-body" id="orders"></div>
+    </section>
+    <section class="panel flush">
+      <div class="panel-head">
+        <div class="p-ic">✓</div>
+        <h2>最近成交</h2>
+        <span id="fills-count" class="count">0</span>
+      </div>
+      <div class="panel-body" id="fills"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div class="p-ic">⚡</div>
+      <h2>最近告警</h2>
+      <span id="alerts-count" class="count">0</span>
+    </div>
+    <div class="panel-body padded" id="alerts" style="padding: 0;">
+      <div class="empty"><span class="e-ic">✓</span>暂无告警</div>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <span>CoinTrader WebUI · 只读 · 3s 轮询</span>
+  <span id="foot-state">offline</span>
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let lastOk = false;
+let lastTickAt = null;
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+function fmtTs(ms) {
+  if (!ms) return "-";
+  const d = new Date(Number(ms));
+  return d.toLocaleString("zh-CN", { hour12: false });
+}
+function fmtAge(ms) {
+  if (ms === null || ms === undefined) return "-";
+  const s = Math.max(0, Math.floor(Number(ms) / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60) + "s";
+  if (s < 86400) return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
+  return Math.floor(s / 86400) + "d" + Math.floor((s % 86400) / 3600) + "h";
+}
+function num(v) {
+  if (v === null || v === undefined || v === "") return "-";
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toLocaleString("zh-CN", { maximumFractionDigits: 6 }) : esc(v);
+}
+function signed(v) {
+  if (v === null || v === undefined || v === "") return '<span class="dim-cell">-</span>';
+  const n = Number(v);
+  if (!Number.isFinite(n)) return esc(v);
+  const cls = n > 0 ? "pos" : (n < 0 ? "neg" : "");
+  return `<span class="${cls}">${n > 0 ? "+" : ""}${num(v)}</span>`;
+}
+function card(k, v, cls, sub) {
+  return `<div class="card ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div>${sub ? `<div class="s">${sub}</div>` : ""}</div>`;
+}
+function table(headers, rows) {
+  if (!rows.length) return '<div class="empty"><span class="e-ic">▢</span>暂无数据</div>';
+  const th = headers.map(h => `<th class="${h.num ? "num" : ""}">${h.t}</th>`).join("");
+  const trs = rows.map(r => `<tr>${r}</tr>`).join("");
+  return `<table><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+function render(d) {
+  const svc = d.service || {};
+  const st = d.status || {};
+  const state = svc.state || st.service_state || "UNKNOWN";
+  const mode = svc.mode || st.mode || "-";
+
+  // 顶栏
+  const badge = $("state-badge");
+  badge.className = "chip " + String(state).toLowerCase();
+  badge.innerHTML = `<span class="dot"></span>${esc(state)}`;
+  $("mode-badge").textContent = "模式 " + mode + (d.store_available ? "" : " · 无账本");
+  const canOpen = svc.can_open ?? st.can_open;
+  const ob = $("open-badge");
+  ob.textContent = (canOpen ? "开仓 允许" : "开仓 禁止");
+  ob.className = "chip " + (canOpen ? "ok" : "no");
+
+  $("errbar").classList.remove("show");
+  const reason = svc.recovery_reason || st.recovery_reason || "";
+  $("recoverybar").classList.toggle("show", !!reason);
+  $("recoverybar-text").textContent = reason
+    ? "非 RUNNING 状态（只允许减仓）: " + reason
+    : "";
+
+  // KPI 卡片
+  const acctAge = (svc.account && svc.account.snapshot_ts_ms)
+    ? d.now_ms - Number(svc.account.snapshot_ts_ms)
+    : st.account_snapshot_age_ms;
+  const recon = st.last_reconciliation || {};
+  const reconOk = recon.consistent;
+  const capital = (svc.account && svc.account.total_capital)
+    ? svc.account.total_capital
+    : st.total_capital;
+  const runDur = (st.run && st.run.started_ms) ? d.now_ms - Number(st.run.started_ms) : null;
+  const runId = svc.run_id || st.run_id || "-";
+  $("cards").innerHTML = [
+    card("服务状态", esc(state), state === "RUNNING" ? "good" : (state === "STARTING" ? "warn" : "bad")),
+    card("允许开仓", canOpen ? "是" : "否", canOpen ? "good" : "bad"),
+    card("最后对账", reconOk === null || reconOk === undefined ? "—" : (reconOk ? "一致" : "不一致"),
+      reconOk === null || reconOk === undefined ? "" : (reconOk ? "good" : "bad"),
+      fmtAge(recon.ts_ms ? d.now_ms - Number(recon.ts_ms) : null) + " 前"),
+    card("总资金 USDT", num(capital), "info"),
+    card("账户快照", fmtAge(acctAge)),
+    card("Run 时长", fmtAge(runDur)),
+    card("持仓数", String((d.positions || []).filter(p => !p.error).length)),
+  ].join("");
+
+  // 持仓
+  const positions = (d.positions || []).filter(p => !p.error);
+  $("positions-count").textContent = String(positions.length);
+  $("positions").innerHTML = positions.length
+    ? table(
+        [
+          { t: "Symbol" }, { t: "现货量", num: 1 }, { t: "永续量", num: 1 },
+          { t: "对冲比", num: 1 }, { t: "基差 %", num: 1 },
+          { t: "现货价", num: 1 }, { t: "永续价", num: 1 },
+          { t: "开仓年龄" }, { t: "未实现 PnL", num: 1 },
+        ],
+        positions.map(p =>
+          `<td><span class="sym">${esc(p.symbol)}</span></td>` +
+          `<td class="num">${num(p.spot_qty)}</td>` +
+          `<td class="num neg">${num(p.perp_qty)}</td>` +
+          `<td class="num dim-cell">${num(p.hedge_ratio)}</td>` +
+          `<td class="num dim-cell">${num(p.basis_pct)}</td>` +
+          `<td class="num">${num(p.spot_price)}</td>` +
+          `<td class="num">${num(p.perp_price)}</td>` +
+          `<td class="dim-cell">${fmtAge(p.age_ms)}</td>` +
+          `<td class="num">${p.unrealized_pnl !== undefined ? signed(p.unrealized_pnl) : '<span class="dim-cell">-</span>'}</td>`
+        )
+      )
+    : '<div class="empty"><span class="e-ic">◈</span>当前无持仓</div>';
+
+  // PnL
+  const pnl = d.pnl || {};
+  $("pnl-version").textContent = (pnl.pnl && pnl.pnl.calculation_version)
+    ? "口径 " + pnl.pnl.calculation_version : "";
+  if (pnl.error) {
+    $("pnl").innerHTML = `<div class="empty">聚合失败: ${esc(pnl.error)}</div>`;
+  } else if (!pnl.pnl) {
+    $("pnl").innerHTML = `<div class="empty"><span class="e-ic">Σ</span>暂无 run 数据</div>`;
+  } else {
+    const net = pnl.pnl.net_pnl;
+    const netCls = net !== null && net !== undefined && Number.isFinite(Number(net))
+      ? (Number(net) > 0 ? "pos" : (Number(net) < 0 ? "neg" : "")) : "";
+    $("pnl").innerHTML =
+      `<div class="pnl-hero">
+        <span class="label">净 PnL</span>
+        <span class="value ${netCls}">${pnl.pnl.net_pnl !== null && pnl.pnl.net_pnl !== undefined ? signed(pnl.pnl.net_pnl) : "—"}</span>
+        <span class="sub">run ${esc((pnl.run_id || "").slice(0, 16))}</span>
+      </div>
+      <div class="pnl-grid">` + [
+        ["资金费", pnl.pnl.funding_pnl],
+        ["手续费", pnl.pnl.trading_fee],
+        ["基差", pnl.pnl.basis_pnl],
+        ["已实现", pnl.pnl.realized_pnl],
+        ["未实现", pnl.pnl.unrealized_pnl],
+        ["现金差(校验)", pnl.pnl.cash_delta],
+      ].map(([k, v]) =>
+        `<div class="mini"><div class="k">${esc(k)}</div>` +
+        `<div class="v">${(v !== null && v !== undefined && (k === "已实现" || k === "未实现")) ? signed(v) : num(v)}</div></div>`
+      ).join("") + `</div>`;
+  }
+
+  // 订单
+  const orders = (d.orders || []).filter(o => !o.error);
+  $("orders-count").textContent = String(orders.length);
+  $("orders").innerHTML = table(
+    [
+      { t: "时间" }, { t: "Symbol" }, { t: "方向" }, { t: "市场" },
+      { t: "数量", num: 1 }, { t: "均价", num: 1 }, { t: "状态" },
+    ],
+    orders.map(o =>
+      `<td class="dim-cell">${fmtTs(o.created_ms || o.ts_ms)}</td>` +
+      `<td><span class="sym">${esc(o.symbol)}</span></td>` +
+      `<td><span class="side ${esc(String(o.side || "").toLowerCase())}">${esc(o.side)}</span></td>` +
+      `<td class="dim-cell">${esc(o.market)}</td>` +
+      `<td class="num">${num(o.quantity)}</td>` +
+      `<td class="num">${num(o.avg_price)}</td>` +
+      `<td><span class="pill ${esc(String(o.state || ""))}">${esc(o.state)}</span></td>`
+    )
+  );
+
+  // 成交
+  const fills = (d.fills || []).filter(f => !f.error);
+  $("fills-count").textContent = String(fills.length);
+  $("fills").innerHTML = table(
+    [
+      { t: "时间" }, { t: "Symbol" }, { t: "方向" },
+      { t: "数量", num: 1 }, { t: "价格", num: 1 }, { t: "手续费", num: 1 },
+    ],
+    fills.map(f =>
+      `<td class="dim-cell">${fmtTs(f.ts_ms)}</td>` +
+      `<td><span class="sym">${esc(f.symbol)}</span></td>` +
+      `<td><span class="side ${esc(String(f.side || "").toLowerCase())}">${esc(f.side)}</span></td>` +
+      `<td class="num">${num(f.quantity)}</td>` +
+      `<td class="num">${num(f.price)}</td>` +
+      `<td class="num dim-cell">${num(f.fee_amount)}${f.fee_asset ? " " + esc(f.fee_asset) : ""}</td>`
+    )
+  );
+
+  // 告警
+  const alerts = (st.recent_alerts || []).slice(0, 10);
+  $("alerts-count").textContent = String(alerts.length);
+  $("alerts").innerHTML = alerts.length
+    ? alerts.map(a =>
+        `<div class="alert-row"><span class="t">${fmtTs(a.ts_ms)}</span>` +
+        (a.market ? `<span class="m">${esc(a.market)}</span>` : "") +
+        `<span>${esc(a.payload || "")}</span></div>`
+      ).join("")
+    : '<div class="empty"><span class="e-ic">✓</span>暂无告警</div>';
+
+  // 连接状态
+  lastTickAt = Date.now();
+  $("updated").classList.remove("offline");
+  $("foot-state").textContent = "online · " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+async function tick() {
+  try {
+    const resp = await fetch("/api/state", { cache: "no-store" });
+    const d = await resp.json();
+    if (!resp.ok) throw new Error(d.error || ("HTTP " + resp.status));
+    render(d);
+    lastOk = true;
+  } catch (e) {
+    if (lastOk) {
+      $("errbar").classList.add("show");
+      $("errbar-text").textContent = "连接中断，正在重试: " + e.message;
+      $("updated").classList.add("offline");
+      $("foot-state").textContent = "offline";
+    }
+  }
+}
+function updateRel() {
+  if (lastTickAt) {
+    const s = Math.floor((Date.now() - lastTickAt) / 1000);
+    const t = new Date(lastTickAt).toLocaleTimeString("zh-CN", { hour12: false });
+    $("updated-text").textContent = `更新于 ${t} · ${s}s 前`;
+  }
+}
+tick();
+setInterval(tick, 3000);
+setInterval(updateRel, 1000);
+</script>
+</body>
+</html>

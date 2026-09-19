@@ -200,6 +200,60 @@ class LiveService:
         self._persist_runtime_state()
         logger.error("【进入 RECOVERY】%s（禁止开新仓，等待对账通过后恢复）", reason)
 
+    def web_snapshot(self) -> dict[str, Any]:
+        """WebUI 用的内存状态快照（只读、无锁）。
+
+        只读简单属性（GIL 原子读），不取任何写锁，不会阻塞/干扰主循环。
+        """
+        now_ms = int(self._now() * 1000)
+        acct = self._account_result
+        held = sorted(
+            (
+                {"symbol": h.symbol,
+                 "spot_qty": str(h.spot_qty),
+                 "perp_qty": str(h.perp_qty),
+                 "opened_ms": h.opened_ms or None}
+                for h in self._held.values()
+            ),
+            key=lambda r: r["symbol"],
+        )
+        streams: list[dict[str, Any]] = []
+        for s in self.streams:
+            try:
+                streams.append({
+                    "market": str(getattr(s, "market", "?")),
+                    "fresh": bool(getattr(s, "is_fresh", False)),
+                    "generation": getattr(s, "generation", None),
+                })
+            except Exception:  # noqa: BLE001
+                streams.append({"market": "?", "fresh": False, "generation": None})
+        try:
+            gate_state = self.gate.state.value
+        except Exception:  # noqa: BLE001
+            gate_state = None
+        return {
+            "state": self.state.value,
+            "recovery_reason": self._recovery_reason,
+            "run_id": self.run_id or None,
+            "mode": self.mode,
+            "can_open": self._reconcile_ok and self.state is ServiceState.RUNNING,
+            "gate_state": gate_state,
+            "held": held,
+            "account": None if acct is None else {
+                "total_capital": str(acct.total_capital),
+                "spot_available": str(acct.spot_available),
+                "futures_wallet": str(acct.futures_wallet),
+                "futures_available": str(acct.futures_available),
+                "futures_unrealized": str(acct.futures_unrealized),
+            },
+            "user_streams": streams,
+            "last_reconcile_age_ms": (
+                now_ms - self._last_reconcile_ms if self._last_reconcile_ms else None
+            ),
+            "code_revision": self.code_revision,
+            "metrics": self.metrics.snapshot(),
+        }
+
     def _check_leverage_margin(
         self, symbol: str, want_lev: int, want_margin: str
     ) -> tuple[int, str, bool]:
