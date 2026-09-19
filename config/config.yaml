@@ -1,0 +1,199 @@
+# CoinTrader 唯一配置源
+# ⚠️ 本文件永远不包含 API 密钥。密钥只从环境变量读取，见 docs/ARCHITECTURE.md §4.2
+
+# ---------------------------------------------------------------------------
+# 数据
+# ---------------------------------------------------------------------------
+data:
+  cache_dir: data/cache
+  raw_dir: data/raw
+
+  # 请求限流（实测：期货 REQUEST_WEIGHT 2400/min，ORDERS 1200/min）
+  rate_limit:
+    futures_weight_per_min: 2400
+    spot_weight_per_min: 6000
+    # 达到该比例时主动休眠，给突发请求留余量
+    soft_limit_ratio: 0.80
+    max_retries: 5
+    base_backoff_seconds: 0.5
+    max_backoff_seconds: 30.0
+
+  # 缓存 TTL（秒）。历史数据不可变，实时数据短 TTL
+  cache_ttl:
+    funding_history: 604800      # 7 天：历史资金费不再变化
+    klines_closed: 604800        # 7 天：已收盘 K 线不再变化
+    premium_index: 5             # 5 秒：实时资金费+标记价
+    exchange_info: 3600          # 1 小时：交易规则变化不频繁
+    funding_info: 86400          # 1 天：结算周期极少变动
+
+# ---------------------------------------------------------------------------
+# 成本模型 —— 全项目最重要的参数，改这里前先读 docs/ARCHITECTURE.md §2.4
+# ---------------------------------------------------------------------------
+costs:
+  # 手续费档位：vip0 / vip0_bnb / vip1 ... 仅作标签，实际费率以下方为准
+  fee_tier: vip0_bnb
+
+  spot:
+    maker: 0.00100        # 0.100%
+    taker: 0.00100        # 0.100%
+  perp:
+    maker: 0.00020        # 0.020%
+    taker: 0.00050        # 0.050%
+
+  # BNB 折扣：现货 75 折，合约 9 折
+  spot_bnb_discount: 0.75
+  perp_bnb_discount: 0.90
+
+  # 滑点假设：单边，按币种流动性分档
+  slippage:
+    major: 0.00010        # 0.010%  BTC/ETH 等
+    mid: 0.00030          # 0.030%
+    small: 0.00050        # 0.050%  小市值
+
+  # 是否所有腿都按 taker 计价（保守）。设 false 则假设 maker 成交
+  assume_all_taker: true
+
+# ---------------------------------------------------------------------------
+# 回测
+# ---------------------------------------------------------------------------
+backtest:
+  # 信号在第 t 个资金费事件产生，成交在第 t+lag 个可见事件
+  # ⚠️ 该值必须 >= 1。设为 0 会引入前瞻偏差，测试会直接失败
+  execution_lag_bars: 1
+
+  # 固定滚动历史窗口：每个时点只看最近 N 期，窗口未满不交易
+  # 这是消除全样本统计量未来函数的核心参数
+  rolling_window_periods: 30
+
+  # 回测数据范围：最近 365 天，不读取更早历史
+  history_days: 365
+
+  # 回测专用滑点：基准情景每条成交腿 0.15%
+  slippage_per_leg: 0.0015
+
+  # 样本内/外时间分割（前推式，不可随机分割）
+  in_sample_ratio: 0.70
+
+  # 年化折算基准
+  days_per_year: 365
+
+  # 初始资金（USDT），仅用于收益率归一化
+  initial_capital: 10000.0
+
+  # 记账模式：hedged（现货+永续对冲，本项目主策略）
+  mode: hedged
+
+# ---------------------------------------------------------------------------
+# 策略参数
+# ---------------------------------------------------------------------------
+strategy:
+  name: funding_carry
+
+  entry:
+    # 进场的年化资金费阈值（扣费前）
+    min_annualized_rate: 0.30
+    # 需要连续多少期为正才进场（过滤噪音）
+    min_consecutive_positive: 6
+    # 所有入场、出场和换仓判断使用最近 10 期滑动平均值
+    lookback_periods: 10
+    # 进场要求的最近 10 期平均年化
+    min_trailing_annualized: 0.30
+
+  exit:
+    # 最近 30 期均值为负才退出；替换门槛按持仓年龄分段
+    exit_lookback_periods: 30
+    replacement_premium_under_60: 1.00
+    replacement_premium_under_120: 1.00
+    replacement_premium_over_120: 0.70
+    # 最长持有期（结算周期数），超时强制出场
+    max_holding_periods: 270
+
+  selection:
+    # 同时持有的最大币种数
+    max_positions: 3
+    # 每个币种的目标名义额占初始资金比例
+    per_position_weight: 0.33
+    # 3 天滑动平均日成交额门槛（USDT）
+    min_quote_volume_3d_avg: 1_000_000
+    # 排除的币种（稳定币对等）
+    exclude_bases: ["USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP"]
+
+# ---------------------------------------------------------------------------
+# 风控（execution 层使用，回测层也会读取用于情景分析）
+# ---------------------------------------------------------------------------
+risk:
+  max_notional_per_order: 200.0
+  max_total_exposure: 2000.0
+  max_exposure_per_symbol: 500.0
+  max_daily_loss_pct: 0.02       # 2% of 总资金 → 触发停机
+  max_unhedged_seconds: 60       # 单腿裸露最长时间
+  max_basis_adverse_pct: 0.0015     # 基准：单次进/出场基差不利变动 0.15%
+
+# ---------------------------------------------------------------------------
+# API 端点（公开只读接口；下单相关端点仅 execution 层使用）
+# ---------------------------------------------------------------------------
+api:
+  spot_base: https://api.binance.com
+  futures_base: https://fapi.binance.com
+  # testnet 端点，execution 层默认使用。当前指向币安 Demo Trading（官方模拟盘，
+  # 一对 key 通用现货+合约，虚拟资金；行情与主网接近，过滤器/限频与主网一致）。
+  # 经典 testnet: spot=https://testnet.binance.vision futures=https://testnet.binancefuture.com
+  spot_testnet_base: https://demo-api.binance.com
+  futures_testnet_base: https://demo-fapi.binance.com
+  # user data stream 端点（测试网/demo 覆盖主网域名）
+  spot_testnet_ws_base: wss://demo-stream.binance.com:9443
+  futures_testnet_ws_base: wss://demo-fstream.binance.com
+  timeout_seconds: 10.0
+
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+logging:
+  level: INFO
+  log_dir: logs
+  # 结构化日志（JSON Lines），便于机器解析
+  structured: true
+
+# ---------------------------------------------------------------------------
+# 实盘执行（开发设计文档 §4.2）。凭证不在这里 —— 只从环境变量读取。
+# mode: paper（默认，本地模拟，走 backtest/broker）/ testnet / shadow / live
+#   testnet 用测试网凭证下真实测试单；shadow 读真实行情与账户但只生成意图不下单；
+#   live 需 COINTRADER_TRADING_ENABLED 魔法串 + COINTRADER_USE_TESTNET=false + CLI --confirm-live。
+# ---------------------------------------------------------------------------
+execution:
+  mode: testnet
+  recv_window_ms: 5000
+  request_timeout_seconds: 5.0
+  order_ack_timeout_seconds: 3.0
+  state_db: data/live/trading.sqlite3
+  audit_path: logs/audit.log
+  user_stream_keepalive_seconds: 1800
+  # 用户流模式：stream=WebSocket 用户流（经典 testnet/主网）；poll=REST 轮询。
+  # demo trading 用户流不可用（现货 listenKey 410、合约 WS 20 秒被服务端断开），必须用 poll。
+  user_stream_mode: poll
+  user_stream_poll_seconds: 5
+  user_stream_fresh_seconds: 15
+  # 对账忽略的平台发放资产（demo 现货账户自带 USDC 5000）
+  reconcile_ignore_assets: [USDC]
+  reconciliation_interval_seconds: 30
+  max_market_data_age_seconds: 5.0
+  max_leg_slippage_pct: 0.001    # 单腿滑点保护 0.1%
+  hedge_tolerance_pct: 0.005     # 两腿数量容差 0.5%
+  canary_notional: 10.0          # 单 pair 名义额硬顶（USDT），canary 期极小
+  leverage: 1                    # 只允许 1 或 2，禁止动态加杠杆
+  margin_type: isolated
+  one_way_position_mode: true
+  server_time_offset_limit_ms: 3000
+  # server time 周期性重校准（秒）：代理 RTT 漂移会让启动时偏移过期→签名 -1021；
+  # 长跑定期重校准（单次校准本身多点采样取 RTT 最小样本）
+  time_resync_seconds: 300
+  # 实时策略候选池（§7.1：初期固定一个高流动性 USDT symbol，完成单 pair 闭环后再开放多 symbol）
+  live_symbols: [BTCUSDT]
+  # 候选指标低频刷新（秒）；主循环不重复拉历史
+  candidate_refresh_seconds: 300
+  # 候选指标缓存最大年龄（秒）；超过拒绝开仓
+  max_candidate_data_age_seconds: 1800
+  # 账户/持仓快照采样周期（秒，§8.5 至少 30s）
+  snapshot_interval_seconds: 30
+  # 报告导出根目录
+  report_dir: reports/live

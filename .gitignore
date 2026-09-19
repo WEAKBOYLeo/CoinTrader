@@ -1,0 +1,50 @@
+# --- 密钥与环境 ---
+# 永远不要提交任何形式的密钥（docs/ARCHITECTURE.md §4.2）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+KILL_SWITCH
+
+# --- 数据与产物 ---
+data/cache/
+data/raw/
+reports/
+logs/
+*.log
+*.jsonl
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.uv/
+
+# --- 工具 ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.ipynb_checkpoints/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,131 @@
+[project]
+name = "cointrader"
+version = "0.1.0"
+description = "Binance funding-rate carry research and (guarded) execution framework"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+
+# 运行期依赖，刻意保持最小。每一个新依赖都是供应链攻击面。
+dependencies = [
+    "httpx>=0.27,<0.29",       # HTTP 客户端，支持 HTTP/2 与超时控制
+    "pydantic>=2.7,<3",        # 配置校验
+    "PyYAML>=6.0,<7",          # 配置文件
+    "pandas>=2.2,<3",          # 时序数据处理
+    "numpy>=1.26,<3",          # 数值计算
+    "websockets>=17.1",
+]
+
+[project.optional-dependencies]
+report = ["rich>=13.0,<14"]     # 终端报表美化，可选
+
+[dependency-groups]
+# 开发工具链（测试/lint/类型检查）。用 PEP 735 的 dependency-groups
+# 而不是 optional-dependencies —— 这些不是给下游用户 pip install 的可选特性，
+# 是仓库自身的开发依赖，`uv sync` 默认就会装（见下方 [tool.uv]）。
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-cov>=5.0,<7",
+    "ruff>=0.5,<0.14",          # lint（安全规则通过 ruff 的 S 规则集）
+    "mypy>=1.10,<2",
+    "types-PyYAML>=6.0",       # PyYAML 的类型存根，mypy 需要
+]
+
+[project.scripts]
+cointrader = "cointrader.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cointrader"]
+
+[tool.uv]
+# dev 组是本仓库工作所必需的（测试/lint/类型检查），
+# 所以让 `uv sync`（不加任何 --group 参数）默认就装上它。
+# report 仍是 optional-dependencies 的 extra，需要显式 `uv sync --extra report`。
+default-groups = ["dev"]
+
+# ---------------------------------------------------------------------------
+# 工具配置
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 默认不跑联网测试，保证 CI/本地离线也能验证核心逻辑
+addopts = "-ra --strict-markers --strict-config -m 'not network'"
+markers = [
+    "network: 需要联网的测试（默认跳过，用 -m network 显式启用）",
+    "slow: 耗时较长的测试",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # flake8-bugbear —— 抓常见的逻辑陷阱
+    "S",         # flake8-bandit —— 安全检查（硬编码密码、assert、subprocess 等）
+    "RET",       # 返回语句规范
+    "SIM",       # 简化建议
+    "TID",       # import 规范
+    "PTH",       # 用 pathlib 替代 os.path
+    "BLE",       # 禁止裸 except
+    "DTZ",       # 强制带时区的 datetime（对交易系统至关重要）
+]
+ignore = [
+    "E501",      # 行长由 formatter 处理
+    "S101",      # 允许 assert（测试中大量使用）
+
+    # --- 以下为**刻意的**设计选择，逐条说明理由 ---
+
+    # 项目内部统一使用相对 import（from ..errors import X）。
+    # 理由：让依赖方向在源码里一眼可见 —— `..errors` 明显是同包内，
+    # `cointrader.errors` 看不出层级。且包重命名时相对 import 无需改动。
+    "TID252",
+
+    # 异常类名不带 Error 后缀（GuardRejected / RiskLimitExceeded /
+    # KillSwitchEngaged）。理由：这些是**领域事件**而非错误 ——
+    # "下单被闸门拒绝"在默认配置下是预期行为，每天都发生无数次。
+    # 叫 GuardRejectedError 会让人误以为出了故障。
+    "N818",
+
+    # 使用非加密随机数。唯一用途是重试退避的**抖动**（jitter），
+    # 目的是避免多进程同时重试造成惊群。这里不需要密码学强度，
+    # 且引入 secrets 模块会带来不必要的开销。
+    "S311",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S105",   # 测试里允许出现假密钥字符串
+    "S106",
+    "S108",   # 测试里允许使用临时目录
+    "B017",   # 测试断言底层不可变异常（FrozenInstanceError）时只能捕获 Exception
+    "SIM102", # 安全扫描测试需要嵌套 if 来逐条给出违规位置
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false   # 逐步收紧，先不阻塞
+ignore_missing_imports = true
+
+# 币安 API 的响应本质上是动态 JSON 结构（字段随接口而变、会新增字段），
+# ``_request()`` 返回 Any 是诚实的表达。在每个调用点加 cast 只会制造
+# 噪音而不增加安全性 —— 真正的字段校验由 data/klines.py 的解析函数
+# 与 tests/test_data.py 的解析测试保证。
+#
+# 关闭的是「返回 Any」这一类，其余 mypy 检查仍然生效。
+[[tool.mypy.overrides]]
+module = ["cointrader.data.binance"]
+disable_error_code = ["no-any-return"]
