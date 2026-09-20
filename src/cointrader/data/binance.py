@@ -187,6 +187,7 @@ class BinancePublicClient:
                 "Accept": "application/json",
             },
             follow_redirects=False,  # 重定向可能是钓鱼/中间人信号，不跟随
+            trust_env=True,  # 读取 HTTPS_PROXY/HTTP_PROXY（服务器直连币安受限时必须走代理）
         )
 
     # -- 生命周期 -----------------------------------------------------------

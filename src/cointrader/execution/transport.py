@@ -176,6 +176,7 @@ class SignedClient:
             timeout=httpx.Timeout(timeout_seconds),
             headers={"X-MBX-APIKEY": api_key.reveal(), "Accept": "application/json"},
             follow_redirects=False,
+            trust_env=True,  # 读取 HTTPS_PROXY/HTTP_PROXY（服务器直连币安受限时必须走代理）
         )
         self._sleep = sleep_fn
         self._now = now_fn
