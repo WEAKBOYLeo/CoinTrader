@@ -451,3 +451,118 @@ class TestMainEntry:
 
 
 __all__: list[str] = []
+
+
+class TestT4CliCrossRestartView:
+    """T4/AC-09/10/12：CLI 与 Web 同一 store 查询语义。"""
+
+    def test_pnl_defaults_to_all_runs(self, clean_env, tmp_path: Path) -> None:
+        """不带 --run-id / --all-runs → 默认跨 run（ALL）。"""
+        import json as _json
+
+        from cointrader.cli import cmd_live_pnl
+        from cointrader.execution.store import StateStore
+        from test_pnl import _seed_closed_trip_b, _seed_round_trip
+
+        db = tmp_path / "t.sqlite3"
+        store = StateStore(db)
+        _seed_round_trip(store, run_id="run-a")
+        _seed_closed_trip_b(store)
+        now = int(time.time() * 1000)
+        for run_id, started in (("run-a", now - 2 * 3600_000), ("run-b", now - 3600_000)):
+            store.start_run_session(
+                run_id=run_id, started_ms=started, mode="testnet",
+                strategy_version="t", config_hash="h", code_revision="r",
+                spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+            )
+            store.end_run_session(run_id, ended_ms=started + 1000,
+                                  status="STOPPED", stop_reason="graceful_stop")
+        store.close()
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(
+            cmd_live_pnl,
+            config=config_path,
+            run_id=None,
+            all_runs=False,  # 未显式 --all-runs 也默认跨 run
+            since="24h",
+            until=None,
+            symbol=None,
+            json=True,
+        )
+        assert code == 0
+        payload = _json.loads(output)
+        assert payload["run_id"] == "ALL"
+        assert payload["current_run_id"] == "run-b"
+        assert len(payload["pnl"]["per_pair"]) == 2
+        assert "authoritative_complete" in payload["pnl"]
+        assert "estimated_funding_pnl" in payload["pnl"]
+
+    def test_status_includes_online_and_projection_state(
+        self, clean_env, tmp_path: Path
+    ) -> None:
+        import json as _json
+
+        from cointrader.cli import cmd_live_status
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        store = StateStore(db)
+        now = int(time.time() * 1000)
+        store.start_run_session(
+            run_id="run-1", started_ms=now - 7200_000, mode="testnet",
+            strategy_version="t", config_hash="h", code_revision="r",
+            spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+        )
+        store.update_run_heartbeat("run-1", now_ms=now - 7140_000)
+        store.end_run_session("run-1", ended_ms=now - 7140_000, status="STOPPED",
+                              stop_reason="graceful_stop")
+        store.close()
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(cmd_live_status, config=config_path, json=True)
+        assert code == 0
+        payload = _json.loads(output)
+        online = payload["online"]
+        assert online["run_count"] == 1
+        assert online["total_online_ms"] == 60_000
+        assert online["current_run_online_ms"] is None
+        assert online["total_downtime_ms"] >= 7100_000  # 60s 在线之外的停机
+        assert payload["current_positions_state"] == "UNKNOWN"
+        assert payload["heartbeat_age_ms"] is not None
+
+    def test_positions_from_current_projection_not_snapshots(
+        self, clean_env, tmp_path: Path
+    ) -> None:
+        """历史 position_snapshots 有仓但 current projection 没有 → 不显示。"""
+        import json as _json
+
+        from cointrader.cli import cmd_live_positions
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        store = StateStore(db)
+        now = int(time.time() * 1000)
+        from decimal import Decimal
+
+        from cointrader.execution.models import PositionSnapshot
+
+        store.record_position_snapshot(PositionSnapshot(
+            ts_ms=now - 86_400_000, symbol="BTCUSDT",
+            spot_qty=Decimal("0.01"), perp_qty=Decimal("-0.01"),
+            spot_price=Decimal("100"), perp_price=Decimal("100"),
+        ))
+        store.close()
+
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(cmd_live_positions, config=config_path, json=True)
+        assert code == 0
+        payload = _json.loads(output)
+        assert payload["positions"] == [], "历史快照不得冒充当前持仓"
+        assert payload["positions_state"] == "UNKNOWN"

@@ -666,7 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
     live_pnl.add_argument("--until", default=None, help="截止时间（同 --since 格式）")
     live_pnl.add_argument("--symbol", default=None, help="按 symbol 过滤")
     run_group = live_pnl.add_mutually_exclusive_group()
-    run_group.add_argument("--run-id", default=None, help="指定 run（默认最近一个）")
+    run_group.add_argument("--run-id", default=None, help="指定 run（默认跨 run ALL，T4）")
     run_group.add_argument("--all-runs", action="store_true",
                            help="跨所有 run 聚合（含跨 run 未平仓 pair）")
     live_pnl.add_argument("--json", action="store_true", help="JSON 输出")
@@ -793,6 +793,15 @@ def cmd_live_status(args: argparse.Namespace) -> int:
             ),
             "recent_alerts": [{"ts_ms": a.get("recv_ts"), "market": a.get("market"), "type": a.get("event_type"), "payload": a.get("payload")} for a in alerts],
             "run_continuity": _run_continuity(store, now_ms),
+            "online": store.online_stats(now_ms),
+            "heartbeat_age_ms": (
+                now_ms - int(latest_run["last_heartbeat_ms"])
+                if latest_run and latest_run.get("last_heartbeat_ms") else None
+            ),
+            "reconcile_age_ms": (
+                now_ms - int(recon["ts_ms"]) if recon and recon.get("ts_ms") else None
+            ),
+            "current_positions_state": _current_positions_state(store, now_ms, config),
             "schema_version": store.schema_version(),
         }
     finally:
@@ -812,6 +821,14 @@ def cmd_live_status(args: argparse.Namespace) -> int:
     print(f"  最后对账     : {'一致' if recon['consistent'] else '不一致'}"
           f"（{recon['ts_ms']}）差异: {recon['mismatches'] or '无'}")
     print(f"  对账年龄     : {payload['last_reconcile_age_ms']} ms")
+    online = payload["online"]
+    print(f"  在线时长     : 累计 {online['total_online_ms']} ms | "
+          f"本次 run {online['current_run_online_ms'] if online['current_run_online_ms'] is not None else '无'} ms | "
+          f"首启至今 {online['span_ms']} ms | 中断 {online['total_downtime_ms']} ms | "
+          f"run 数 {online['run_count']}")
+    hb_age = payload["heartbeat_age_ms"]
+    print(f"  心跳年龄     : {hb_age if hb_age is not None else '无'} ms"
+          f"   current projection: {payload['current_positions_state']}")
     cont = payload["run_continuity"]
     print("  运行连续性   :")
     if not cont["has_any_session"]:
@@ -845,36 +862,48 @@ def cmd_live_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _current_positions_state(store: Any, now_ms: int, config: Any) -> str:
+    """current projection 状态（与 Web 同口径：OK/STALE/UNKNOWN，T4）。"""
+    rows = store.current_positions(include_tombstones=False)
+    if not rows:
+        return "UNKNOWN" if store.current_account() is None else "OK"
+    latest_observed = max(int(r.get("observed_at_ms") or 0) for r in rows)
+    stale_after_ms = max(
+        int(config.execution.snapshot_interval_seconds) * 3000, 60_000
+    )
+    if not latest_observed or now_ms - latest_observed > stale_after_ms:
+        return "STALE"
+    return "OK"
+
+
 def cmd_live_positions(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     store = _open_live_store(config)
+    now_ms = int(time.time() * 1000)
     try:
-        snaps = store.position_snapshots(limit=10000)
-        latest: dict[str, dict] = {}
-        for row in snaps:
-            symbol = row.get("symbol")
-            if symbol and symbol not in latest:
-                latest[symbol] = row
+        # T4：与 Web 同一 store 查询语义 —— current projection（不是历史快照）
+        cur_rows = store.current_positions(include_tombstones=False)
+        state = _current_positions_state(store, now_ms, config)
         positions = []
-        for symbol, row in sorted(latest.items()):
+        for row in sorted(cur_rows, key=lambda r: str(r.get("symbol"))):
             spot_qty = Decimal(str(row.get("spot_qty") or 0))
             perp_qty = Decimal(str(row.get("perp_qty") or 0))
             if spot_qty <= 0 and abs(perp_qty) <= 0:
                 continue
-            opened_ms = store.position_opened_ms(symbol) or row.get("ts_ms")
+            opened_ms = store.position_opened_ms(str(row.get("symbol"))) or row.get("observed_at_ms")
             positions.append({
-                "symbol": symbol,
+                "symbol": str(row.get("symbol")),
                 "spot_qty": str(spot_qty),
                 "perp_qty": str(perp_qty),
                 "spot_price": row.get("spot_price"),
                 "perp_price": row.get("perp_price"),
-                "basis_pct": row.get("basis_pct"),
+                "basis_pct": None,
                 "hedge_ratio": (
                     str(abs(perp_qty) / spot_qty) if spot_qty > 0 else None
                 ),
                 "opened_ms": opened_ms,
-                "age_ms": int(time.time() * 1000) - int(opened_ms) if opened_ms else None,
-                "snapshot_ts_ms": row.get("ts_ms"),
+                "age_ms": now_ms - int(opened_ms) if opened_ms else None,
+                "observed_at_ms": row.get("observed_at_ms"),
             })
         quotes = _fetch_live_quotes(config, [str(p["symbol"]) for p in positions])
         runs = store.latest_run_session()
@@ -891,11 +920,17 @@ def cmd_live_positions(args: argparse.Namespace) -> int:
                             pos["pair_execution_id"] = item.pair_execution_id
             except Exception as exc:  # noqa: BLE001
                 logging.getLogger(__name__).debug("PnL 聚合失败（不影响持仓展示）: %s", exc)
-        payload = {"positions": positions, "run_id": (runs or {}).get("run_id")}
+        payload = {"positions": positions, "positions_state": state,
+                   "run_id": (runs or {}).get("run_id")}
     finally:
         store.close()
     if args.json:
         return _print_json(payload)
+    if state == "UNKNOWN":
+        print("  current projection 尚未建立（UNKNOWN，不得当作无持仓）。")
+        return 0
+    if state == "STALE":
+        print("  current projection 已过期（STALE：账户/对账不可信，以下为最后已知值）。")
     if not positions:
         print("  当前无策略持仓。")
         return 0
@@ -990,9 +1025,10 @@ def cmd_live_pnl(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     store = _open_live_store(config)
     try:
-        all_runs = bool(getattr(args, "all_runs", False))
+        # T4：PnL 默认跨 run（与 Web 同语义）；显式 --run-id 才限定单 run
+        all_runs = bool(getattr(args, "all_runs", False)) or not getattr(args, "run_id", None)
         run = store.latest_run_session()
-        if run is None:
+        if run is None and not all_runs:
             raise ConfigError("没有找到 run_session（先运行 live run）")
         if not all_runs and args.run_id:
             run = store.run_session(args.run_id)
@@ -1025,6 +1061,7 @@ def cmd_live_pnl(args: argparse.Namespace) -> int:
             run_id = str(run["run_id"])
         payload: dict[str, Any] = {
             "run_id": run_id,
+            "current_run_id": str(run["run_id"]) if run else None,
             "since_ms": since_ms,
             "until_ms": until_ms,
             "pnl": summary.to_dict(),
@@ -1038,13 +1075,16 @@ def cmd_live_pnl(args: argparse.Namespace) -> int:
     if args.json:
         return _print_json(payload)
     pnl = payload["pnl"]
-    print(f"  run_id       : {payload['run_id']}")
-    print(f"  funding_pnl  : {pnl['funding_pnl']}")
+    scope_label = "跨 run（ALL）" if payload["run_id"] == "ALL" else f"单 run（{payload['run_id']}）"
+    print(f"  run_id       : {payload['run_id']}（{scope_label}，current run: {payload.get('current_run_id') or '无'}）")
+    print(f"  funding_pnl  : {pnl['funding_pnl']}（authoritative）")
+    print(f"  estimated    : {pnl['estimated_funding_pnl']}（估算口径，单独展示，不混入 authoritative）")
     print(f"  trading_fee  : {pnl['trading_fee']}")
     print(f"  basis_pnl    : {pnl['basis_pnl']}")
     print(f"  realized     : {pnl['realized_pnl']}")
     print(f"  unrealized   : {pnl['unrealized_pnl']}")
     print(f"  net_pnl      : {pnl['net_pnl']}（口径 {pnl['calculation_version']}）")
+    print(f"  authoritative: {'完整' if pnl['authoritative_complete'] else '不完整（窗口内存在仅估算口径的结算）'}")
     print(f"  cash_delta   : {pnl['cash_delta']}（仅交叉验证，不替代策略 PnL）")
     if pnl["differences"]:
         print("  差异         :")

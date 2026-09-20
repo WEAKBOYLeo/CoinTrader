@@ -52,6 +52,14 @@ class TestExport:
         assert result.manifest_path.is_file()
         manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
         assert manifest["run_id"] == "run-exp"
+        # T4：迁移版本 + authority 口径 + cursor/epoch 完整性
+        assert manifest["schema_version"] == 2
+        authority = manifest["funding_authority"]
+        assert isinstance(authority["authoritative_rows"], int)
+        assert isinstance(authority["estimated_rows"], int)
+        assert isinstance(authority["authoritative_complete"], bool)
+        assert isinstance(manifest["sync_cursors"], list)
+        assert "count" in manifest["scan_epochs"] and "latest" in manifest["scan_epochs"]
 
         # 每个声明文件的 SHA-256 与磁盘一致
         listed = {f["file"]: f["sha256"] for f in manifest["files"]}

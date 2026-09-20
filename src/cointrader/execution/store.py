@@ -651,7 +651,7 @@ class StateStore:
             row = self._conn.execute(
                 "SELECT run_id, started_ms, ended_ms, status, stop_reason, code_revision,"
                 " strategy_version, config_hash, mode, spot_endpoint, futures_endpoint,"
-                " user_stream_mode, timezone FROM run_sessions WHERE run_id = ?",
+                " user_stream_mode, timezone, last_heartbeat_ms FROM run_sessions WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         if row is None:
@@ -659,7 +659,7 @@ class StateStore:
         return dict(zip(
             ("run_id", "started_ms", "ended_ms", "status", "stop_reason", "code_revision",
              "strategy_version", "config_hash", "mode", "spot_endpoint", "futures_endpoint",
-             "user_stream_mode", "timezone"),
+             "user_stream_mode", "timezone", "last_heartbeat_ms"),
             row, strict=False,
         ))
 
@@ -680,31 +680,66 @@ class StateStore:
             ).fetchall()
         return [r for r in (self.run_session(str(row[0])) for row in rows) if r is not None]
 
-    def online_stats(self, now_ms: int) -> dict[str, Any]:
-        """累计在线统计（跨重启，WebUI 展示用）。
+    def online_stats(self, now_ms: int, *, heartbeat_fresh_ms: int = 120_000) -> dict[str, Any]:
+        """累计在线/中断统计（跨重启，固定时钟可测，WebUI/CLI 展示用）。
 
-        在线时长 = 各已结束的 run_session 时长之和 + 当前未结束 run 的
-        已运行时长（ended_ms IS NULL 的 RUNNING/RECOVERY 会话计到 now_ms）。
-        INTERRUPTED/STOPPED 会话的 ended_ms 已由停机/接管路径写入，不重复计。
+        v2 口径（T4/AC-09）：
+        - 已结束 run：在线区间 = [started_ms, ended_ms]（INTERRUPTED 会话的
+          ended_ms 已由接管路径按 last_heartbeat_ms 截断，停机间隔不计入）；
+        - 当前未结束 run：在线计到 ``min(now_ms, last_heartbeat + heartbeat_fresh_ms)``，
+          不把「心跳停止后的停机时间」计入在线；
+        - 区间重叠/负值（脏数据）在合并时截断，不产生负在线。
 
         Returns:
-            {"first_start_ms": 首次启动时间 | None, "total_online_ms": 累计在线毫秒, "run_count": N}
+            first_start_ms / last_end_ms / run_count / total_online_ms /
+            current_run_online_ms（无未结束 run 为 None）/ span_ms（首启至 now 或
+            最后结束）/ total_downtime_ms（span - 在线）。
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT started_ms, ended_ms FROM run_sessions ORDER BY started_ms"
+                "SELECT started_ms, ended_ms, last_heartbeat_ms FROM run_sessions"
+                " ORDER BY started_ms"
             ).fetchall()
-        total_ms = 0
+        intervals: list[tuple[int, int]] = []
+        current_run_online_ms: int | None = None
         first_start_ms: int | None = None
-        for started_ms, ended_ms in rows:
+        for started_ms, ended_ms, last_heartbeat_ms in rows:
+            started = int(started_ms)
             if first_start_ms is None:
-                first_start_ms = int(started_ms)
-            end = int(ended_ms) if ended_ms is not None else now_ms
-            total_ms += max(0, end - int(started_ms))
+                first_start_ms = started
+            if ended_ms is not None:
+                end = int(ended_ms)
+            else:
+                heartbeat = int(last_heartbeat_ms) if last_heartbeat_ms is not None else started
+                end = min(now_ms, heartbeat + int(heartbeat_fresh_ms))
+                current_run_online_ms = max(0, end - started)
+            if end > started:
+                intervals.append((started, end))
+        intervals.sort()
+        # 合并重叠区间后求和（脏数据重叠只计一次）
+        merged: list[list[int]] = []
+        for start, end in intervals:
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        total_ms = 0
+        last_end_ms: int | None = None
+        for start, end in merged:  # noqa: B020  # start 仅用于语义清晰
+            total_ms += end - start
+            if last_end_ms is None or end > last_end_ms:
+                last_end_ms = end
+        # span = 首次启动 → now（无论当前是否在运行；停机中的服务 span 继续增长，
+        # downtime = span - 在线 自然包含当前停机段）
+        span_ms = (now_ms - first_start_ms) if first_start_ms is not None else 0
         return {
             "first_start_ms": first_start_ms,
-            "total_online_ms": total_ms,
+            "last_end_ms": last_end_ms,
             "run_count": len(rows),
+            "total_online_ms": total_ms,
+            "current_run_online_ms": current_run_online_ms,
+            "span_ms": max(0, span_ms),
+            "total_downtime_ms": max(0, max(0, span_ms) - total_ms),
         }
 
     def lease_holders(self) -> list[dict[str, Any]]:
@@ -822,6 +857,18 @@ class StateStore:
             scope=str(row[0]), stream=str(row[1]), symbol_key=str(row[2]),
             last_time_ms=int(row[3]), last_id=str(row[4]), updated_ms=int(row[5]),
         )
+
+    def sync_cursors(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        """全部 facts 同步游标（只读诊断/报告 manifest 用）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT scope, stream, symbol_key, last_time_ms, last_id, updated_ms"
+                " FROM sync_cursors ORDER BY scope, stream, symbol_key LIMIT ?",
+                (limit,),
+            )
+            rows = cur.fetchall()
+            names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=False)) for row in rows]
 
     def _insert_fill_row(self, conn: sqlite3.Connection, fill: Fill) -> bool:
         try:

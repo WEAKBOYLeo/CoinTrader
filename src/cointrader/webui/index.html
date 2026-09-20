@@ -291,10 +291,20 @@ footer {
 
   <section class="panel">
     <div class="panel-head">
+      <div class="p-ic">▦</div>
+      <h2>数据状态 · epoch / 限流 / 新鲜度</h2>
+      <span class="hint">UNKNOWN/STALE 原样展示，不渲染为 0</span>
+    </div>
+    <div class="panel-body padded" id="data-status"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
       <div class="p-ic">◈</div>
       <h2>持仓 · 现货多 + 永续空对冲</h2>
       <span id="positions-count" class="count">0</span>
-      <span class="hint">快照口径（最新 tick）</span>
+      <span id="positions-state" class="chip">-</span>
+      <span class="hint">current projection 口径（对账/恢复写入）</span>
     </div>
     <div class="panel-body" id="positions"></div>
   </section>
@@ -425,8 +435,12 @@ function render(d) {
     : st.total_capital;
   const runDur = (st.run && st.run.started_ms) ? d.now_ms - Number(st.run.started_ms) : null;
   const online = st.online || {};
-  const totalOnline = (typeof online.total_online_ms === "number") ? online.total_online_ms : runDur;
+  const totalOnline = (typeof online.total_online_ms === "number") ? online.total_online_ms : null;
+  const curRunOnline = (typeof online.current_run_online_ms === "number") ? online.current_run_online_ms : null;
+  const spanOnline = (typeof online.span_ms === "number") ? online.span_ms : null;
+  const downtime = (typeof online.total_downtime_ms === "number") ? online.total_downtime_ms : null;
   const runId = svc.run_id || st.run_id || "-";
+  const posState = d.positions_state || "UNKNOWN";
   $("cards").innerHTML = [
     card("服务状态", esc(state), state === "RUNNING" ? "good" : (state === "STARTING" ? "warn" : "bad")),
     card("允许开仓", canOpen ? "是" : "否", canOpen ? "good" : "bad"),
@@ -435,13 +449,21 @@ function render(d) {
       fmtAge(recon.ts_ms ? d.now_ms - Number(recon.ts_ms) : null) + " 前"),
     card("总资金 USDT", num(capital), "info"),
     card("账户快照", fmtAge(acctAge)),
-    card("累计在线", fmtAge(totalOnline), "info", "Run 时长 " + (fmtAge(runDur) || "—")),
-    card("持仓数", String((d.positions || []).filter(p => !p.error).length)),
+    card("累计在线", fmtAge(totalOnline), "info",
+      "首启至今 " + (fmtAge(spanOnline) || "—") + " · 中断 " + (fmtAge(downtime) || "—")),
+    card("本次运行", fmtAge(curRunOnline), "info", "run 数 " + String(online.run_count ?? "—")),
+    card("持仓数", String((d.positions || []).filter(p => !p.error).length),
+      posState === "OK" ? "good" : "bad", "projection " + esc(posState)),
   ].join("");
 
-  // 持仓
+  // 数据状态区（T4：epoch / 限流 / 新鲜度；缺数据 = UNKNOWN，不得渲染成 0）
+  renderDataStatus(d, svc, st, posState);
+
+  // 持仓（T4：current projection；UNKNOWN/STALE 明确展示）
   const positions = (d.positions || []).filter(p => !p.error);
   $("positions-count").textContent = String(positions.length);
+  $("positions-state").textContent = posState;
+  $("positions-state").className = "chip " + (posState === "OK" ? "ok" : "no");
   $("positions").innerHTML = positions.length
     ? table(
         [
@@ -462,12 +484,16 @@ function render(d) {
           `<td class="num">${p.unrealized_pnl !== undefined ? signed(p.unrealized_pnl) : '<span class="dim-cell">-</span>'}</td>`
         )
       )
-    : '<div class="empty"><span class="e-ic">◈</span>当前无持仓</div>';
+    : (posState === "OK")
+      ? '<div class="empty"><span class="e-ic">◈</span>当前无持仓</div>'
+      : '<div class="empty"><span class="e-ic">◈</span>current projection ' + esc(posState) + '（不展示历史旧仓）</div>';
 
-  // PnL
+  // PnL（T4：默认跨 run ALL；口径标签 + 估算单独展示）
   const pnl = d.pnl || {};
+  $("pnl-count").textContent = (pnl.run_id === "ALL") ? "跨 run（ALL）" : "当前 run";
   $("pnl-version").textContent = (pnl.pnl && pnl.pnl.calculation_version)
-    ? "口径 " + pnl.pnl.calculation_version : "";
+    ? "口径 " + pnl.pnl.calculation_version
+      + (pnl.pnl.authoritative_complete === false ? " · authoritative 不完整" : "") : "";
   if (pnl.error) {
     $("pnl").innerHTML = `<div class="empty">聚合失败: ${esc(pnl.error)}</div>`;
   } else if (!pnl.pnl) {
@@ -483,7 +509,8 @@ function render(d) {
         <span class="sub">run ${esc((pnl.run_id || "").slice(0, 16))}</span>
       </div>
       <div class="pnl-grid">` + [
-        ["资金费", pnl.pnl.funding_pnl],
+        ["资金费(authoritative)", pnl.pnl.funding_pnl],
+        ["估算资金费(单独展示)", pnl.pnl.estimated_funding_pnl],
         ["手续费", pnl.pnl.trading_fee],
         ["基差", pnl.pnl.basis_pnl],
         ["已实现", pnl.pnl.realized_pnl],
@@ -547,6 +574,57 @@ function render(d) {
   lastTickAt = Date.now();
   $("updated").classList.remove("offline");
   $("foot-state").textContent = "online · " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function renderDataStatus(d, svc, st, posState) {
+  const el = $("data-status");
+  const md = d.market_data;
+  const rl = d.rate_limits;
+  const fr = d.freshness || {};
+  const unknown = '<span class="dim-cell">UNKNOWN</span>';
+  // epoch 行
+  let epochHtml;
+  if (!md) {
+    epochHtml = unknown + "（服务未运行或无 epoch）";
+  } else {
+    const cutoff = md.decision_cutoff_ms ? fmtTs(md.decision_cutoff_ms) : "—";
+    epochHtml =
+      `<span class="pill ${esc(md.status || "")}">${esc(md.status || "UNKNOWN")}</span>` +
+      ` <span class="dim-cell">覆盖 ${Number(md.completed ?? 0)}/${Number(md.expected ?? 0)}` +
+      ` · cutoff ${cutoff} · epoch ${esc(String(md.epoch_id || "").slice(0, 12))}</span>`;
+  }
+  // 限流行
+  let rlHtml = unknown + "（服务未运行）";
+  if (rl && typeof rl === "object" && Object.keys(rl).length) {
+    rlHtml = Object.entries(rl).map(([scope, s]) => {
+      const frozen = s.frozen ? " <span class='pill FAILED'>frozen</span>" : "";
+      const banned = s.banned ? " <span class='pill FAILED'>banned</span>" : "";
+      return `<span class="dim-cell">${esc(scope)}</span> used ` +
+        `${s.local_used ?? "—"}/${s.limit ?? "—"} in-flight ${s.in_flight ?? 0}` +
+        frozen + banned;
+    }).join(" · ");
+  }
+  // 新鲜度行
+  const acctAge = fr.account_age_ms;
+  const reconAge = fr.reconcile_age_ms;
+  const hbAge = fr.heartbeat_age_ms;
+  const syncErr = fr.ledger_sync_error ? ` <span class="pill FAILED">${esc(fr.ledger_sync_error)}</span>` : "";
+  const freshHtml =
+    `账户 ${acctAge === undefined || acctAge === null ? unknown : fmtAge(acctAge) + " 前"}` +
+    (fr.account_complete === false ? " <span class='pill FAILED'>不完整</span>" : "") +
+    ` · 对账 ${reconAge === undefined || reconAge === null ? unknown : fmtAge(reconAge) + " 前"}` +
+    ` · 心跳 ${hbAge === undefined || hbAge === null ? unknown : fmtAge(hbAge) + " 前"}` +
+    ` · 账本同步 ${fr.ledger_sync_ok === false ? "<span class='pill FAILED'>未通过</span>" : (fr.ledger_sync_ok === true ? "通过" : unknown)}` +
+    syncErr +
+    ` · projection <span class="pill ${posState === "OK" ? "COMPLETE" : "FAILED"}">${esc(posState)}</span>`;
+  el.innerHTML =
+    `<div class="pnl-grid">` + [
+      ["epoch（只有 READY 可开/换仓）", epochHtml],
+      ["限流（used / in-flight / frozen）", rlHtml],
+      ["新鲜度（账户 / 对账 / 心跳 / 账本同步）", freshHtml],
+    ].map(([k, v]) =>
+      `<div class="mini"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`
+    ).join("") + `</div>`;
 }
 
 async function tick() {

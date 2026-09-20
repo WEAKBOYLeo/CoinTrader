@@ -39,75 +39,116 @@ _FILL_LIMIT = 50
 # ---------------------------------------------------------------------------
 
 
-def _latest_positions(store: Any) -> list[dict[str, Any]]:
-    """每个 symbol 最新一条持仓快照（过滤已平仓的空快照）。"""
-    snaps = store.position_snapshots(limit=10000)
-    latest: dict[str, dict] = {}
-    for row in snaps:
-        symbol = row.get("symbol")
-        if symbol and symbol not in latest:
-            latest[symbol] = row
+def _current_positions(
+    store: Any, now_ms: int, *, stale_after_ms: int
+) -> tuple[list[dict[str, Any]], str]:
+    """current positions projection（T4/AC-12）+ 状态标签。
+
+    只读 current projection（对账/恢复写入），不以历史 position_snapshots
+    冒充当前持仓：平仓后 tombstone 行 qty=0 被过滤，不再显示旧仓。
+    状态：OK / STALE（projection 过期）/ UNKNOWN（从未建立投影）。
+    价格/基准率仅作展示从最近快照补充（不影响数量口径）。
+    """
+    rows = store.current_positions(include_tombstones=False)
+    live = [r for r in rows if _is_live_position(r)]
+    if not rows:
+        state = "UNKNOWN" if store.current_account() is None else "OK"
+        return [], state
+    latest_observed = max(int(r.get("observed_at_ms") or 0) for r in rows)
+    state = ("STALE"
+             if not latest_observed or now_ms - latest_observed > stale_after_ms
+             else "OK")
+    # 展示层补充：最近快照的价格/基准（趋势参考，不是数量来源）
+    price_map: dict[str, dict[str, Any]] = {}
+    for snap in store.position_snapshots(limit=10000):
+        symbol = snap.get("symbol")
+        if symbol and symbol not in price_map:
+            price_map[symbol] = snap
     positions: list[dict[str, Any]] = []
-    now_ms = int(time.time() * 1000)
-    for symbol, row in sorted(latest.items()):
+    for row in sorted(live, key=lambda r: str(r.get("symbol"))):
+        symbol = str(row["symbol"])
         spot_qty = Decimal(str(row.get("spot_qty") or 0))
         perp_qty = Decimal(str(row.get("perp_qty") or 0))
-        if spot_qty <= 0 and abs(perp_qty) <= 0:
-            continue
-        opened_ms = store.position_opened_ms(symbol) or row.get("ts_ms")
+        snap = price_map.get(symbol, {})
+        opened_ms = store.position_opened_ms(symbol) or row.get("observed_at_ms")
         positions.append({
             "symbol": symbol,
             "spot_qty": str(spot_qty),
             "perp_qty": str(perp_qty),
-            "spot_price": row.get("spot_price"),
-            "perp_price": row.get("perp_price"),
-            "basis_pct": row.get("basis_pct"),
+            "spot_price": row.get("spot_price") or snap.get("spot_price"),
+            "perp_price": row.get("perp_price") or snap.get("perp_price"),
+            "basis_pct": snap.get("basis_pct"),
             "hedge_ratio": str(abs(perp_qty) / spot_qty) if spot_qty > 0 else None,
             "opened_ms": opened_ms,
             "age_ms": now_ms - int(opened_ms) if opened_ms else None,
-            "snapshot_ts_ms": row.get("ts_ms"),
+            "observed_at_ms": row.get("observed_at_ms"),
         })
-    return positions
+    return positions, state
 
 
-def _latest_pnl(store: Any) -> dict[str, Any] | None:
-    """最近一个 run 的 PnL 分项（无实时报价 → unrealized 用最近快照口径）。"""
+def _is_live_position(row: dict[str, Any]) -> bool:
+    spot_qty = Decimal(str(row.get("spot_qty") or 0))
+    perp_qty = Decimal(str(row.get("perp_qty") or 0))
+    return spot_qty > 0 or abs(perp_qty) > 0
+
+
+def _pnl_block(store: Any) -> dict[str, Any] | None:
+    """PnL 默认跨 run（for_all_runs）；current run id 仅作上下文。
+
+    口径标签（T4/AC-12）：``authoritative_complete`` 与
+    ``estimated_funding_pnl`` 单独字段展示，估算不得混入 authoritative。
+    """
     run = store.latest_run_session()
-    if run is None:
-        return None
     try:
         from ..reporting.pnl import PnlAggregator
 
-        summary = PnlAggregator(store).for_run(str(run["run_id"]))
-        return {"run_id": str(run["run_id"]), "pnl": summary.to_dict()}
+        summary = PnlAggregator(store).for_all_runs()
+        return {
+            "run_id": "ALL",
+            "current_run_id": str(run["run_id"]) if run else None,
+            "pnl": summary.to_dict(),
+        }
     except Exception as exc:  # noqa: BLE001
         logger.debug("PnL 聚合失败（不影响 WebUI 其余区块）: %s", exc)
-        return {"run_id": str(run["run_id"]), "pnl": None, "error": str(exc)}
+        return {
+            "run_id": "ALL",
+            "current_run_id": str(run["run_id"]) if run else None,
+            "pnl": None,
+            "error": str(exc),
+        }
 
 
 def build_payload(config: Config, state_provider: Callable[[], dict] | None = None) -> dict[str, Any]:
     """聚合 WebUI 单次轮询需要的全部数据。任何子块失败降级，不抛异常。"""
     now_ms = int(time.time() * 1000)
+    service: dict[str, Any] = {}
+    if state_provider is not None:
+        try:
+            service = state_provider() or {}
+        except Exception as exc:  # noqa: BLE001
+            service = {"error": str(exc)}
     payload: dict[str, Any] = {
         "now_ms": now_ms,
-        "service": {},
+        "service": service,
         "status": {},
         "positions": [],
+        "positions_state": "UNKNOWN",
         "orders": [],
         "fills": [],
         "pnl": None,
+        # T4：来自服务内存快照的数据状态区（服务未运行时为 None，不得渲染成 0）
+        "market_data": service.get("market_data"),
+        "rate_limits": service.get("rate_limits"),
+        "freshness": {},
         "store_available": False,
     }
 
-    # 内存快照（主循环最新状态）
-    try:
-        if state_provider is not None:
-            payload["service"] = state_provider() or {}
-    except Exception as exc:  # noqa: BLE001
-        payload["service"] = {"error": str(exc)}
-
     db_path = config.resolved_path(config.execution.state_db)
     if not db_path.exists():
+        # 无账本时仍暴露服务侧新鲜度（不得把 UNKNOWN 渲染成 0）
+        svc_freshness = service.get("freshness")
+        if isinstance(svc_freshness, dict):
+            payload["freshness"] = svc_freshness
         return payload
     payload["store_available"] = True
 
@@ -136,6 +177,7 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
                 "mode": runtime.get("mode", {}).get("value"),
                 "can_open": runtime.get("can_open", {}).get("value") == "1",
                 "total_capital": runtime.get("total_capital", {}).get("value"),
+                "current_account": store.current_account(),
                 "account_snapshot_ts_ms": acct.get("ts_ms") if acct else None,
                 "account_snapshot_age_ms": (
                     now_ms - int(acct["ts_ms"]) if acct and acct.get("ts_ms") else None
@@ -147,6 +189,13 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
                         m for m in str(recon.get("mismatches", "")).split(",") if m
                     ] if recon else [],
                 },
+                "reconcile_age_ms": (
+                    now_ms - int(recon["ts_ms"]) if recon and recon.get("ts_ms") else None
+                ),
+                "heartbeat_age_ms": (
+                    now_ms - int(latest_run["last_heartbeat_ms"])
+                    if latest_run and latest_run.get("last_heartbeat_ms") else None
+                ),
                 "open_pairs": [
                     {"pair_execution_id": str(r.get("pair_execution_id")),
                      "symbol": str(r.get("symbol")), "kind": str(r.get("kind")),
@@ -164,22 +213,28 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
             logger.debug("WebUI 状态块聚合失败: %s", exc)
             payload["status"] = {"error": str(exc)}
 
-        # 持仓块
+        # 持仓块（T4：current projection，不是历史快照；UNKNOWN/STALE 明确标记）
         try:
-            positions = _latest_positions(store)
-            run = store.latest_run_session()
-            if run and positions:
+            stale_after_ms = max(
+                int(config.execution.snapshot_interval_seconds) * 3000, 60_000
+            )
+            positions, positions_state = _current_positions(
+                store, now_ms, stale_after_ms=stale_after_ms
+            )
+            if positions:
                 from ..reporting.pnl import PnlAggregator
 
-                summary = PnlAggregator(store).for_run(str(run["run_id"]))
+                summary = PnlAggregator(store).for_all_runs()
                 by_symbol = {item.symbol: item.unrealized_pnl for item in summary.per_pair}
                 for pos in positions:
                     if pos["symbol"] in by_symbol:
                         pos["unrealized_pnl"] = str(by_symbol[pos["symbol"]])
             payload["positions"] = positions
+            payload["positions_state"] = positions_state
         except Exception as exc:  # noqa: BLE001
             logger.debug("WebUI 持仓块聚合失败: %s", exc)
             payload["positions"] = [{"error": str(exc)}]
+            payload["positions_state"] = "UNKNOWN"
 
         # 订单/成交块（最近 N 条，倒序）
         try:
@@ -191,11 +246,38 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
         except Exception as exc:  # noqa: BLE001
             payload["fills"] = [{"error": str(exc)}]
 
-        # PnL 块
+        # PnL 块（T4：默认跨 run，口径标签在 pnl 字典内）
         try:
-            payload["pnl"] = _latest_pnl(store)
+            payload["pnl"] = _pnl_block(store)
         except Exception as exc:  # noqa: BLE001
             payload["pnl"] = {"error": str(exc)}
+
+        # 新鲜度汇总（T4：Web/CLI 统一口径；服务未运行时仅有账本侧数据）
+        try:
+            status = payload["status"]
+            svc_freshness = service.get("freshness") or {}
+            payload["freshness"] = {
+                "account_ts_ms": svc_freshness.get("account_ts_ms",
+                                                  status.get("account_snapshot_ts_ms")),
+                "account_age_ms": svc_freshness.get("account_age_ms",
+                                                   status.get("account_snapshot_age_ms")),
+                "account_complete": svc_freshness.get(
+                    "account_complete",
+                    (status.get("current_account") or {}).get("complete") == 1
+                    if status.get("current_account") else None,
+                ),
+                "reconcile_age_ms": svc_freshness.get("reconcile_age_ms",
+                                                      status.get("reconcile_age_ms")),
+                "reconcile_ok": svc_freshness.get("reconcile_ok",
+                                                  (status.get("last_reconciliation") or {})
+                                                  .get("consistent")),
+                "heartbeat_age_ms": status.get("heartbeat_age_ms"),
+                "positions_state": payload["positions_state"],
+                "ledger_sync_ok": svc_freshness.get("ledger_sync_ok"),
+                "ledger_sync_error": svc_freshness.get("ledger_sync_error"),
+            }
+        except Exception:  # noqa: BLE001
+            payload["freshness"] = {"positions_state": payload["positions_state"]}
     finally:
         store.close()
 

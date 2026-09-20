@@ -156,6 +156,45 @@ def _redacted_config(config: Config, output: Path) -> None:
     output.write_text(text, encoding="utf-8")
 
 
+def _scan_epochs_summary(store: Any) -> dict[str, Any]:
+    """epoch 完整性摘要（manifest 用）。"""
+    epochs = store.scan_epochs(limit=1000)
+    latest = epochs[0] if epochs else None
+    return {
+        "count": len(epochs),
+        "latest": (
+            {
+                "epoch_id": latest.get("epoch_id"),
+                "status": latest.get("status"),
+                "decision_cutoff_ms": latest.get("decision_cutoff_ms"),
+            }
+            if latest else None
+        ),
+    }
+
+
+def _funding_authority_summary(store: Any) -> dict[str, Any]:
+    """资金费 authority 口径汇总（T4：报告 manifest 可验证性）。
+
+    authoritative_complete：每个 ESTIMATED 结算 (symbol, ts) 都有对应的
+    AUTHORITATIVE 行（否则报告需声明估算成分）。
+    """
+    rows = store.funding_cashflows(limit=100000)
+    authoritative: set[tuple[str, int]] = set()
+    estimated: set[tuple[str, int]] = set()
+    for r in rows:
+        key = (str(r.get("symbol")), int(r.get("funding_ts_ms") or 0))
+        if str(r.get("authority")) == "AUTHORITATIVE":
+            authoritative.add(key)
+        else:
+            estimated.add(key)
+    return {
+        "authoritative_rows": len(authoritative),
+        "estimated_rows": len(estimated),
+        "authoritative_complete": estimated <= authoritative,
+    }
+
+
 def export_report(
     store: StateStore,
     config: Config,
@@ -303,6 +342,11 @@ def export_report(
         "code_revision": code_revision,
         "strategy_version": strategy_version or run.get("strategy_version"),
         "config_hash": config_hash or run.get("config_hash"),
+        # T4：迁移版本 + authority 口径 + cursor/epoch 完整性（报告可验证性）
+        "schema_version": store.schema_version(),
+        "funding_authority": _funding_authority_summary(store),
+        "sync_cursors": store.sync_cursors(),
+        "scan_epochs": _scan_epochs_summary(store),
         "files": files,
         "integrity_check": "PASS" if integrity_ok else "FAIL",
         "redaction_check": "PASS" if not redaction_hits else "FAIL",

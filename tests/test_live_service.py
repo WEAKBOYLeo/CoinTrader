@@ -263,3 +263,41 @@ class TestTimeResync:
         r = svc.run_once()
         assert r["state"] == "RECOVERY"
         assert "偏移" in svc._recovery_reason  # noqa: SLF001
+
+
+class TestT4WebSnapshot:
+    """T4/AC-10：web_snapshot 带限流/市场就绪/新鲜度，且 JSON 可序列化。"""
+
+    def test_web_snapshot_includes_t4_blocks_json_serializable(self, tmp_path):
+        import json
+
+        env = _env(tmp_path)
+        snap = env["svc"].web_snapshot()
+        assert "rate_limits" in snap and "market_data" in snap and "freshness" in snap
+        assert snap["freshness"]["ledger_sync_ok"] is True
+        assert "account_age_ms" in snap["freshness"]
+        assert "heartbeat" not in str(type(snap))  # 无异常对象混入
+        json.dumps(snap)  # 不含异常对象/凭据，全可序列化
+
+    def test_web_snapshot_market_data_readiness(self, tmp_path):
+        from cointrader.live.market_sync import DataReadiness, ScanEpochStatus
+
+        env = _env(tmp_path)
+        svc = env["svc"]
+
+        class _StubSync:
+            def readiness(self, now_ms: int | None = None) -> DataReadiness:
+                return DataReadiness(
+                    epoch_id="ep-1", status=ScanEpochStatus.READY,
+                    expected=3, completed=3, excluded_count=0, failed_count=0,
+                    missing=(), failed={}, age_ms=1000, reason="",
+                )
+
+            def latest_ready(self) -> object:
+                return None
+
+        svc.synchronizer = _StubSync()  # type: ignore[assignment]
+        snap = svc.web_snapshot()
+        assert snap["market_data"]["status"] == "READY"
+        assert snap["market_data"]["can_rank"] is True
+        assert snap["market_data"]["expected"] == 3

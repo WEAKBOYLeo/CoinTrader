@@ -189,6 +189,7 @@ class LiveService:
         # 账本同步闸门：无事实同步器时视为 legacy 路径（True）；
         # 有同步器时首次同步通过前 False（禁止开仓）
         self._ledger_sync_ok = exch_sync is None
+        self._ledger_sync_error = ""  # T4：最后一次 facts 同步失败原因（Web 展示）
 
     # -- 状态 ---------------------------------------------------------------
 
@@ -265,6 +266,27 @@ class LiveService:
             gate_state = self.gate.state.value
         except Exception:  # noqa: BLE001
             gate_state = None
+        # T4：限流器快照（JSON 可序列化，不含 URL/密钥）
+        rate_limits: dict[str, Any] | None = None
+        if self.exch_sync is not None:
+            rate_limits = self._rate_limits_snapshot()
+        # T4：市场数据就绪度（epoch status/coverage/cutoff）
+        market_data: dict[str, Any] | None = None
+        if self.strategy is not None and self.synchronizer is not None:
+            market_data = self._market_data_readiness(now_ms)
+        # T4：新鲜度块（账户/对账/心跳年龄，供 Web/CLI 统一展示）
+        acct_ts = None if acct is None else int(getattr(acct, "ts_ms", 0) or 0)
+        freshness = {
+            "account_ts_ms": acct_ts,
+            "account_age_ms": (now_ms - acct_ts) if acct_ts else None,
+            "account_complete": bool(acct is not None and acct.complete),
+            "reconcile_age_ms": (
+                now_ms - self._last_reconcile_ms if self._last_reconcile_ms else None
+            ),
+            "reconcile_ok": self._reconcile_ok,
+            "ledger_sync_ok": self._ledger_sync_ok,
+            "ledger_sync_error": self._ledger_sync_error,
+        }
         return {
             "state": self.state.value,
             "recovery_reason": self._recovery_reason,
@@ -294,9 +316,76 @@ class LiveService:
             "last_reconcile_age_ms": (
                 now_ms - self._last_reconcile_ms if self._last_reconcile_ms else None
             ),
+            "rate_limits": rate_limits,
+            "market_data": market_data,
+            "freshness": freshness,
             "code_revision": self.code_revision,
             "metrics": self.metrics.snapshot(),
         }
+
+    def _rate_limits_snapshot(self) -> dict[str, Any] | None:
+        """共享限流协调器的只读快照（T4：Web 展示 used/in-flight/frozen）。"""
+        try:
+            client = getattr(self.spot, "client", None)
+            limiter = getattr(client, "coordinator", None)
+            if limiter is None or not hasattr(limiter, "snapshot"):
+                return None
+            t = float(limiter.now())
+            snap = limiter.snapshot()
+            out: dict[str, Any] = {}
+            for scope, s in snap.items():
+                frozen = bool(s.frozen_until is not None and t < s.frozen_until)
+                banned = bool(s.ban_until is not None and t < s.ban_until)
+                out[str(getattr(scope, "value", scope))] = {
+                    "limit": int(s.limit),
+                    "soft_limit": float(s.soft_limit),
+                    "observed_used": int(s.observed_used) if s.observed_used is not None else None,
+                    "in_flight": int(s.in_flight),
+                    "local_used": int(s.local_used),
+                    "frozen": frozen,
+                    "banned": banned,
+                    "seconds_to_unfreeze": (
+                        int(max(0, s.frozen_until - t)) if frozen else None
+                    ),
+                    "freezes": int(s.freezes),
+                    "bans": int(s.bans),
+                }
+            return out or None
+        except Exception:  # noqa: BLE001 —— 诊断块失败不影响快照主体
+            logger.debug("限流器快照失败", exc_info=True)
+            return None
+
+    def _market_data_readiness(self, now_ms: int) -> dict[str, Any] | None:
+        """epoch 就绪度 → 可序列化 dict（T4：Web 数据状态区）。"""
+        try:
+            synchronizer = self.synchronizer
+            if synchronizer is None:
+                return None
+            rd = synchronizer.readiness(now_ms)
+            if rd is None:
+                return None
+            cutoff_ms: int | None = None
+            try:
+                epochs = self.store.scan_epochs(limit=1)
+                if epochs:
+                    cutoff_ms = epochs[0].get("decision_cutoff_ms")
+            except Exception:  # noqa: BLE001
+                cutoff_ms = None
+            return {
+                "epoch_id": str(rd.epoch_id),
+                "status": str(rd.status.value),
+                "can_rank": bool(rd.can_rank),
+                "expected": int(rd.expected),
+                "completed": int(rd.completed),
+                "excluded_count": int(rd.excluded_count),
+                "failed_count": int(rd.failed_count),
+                "age_ms": int(rd.age_ms),
+                "reason": str(rd.reason or ""),
+                "decision_cutoff_ms": cutoff_ms,
+            }
+        except Exception:  # noqa: BLE001
+            logger.debug("epoch 就绪度快照失败", exc_info=True)
+            return None
 
     def _check_leverage_margin(
         self, symbol: str, want_lev: int, want_margin: str
@@ -443,8 +532,10 @@ class LiveService:
                 ]
                 if bad:
                     self._ledger_sync_ok = False
+                    self._ledger_sync_error = "; ".join(bad[:3])
                     self.enter_recovery(f"事实同步失败: {'; '.join(bad[:3])}")
                     return False
+                self._ledger_sync_error = ""
         result = self.reconciler.run(reason="periodic", snapshot=bundle)
         self._last_reconcile_ms = now_ms
         self._reconcile_ok = result.can_open
@@ -749,6 +840,7 @@ class LiveService:
                         if r.error or not r.complete
                     ]
                     self._ledger_sync_ok = not bad
+                    self._ledger_sync_error = "; ".join(bad[:3])
                     if bad:
                         startup_gates.append(f"事实同步未完成: {'; '.join(bad[:3])}")
             result = self.reconciler.run(reason="startup", snapshot=bundle)
@@ -881,6 +973,7 @@ class LiveService:
                         if r.error or not r.complete
                     ]
                     self._ledger_sync_ok = not bad and bundle.complete
+                    self._ledger_sync_error = "; ".join(bad[:3])
                 except SyncCaptureError as exc:
                     self._recovery_reason = f"capture 失败: {exc}"
                     self._persist_runtime_state()

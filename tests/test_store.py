@@ -306,3 +306,95 @@ class TestSnapshots:
         with store._lock:  # noqa: SLF001
             cols = [r[1] for r in store._conn.execute("PRAGMA table_info(orders)")]  # noqa: SLF001
         assert not any("secret" in c or "signature" in c for c in cols), "账本不得保存签名/密钥"
+
+
+class TestOnlineStats:
+    """v2 在线/中断时长口径（T4/AC-09，固定时钟手算）。
+
+    规则：已结束 run 计 [started, ended]（INTERRUPTED 按 heartbeat 截断）；
+    未结束 run 计到 min(now, last_heartbeat + freshness)；重叠/负值截断；
+    重启不清零累计。
+    """
+
+    FRESH = 120_000  # heartbeat 新鲜度裕量（与 online_stats 默认一致）
+
+    def _start(self, store: StateStore, run_id: str, started_ms: int) -> None:
+        store.start_run_session(
+            run_id=run_id, started_ms=started_ms, mode="testnet",
+            strategy_version="t", config_hash="h", code_revision="rev",
+            spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+        )
+
+    def test_graceful_stop_counts_full_duration(self, store: StateStore) -> None:
+        self._start(store, "run-1", 1_000)
+        store.end_run_session("run-1", ended_ms=61_000, status="STOPPED",
+                              stop_reason="graceful_stop")
+        stats = store.online_stats(now_ms=1_000_000)
+        assert stats["run_count"] == 1
+        assert stats["total_online_ms"] == 60_000
+        assert stats["first_start_ms"] == 1_000
+        assert stats["last_end_ms"] == 61_000
+        assert stats["current_run_online_ms"] is None
+        # span = 首启 → now（含当前停机段）；downtime = span - 在线
+        assert stats["span_ms"] == 1_000_000 - 1_000
+        assert stats["total_downtime_ms"] == stats["span_ms"] - 60_000
+
+    def test_kill_then_late_restart_counts_downtime_not_online(
+        self, store: StateStore
+    ) -> None:
+        """kill 后 5 小时才重启：停机 5h 不计在线，累计不重置。"""
+        self._start(store, "run-1", 1_000)
+        store.update_run_heartbeat("run-1", now_ms=361_000)  # 在线 6 分钟后被杀
+        store.mark_interrupted_sessions(now_ms=361_000 + 1)  # ended 按 heartbeat 截断
+        self._start(store, "run-2", 361_000 + 5 * 3_600_000)  # 5 小时后重启
+        store.update_run_heartbeat("run-2", now_ms=361_000 + 5 * 3_600_000 + 60_000)
+        now = 361_000 + 5 * 3_600_000 + 60_000
+        stats = store.online_stats(now_ms=now)
+        assert stats["run_count"] == 2
+        # run-1 在线 6min（heartbeat 截断）+ run-2 在线 60s
+        assert stats["total_online_ms"] == 360_000 + 60_000
+        assert stats["current_run_online_ms"] == 60_000
+        assert stats["span_ms"] == now - 1_000
+        assert stats["total_downtime_ms"] == stats["span_ms"] - (360_000 + 60_000)
+
+    def test_open_run_without_fresh_heartbeat_not_counted_past_allowance(
+        self, store: StateStore
+    ) -> None:
+        """心跳停更 10 分钟的未结束会话：在线只计到 heartbeat+freshness。"""
+        self._start(store, "run-1", 1_000)
+        store.update_run_heartbeat("run-1", now_ms=121_000)
+        # now 比心跳晚 10 分钟（远超 2 分钟裕量）
+        stats = store.online_stats(now_ms=121_000 + 600_000)
+        expected_end = 121_000 + self.FRESH
+        assert stats["total_online_ms"] == expected_end - 1_000
+        assert stats["current_run_online_ms"] == expected_end - 1_000
+
+    def test_overlapping_and_negative_sessions_clamped(self, store: StateStore) -> None:
+        """重叠区间只计一次；ended < started 的脏数据不产生负在线。"""
+        self._start(store, "run-1", 1_000)
+        store.end_run_session("run-1", ended_ms=61_000, status="STOPPED",
+                              stop_reason="graceful_stop")
+        self._start(store, "run-2", 30_000)  # 与 run-1 重叠 30s
+        store.end_run_session("run-2", ended_ms=91_000, status="STOPPED",
+                              stop_reason="graceful_stop")
+        self._start(store, "run-3", 200_000)
+        store.end_run_session("run-3", ended_ms=150_000, status="STOPPED",  # 负时长脏数据
+                              stop_reason="graceful_stop")
+        stats = store.online_stats(now_ms=1_000_000)
+        # run-1+run-2 合并为 [1_000, 91_000] = 90s；run-3 = 0
+        assert stats["total_online_ms"] == 90_000
+        assert stats["total_downtime_ms"] >= 0
+
+    def test_three_runs_cumulative_never_resets(self, store: StateStore) -> None:
+        """三次 run：累计 = 各段在线之和（重启不清零）。"""
+        for i, (start, end) in enumerate(((1_000, 101_000), (200_000, 251_000),
+                                          (300_000, 331_000)), start=1):
+            self._start(store, f"run-{i}", start)
+            store.end_run_session(f"run-{i}", ended_ms=end, status="STOPPED",
+                                  stop_reason="graceful_stop")
+        stats = store.online_stats(now_ms=1_000_000)
+        assert stats["run_count"] == 3
+        assert stats["total_online_ms"] == 100_000 + 51_000 + 31_000
+        assert stats["first_start_ms"] == 1_000
+        assert stats["span_ms"] == 1_000_000 - 1_000
+        assert stats["total_downtime_ms"] == stats["span_ms"] - stats["total_online_ms"]
