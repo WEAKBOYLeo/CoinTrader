@@ -52,6 +52,7 @@ class TestServiceCycle:
         data: FakeStrategyData = env["svc"].strategy.data  # noqa: SLF001
         clock = {"t": NOW}
         svc._now = lambda: clock["t"]  # noqa: SLF001
+        svc.strategy._now = lambda: clock["t"]  # noqa: SLF001  # 刷新超龄判断用策略时钟
         svc.run_id = "run-cycle"
         env["store"].start_run_session(
             run_id="run-cycle", started_ms=int(NOW * 1000), mode="demo",
@@ -74,9 +75,9 @@ class TestServiceCycle:
         assert len(env["executor"].open_calls) == 1, f"不得重复开仓: {r2}"
         assert env["executor"].close_calls == []
 
-        # 3) 尾部费率转负 → 策略退出 → 平仓一次
+        # 3) 尾部费率转负（新结算期到点后才可见）→ 策略退出 → 平仓一次
         data.set_rates(SYMBOL, _neg_tail_rates())
-        clock["t"] = NOW + 62
+        clock["t"] = NOW + 8 * 3600 + 62
         r3 = svc.run_once()
         assert r3["state"] == "RUNNING"
         assert [c["symbol"] for c in env["executor"].close_calls] == [SYMBOL]
@@ -86,7 +87,7 @@ class TestServiceCycle:
         # 4) 平仓成交 → 交易所持仓归零 → 下一轮不再开新仓
         spot.balances_map["BTC"] = Decimal("0")
         futures.position_amt = Decimal("0")
-        clock["t"] = NOW + 93
+        clock["t"] = NOW + 8 * 3600 + 93
         r4 = svc.run_once()
         assert r4["state"] == "RUNNING"
         assert len(env["executor"].open_calls) == 1, f"平仓后费率仍为负，不得开新仓: {r4}"
@@ -138,7 +139,8 @@ class TestServiceCycle:
         data.set_rates(SYMBOL, _neg_tail_rates())
         clock_t = {"t": NOW}
         svc._now = lambda: clock_t["t"]  # noqa: SLF001
-        clock_t["t"] = NOW + 31
+        svc.strategy._now = lambda: clock_t["t"]  # noqa: SLF001  # 刷新超龄判断用策略时钟
+        clock_t["t"] = NOW + 8 * 3600 + 31  # 跨过结算周期，新（负）费率可见
 
         # 让平仓返回失败
         def failing_close(symbol: str, **kw: Any) -> Any:

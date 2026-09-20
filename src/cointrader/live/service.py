@@ -167,7 +167,6 @@ class LiveService:
         self._submitted_this_run: set[str] = set()
         self._account_result: AccountStateResult | None = None
         self._held: dict[str, HeldPosition] = {}
-        self._last_candidate_refresh_ms = 0
         self._last_snapshot_ms = 0
         self._leverage_checked: set[str] = set()
         self._reconcile_ok = False
@@ -775,12 +774,10 @@ class LiveService:
                 self.enter_recovery(f"账本写入失败: {exc}")
                 return {"state": "RECOVERY", "reason": self._recovery_reason}
 
-        # 低频候选刷新（§7.1：不在 5s 主循环拉全市场历史）
+        # 候选刷新：每 tick 调用；strategy 内部按各币结算周期判超龄、按分钟限流量，
+        # 无超龄币时纯内存判断（§7.1）
         if self.strategy is not None:
-            refresh_ms = int(self.config.execution.candidate_refresh_seconds * 1000)
-            if now_ms - self._last_candidate_refresh_ms >= refresh_ms:
-                self.strategy.refresh_candidates()
-                self._last_candidate_refresh_ms = now_ms
+            self.strategy.refresh_candidates()
 
         # 无策略协调器：兼容旧 signal_provider 路径（仅测试/过渡期）
         if self.strategy is None:

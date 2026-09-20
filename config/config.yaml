@@ -206,7 +206,9 @@ execution:
   candidate_pool_max_symbols: 100
   # 动态候选池刷新周期（秒）；失败保留旧池
   universe_refresh_seconds: 1800
-  # 候选指标低频刷新（秒）；主循环不重复拉历史
+  # 每 60 秒窗口内最多刷新的候选 symbol 数（API 按分钟限流；摊平结算边界突发）
+  candidate_refetch_per_minute: 6
+  # 候选最小刷新间隔（秒）；实际每币间隔 = max(本值, 该币资金费结算周期 1/4/8h)
   candidate_refresh_seconds: 300
   # 候选指标缓存最大年龄（秒）；超过拒绝开仓
   max_candidate_data_age_seconds: 1800

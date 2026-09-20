@@ -153,6 +153,8 @@ class LiveStrategy:
         self.candidates: dict[str, CandidateCache] = {}
         self._universe: list[str] = []
         self._universe_ts_ms = 0
+        self._refetch_win_start = 0.0
+        self._refetch_win_count = 0
 
     # -- 低频刷新 -------------------------------------------------------------
 
@@ -211,7 +213,13 @@ class LiveStrategy:
         return len(removed)
 
     def refresh_candidates(self) -> None:
-        """刷新候选池（动态模式低频）与候选指标缓存。失败保留旧缓存并标记 error/数据年龄。"""
+        """刷新候选指标缓存（由 service 每个 tick 调用，内部判断超龄才拉取）。
+
+        每币刷新间隔 = 该币自己的资金费结算周期（两次结算之间费率不变，
+        提前刷无新信息）；每 60 秒窗口限量 ``candidate_refetch_per_minute``
+        个 symbol，把 00/04/08/12/16/20 UTC 结算边界的全员到点摊开，
+        不撞 API 按分钟计的限流。失败保留旧缓存并标记 error/数据年龄。
+        """
         self.refresh_universe()
         entry = self.config.strategy.entry
         exit_cfg = self.config.strategy.exit
@@ -221,7 +229,29 @@ class LiveStrategy:
             exit_cfg.exit_lookback_periods,
         ) + 5
 
+        now = self._now()
+        # 每 60s 窗口限流（币安限流按分钟计，边界全员到点不能一次全拉）
+        if now - self._refetch_win_start >= 60.0:
+            self._refetch_win_start = now
+            self._refetch_win_count = 0
+        budget = int(self.config.execution.candidate_refetch_per_minute) - self._refetch_win_count
+        if budget <= 0:
+            return
+        min_refetch_ms = int(self.config.execution.candidate_refresh_seconds * 1000)
+        due: list[tuple[int, str]] = []
         for symbol in self.candidate_symbols:
+            cache = self.candidates.get(symbol)
+            if cache is None:
+                due.append((0, symbol))
+                continue
+            interval_ms = int(cache.interval_hours) * 3600 * 1000
+            age_ms = int(now * 1000) - cache.refreshed_ts_ms
+            if cache.error or age_ms >= max(interval_ms, min_refetch_ms):
+                due.append((cache.refreshed_ts_ms, symbol))
+        due.sort(key=lambda item: item[0])  # 最旧的先刷
+        self._refetch_win_count += min(len(due), budget)
+
+        for _ts, symbol in due[:budget]:
             old = self.candidates.get(symbol)
             try:
                 raw = self.data.funding_rates(symbol, periods)
@@ -390,11 +420,15 @@ class LiveStrategy:
             return skip(ReasonCode.INSUFFICIENT_HISTORY, "候选指标缓存不存在（刷新失败）")
         if cache.error:
             return skip(ReasonCode.STALE_DATA, f"候选指标缓存异常: {cache.error}")
-        max_age_ms = int(self.config.execution.max_candidate_data_age_seconds * 1000)
-        if self._cache_age_ms(cache) > max_age_ms:
+        # 数据年龄上限 = 该币结算周期 + 宽限（两次结算间费率不变，超龄=刷新掉链）
+        stale_after_ms = (
+            int(cache.interval_hours) * 3600 * 1000
+            + int(self.config.execution.max_candidate_data_age_seconds * 1000)
+        )
+        if self._cache_age_ms(cache) > stale_after_ms:
             return skip(
                 ReasonCode.STALE_DATA,
-                f"候选指标数据年龄 {self._cache_age_ms(cache)}ms 超过 {max_age_ms}ms",
+                f"候选指标数据年龄 {self._cache_age_ms(cache)}ms 超过 {stale_after_ms}ms",
             )
         if len(cache.rates) < entry.lookback_periods:
             return skip(

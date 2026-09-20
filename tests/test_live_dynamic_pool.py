@@ -107,6 +107,54 @@ class TestDynamicPoolSelection:
         assert strat.candidate_symbols == ("BTCUSDT",)
 
 
+class TestRefetchRateLimit:
+    """结算边界全员到点：每 60s 窗口限量，不能一次全拉（API 按分钟限流）。"""
+
+    def _ten_symbol_env(self, tmp_path):
+        clock = {"t": NOW}
+        universe = tuple(f"S{i:02d}USDT" for i in range(10))
+        data = FakeStrategyData(
+            {s: make_rate_series(20, RATE_OK) for s in universe},
+            universe=universe,
+            volumes_24h={s: 50e6 for s in universe},
+        )
+        cfg = _dyn_config(candidate_pool_max_symbols=10, candidate_refetch_per_minute=3)
+        strat, _ = make_strategy(tmp_path, data, config=cfg, now_fn=lambda: clock["t"])
+        return strat, data, clock
+
+    def test_boundary_burst_spread_over_windows(self, tmp_path):
+        strat, data, clock = self._ten_symbol_env(tmp_path)
+        strat.refresh_candidates()
+        assert data.funding_calls == 3  # 首批只刷 3 个
+        strat.refresh_candidates()  # 同窗口内：预算耗尽，不再拉
+        assert data.funding_calls == 3
+        clock["t"] = NOW + 61
+        strat.refresh_candidates()
+        assert data.funding_calls == 6
+        clock["t"] = NOW + 122
+        strat.refresh_candidates()
+        assert data.funding_calls == 9
+        clock["t"] = NOW + 183
+        strat.refresh_candidates()
+        assert data.funding_calls == 10
+
+    def test_fresh_cache_not_refetched_before_boundary(self, tmp_path):
+        strat, data, clock = self._ten_symbol_env(tmp_path)
+        clock["t"] = NOW + 600  # 10 分钟：全部刷完（5 窗口 × 3）
+        for _ in range(5):
+            strat.refresh_candidates()
+            clock["t"] += 61
+        assert data.funding_calls == 10
+        strat.refresh_candidates()  # 刚刷过（< 8h 周期）：不重拉
+        assert data.funding_calls == 10
+        clock["t"] = NOW + 7 * 3600  # 7h < 8h 周期：仍未到点
+        strat.refresh_candidates()
+        assert data.funding_calls == 10
+        clock["t"] = NOW + 8 * 3600 + 1000  # 跨过各自 fetch 时间 + 结算周期：重拉
+        strat.refresh_candidates()
+        assert data.funding_calls > 10
+
+
 class TestDynamicOpenFlow:
     def test_pending_then_entry_ok(self, tmp_path):
         strat, _ = make_strategy(tmp_path, _data(), config=_dyn_config())

@@ -382,6 +382,7 @@ class FakeStrategyData:
         self._volume_24h = dict(volumes_24h or {})
         self._universe_fail = universe_fail
         self.universe_calls = 0
+        self.funding_calls = 0
 
     def rates(self, symbol: str) -> list[tuple[int, Decimal, Decimal]]:
         return list(self._rates.get(symbol, []))
@@ -391,6 +392,7 @@ class FakeStrategyData:
 
     def funding_rates(self, symbol: str, periods: int) -> list[tuple[int, Decimal, Decimal]]:
         raw = self._rates.get(symbol, [])
+        self.funding_calls += 1
         now_ms = int(time.time() * 1000)
         settled = [(ts, r, m) for (ts, r, m) in raw if ts <= now_ms]
         return settled[-periods:]

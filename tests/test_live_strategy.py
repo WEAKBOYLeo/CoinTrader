@@ -106,13 +106,15 @@ class TestEntry:
         data = FakeStrategyData({SYMBOL: make_rate_series(20, RATE_OK)})
         strat, _ = make_strategy(tmp_path, data, config=cfg, now_fn=lambda: clock["t"])
         strat.refresh_candidates()
-        clock["t"] = NOW + 2000  # 超过 max_candidate_data_age_seconds=1800
+        # 超龄上限 = 结算周期 8h + max_candidate_data_age 30min；超过 9h 才拒绝
+        clock["t"] = NOW + 9 * 3600
         decision = strat.can_open(SYMBOL, make_context())
         assert decision.reason_code is ReasonCode.STALE_DATA
 
     def test_candidate_refresh_failure_keeps_old_cache_and_flags_error(self, tmp_path):
+        clock = {"t": NOW}
         data = FakeStrategyData({SYMBOL: make_rate_series(20, RATE_OK)})
-        strat, _ = make_strategy(tmp_path, data)
+        strat, _ = make_strategy(tmp_path, data, now_fn=lambda: clock["t"])
         strat.refresh_candidates()
         # 刷新失败 → 保留旧缓存但标记 error，本轮拒绝
         data.set_rates(SYMBOL, [])
@@ -122,8 +124,9 @@ class TestEntry:
                 raise RuntimeError("api down")
 
         strat.data = _Boom({})  # type: ignore[assignment]
+        clock["t"] = NOW + 8 * 3600 + 60  # 跨过结算周期 → 触发重刷 → 失败
         strat.refresh_candidates()
-        decision = strat.can_open(SYMBOL, make_context())
+        decision = strat.can_open(SYMBOL, make_context(now_ms=int(clock["t"] * 1000)))
         assert decision.reason_code is ReasonCode.STALE_DATA
         assert "api down" in decision.reason_text
 

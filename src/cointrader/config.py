@@ -341,9 +341,11 @@ class ExecutionConfig:
     live_symbols: tuple[str, ...] = ()
     # 动态候选池最大 symbol 数（0 = 不限；越大 Binance API 权重开销越大）
     candidate_pool_max_symbols: int = 100
-    # 动态候选池刷新周期（秒）；池内指标仍按 candidate_refresh_seconds 刷新
+    # 动态候选池刷新周期（秒）；池内指标仍按各币资金费结算周期刷新
     universe_refresh_seconds: float = 1800.0
-    # 候选指标低频刷新周期（秒）；主循环不用全市场扫描
+    # 每 60 秒窗口内最多刷新的候选 symbol 数（API 按分钟限流；摊平结算边界突发）
+    candidate_refetch_per_minute: int = 6
+    # 候选最小刷新间隔（秒）；实际每币间隔 = max(本值, 该币资金费结算周期)
     candidate_refresh_seconds: float = 300.0
     # 候选指标缓存允许的最大年龄（秒）；超过则拒绝开仓
     max_candidate_data_age_seconds: float = 1800.0
@@ -391,6 +393,11 @@ class ExecutionConfig:
             raise ConfigError(
                 f"execution.candidate_pool_max_symbols 必须 >= 0，"
                 f"当前 {self.candidate_pool_max_symbols}"
+            )
+        if self.candidate_refetch_per_minute < 1:
+            raise ConfigError(
+                f"execution.candidate_refetch_per_minute 必须 >= 1，"
+                f"当前 {self.candidate_refetch_per_minute}"
             )
         for symbol in self.live_symbols:
             if not symbol.upper().endswith("USDT"):
@@ -535,6 +542,7 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         live_symbols=tuple(str(s).upper() for s in sec.get("live_symbols", [])),
         candidate_pool_max_symbols=int(sec.get("candidate_pool_max_symbols", 100)),
         universe_refresh_seconds=float(sec.get("universe_refresh_seconds", 1800.0)),
+        candidate_refetch_per_minute=int(sec.get("candidate_refetch_per_minute", 6)),
         candidate_refresh_seconds=float(sec.get("candidate_refresh_seconds", 300.0)),
         max_candidate_data_age_seconds=float(sec.get("max_candidate_data_age_seconds", 1800.0)),
         snapshot_interval_seconds=int(sec.get("snapshot_interval_seconds", 30)),
