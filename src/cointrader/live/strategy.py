@@ -203,13 +203,12 @@ class LiveStrategy:
         )
 
     def prune_universe(self, allowed: set[str]) -> int:
-        """从池中剔除不在 ``allowed`` 内的 symbol（如启动预检发现无 Spot/Futures 规则）。"""
-        before = len(self._universe)
+        """从池中剔除不在 ``allowed`` 内的 symbol（无规则/非 TRADING/最小名义额不满足等）。"""
+        removed = [s for s in self._universe if s not in allowed]
         self._universe = [s for s in self._universe if s in allowed]
-        pruned = before - len(self._universe)
-        if pruned:
-            logger.info("候选池剔除 %d 个无规则 symbol: %s", pruned, sorted(allowed))
-        return pruned
+        if removed:
+            logger.info("候选池剔除 %d 个不可开仓 symbol: %s", len(removed), removed)
+        return len(removed)
 
     def refresh_candidates(self) -> None:
         """刷新候选池（动态模式低频）与候选指标缓存。失败保留旧缓存并标记 error/数据年龄。"""

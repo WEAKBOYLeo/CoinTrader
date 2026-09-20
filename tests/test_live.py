@@ -215,6 +215,48 @@ class TestStartup:
         assert report.symbols == ("BTCUSDT",)
         assert s_spot.started and s_perp.started, "对账通过后才启动用户流"
 
+    def test_dynamic_pool_prunes_untrading_and_unruleable_symbols(self, tmp_path) -> None:
+        """动态池：无规则 symbol 被剔除，不阻断启动（§7.1 第 7 条动态模式）。"""
+        from cointrader.execution.risk import RiskManager
+        from cointrader.execution.risk_gate import RiskGate
+        from cointrader.live.strategy import LiveStrategy
+        from conftest import FakeStrategyData, make_rate_series
+
+        cfg = make_config()  # live_symbols=() 默认 → 动态候选池
+
+        class _Rule:
+            def __init__(self, status: str = "TRADING") -> None:
+                self.status = status
+
+        data = FakeStrategyData(
+            {s: make_rate_series(10, "0.0005")
+             for s in ("AAAUSDT", "BBBUSDT", "CCUSDT")},
+            universe=("AAAUSDT", "BBBUSDT", "CCUSDT"),
+            volumes_24h={"AAAUSDT": 50e6, "BBBUSDT": 40e6, "CCUSDT": 30e6},
+        )
+        store = StateStore(tmp_path / "trading.sqlite3")
+        # BBBUSDT 无 Spot 规则；CCUSDT spot 状态 BREAK（非 TRADING）→ 两者均应被剔除
+        spot = FakeServiceAdapter(symbols=("AAAUSDT", "CCUSDT"))
+        perp = FakeServiceAdapter(symbols=("AAAUSDT", "CCUSDT"))
+        spot.load_rules = lambda: {"AAAUSDT": _Rule(), "CCUSDT": _Rule("BREAK")}  # type: ignore[method-assign]
+        perp.load_rules = lambda: {"AAAUSDT": _Rule(), "CCUSDT": _Rule()}  # type: ignore[method-assign]
+        service = LiveService(
+            config=cfg,
+            spot=spot,  # type: ignore[arg-type]
+            futures=perp,  # type: ignore[arg-type]
+            store=store,
+            gate=RiskGate(RiskManager(cfg.risk)),
+            executor=FakeExecutor(),  # type: ignore[arg-type]
+            reconciler=Reconciler(store, spot, perp),  # type: ignore[arg-type]
+            strategy=LiveStrategy(config=cfg, data=data, store=store),  # type: ignore[arg-type]
+        )
+        service.attach_streams([FakeStream("spot"), FakeStream("perp")])  # type: ignore[list-item]
+        report = service.startup()
+        assert service.state is ServiceState.RUNNING
+        assert report.symbols == ("AAAUSDT",)
+        assert service.strategy is not None
+        assert service.strategy.candidate_symbols == ("AAAUSDT",)
+
     def test_clock_offset_exceeds_limit_fails(self, service_env: dict) -> None:
         service: LiveService = service_env["service"]
         service_env["spot"]._time_offset = 9999  # noqa: SLF001

@@ -536,15 +536,35 @@ class LiveService:
                 raise LiveGateBlocked("Spot 与 Futures 无共同可交易 symbol，拒绝启动")
             want_lev = self.config.execution.leverage
             want_margin = self.config.execution.margin_type
-            # 动态候选池：先构建初始池，剔除无规则 symbol；杠杆/保证金推迟到开仓时
-            # 按需验证（池可能上百个，启动时逐个读/写不现实）。
+            # 动态候选池：先构建初始池，剔除不可开仓 symbol（无规则/非 TRADING/
+            # 最小名义额高于 canary）——单个 pool symbol 不健康不应阻断整个服务；
+            # 杠杆/保证金推迟到开仓时按需验证（池可能上百个，启动时逐个读/写不现实）。
             dynamic_pool = self.strategy is not None and self.strategy.dynamic_pool
             if dynamic_pool and self.strategy is not None:
                 self.strategy.refresh_universe()
-                pruned = self.strategy.prune_universe(set(common))
+                canary = Decimal(str(self.config.execution.canary_notional))
+                allowed: set[str] = set()
+                for symbol in self.strategy.candidate_symbols:
+                    spot_rule = spot_rules.get(symbol)
+                    perp_rule = perp_rules.get(symbol)
+                    if spot_rule is None or perp_rule is None:
+                        continue
+                    healthy = True
+                    for rule in (spot_rule, perp_rule):
+                        status = getattr(rule, "status", "")
+                        if status and status != "TRADING":
+                            healthy = False
+                            break
+                        min_notional = getattr(rule, "min_notional", None)
+                        if min_notional is not None and canary < Decimal(str(min_notional)):
+                            healthy = False
+                            break
+                    if healthy:
+                        allowed.add(symbol)
+                pruned = self.strategy.prune_universe(allowed)
                 report.symbols = tuple(self.strategy.candidate_symbols)
                 logger.info(
-                    "【动态候选池】启动初始池 %d 个 symbol（剔除无规则 %d 个）；"
+                    "【动态候选池】启动初始池 %d 个 symbol（剔除不可开仓 %d 个）；"
                     "杠杆/保证金开仓时按需验证",
                     len(report.symbols), pruned,
                 )
