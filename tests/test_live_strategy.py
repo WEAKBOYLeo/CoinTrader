@@ -122,7 +122,7 @@ class TestEntry:
         data.set_rates(SYMBOL, [])
 
         class _Boom(FakeStrategyData):
-            def funding_rates(self, symbol: str, periods: int):
+            def funding_rates(self, symbol: str, periods: int, *, end_ms: int | None = None):
                 raise RuntimeError("api down")
 
         strat.data = _Boom({})  # type: ignore[assignment]

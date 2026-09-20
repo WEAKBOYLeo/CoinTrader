@@ -68,6 +68,8 @@ class ReasonCode:
     PENDING_QUOTE = "PENDING_QUOTE"
     # 缓存缺最新一期结算（刷新滞后窗口内），本轮禁止开仓（防拿旧数据交易）
     SETTLEMENT_LAG = "SETTLEMENT_LAG"
+    # scan epoch 未就绪（无 READY / 候选不在同一 cutoff 横截面内），禁止新增风险
+    MARKET_DATA_NOT_READY = "MARKET_DATA_NOT_READY"
     # 收益率排名未进 top N（槽位按 trailing 年化排序分配）
     RANKED_OUT = "RANKED_OUT"
     # 退出
@@ -107,6 +109,9 @@ class StrategyDecision:
     perp_price: Decimal | None = None
     quote_ts_ms: int | None = None
     requested_notional: Decimal | None = None
+    # scan epoch 绑定（实施计划书 v2.0 T2）：决策基于哪个 READY epoch 的 cutoff
+    scan_epoch_id: str | None = None
+    decision_cutoff_ms: int | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     decision_id: str = field(default_factory=lambda: new_id("dec"))
 
@@ -134,5 +139,7 @@ class StrategyDecision:
             "perp_price": str(self.perp_price) if self.perp_price is not None else None,
             "quote_ts_ms": self.quote_ts_ms,
             "requested_notional": str(self.requested_notional) if self.requested_notional is not None else None,
+            "scan_epoch_id": self.scan_epoch_id,
+            "decision_cutoff_ms": self.decision_cutoff_ms,
             "metrics": dict(self.metrics),
         }

@@ -365,9 +365,6 @@ class ExecutionConfig:
     candidate_pool_max_symbols: int = 100
     # 动态候选池刷新周期（秒）；池内指标仍按各币资金费结算周期刷新
     universe_refresh_seconds: float = 1800.0
-    # ⚠️ 已废弃（实施计划书 v2.0）：固定 symbol/分钟 预算被共享 weight 调度取代，
-    # 本字段不再控制任何行为，保留仅为加载兼容；将在 scan epoch 任务中彻底移除。
-    candidate_refetch_per_minute: int = 6
     # 候选后台刷新有界并发（1..16）
     candidate_refresh_concurrency: int = 4
     # scan epoch 构建截止（秒）：超时标 DEGRADED/告警，绝不放行交易
@@ -428,11 +425,6 @@ class ExecutionConfig:
             raise ConfigError(
                 f"execution.candidate_pool_max_symbols 必须 >= 0，"
                 f"当前 {self.candidate_pool_max_symbols}"
-            )
-        if self.candidate_refetch_per_minute < 1:
-            raise ConfigError(
-                f"execution.candidate_refetch_per_minute 必须 >= 1，"
-                f"当前 {self.candidate_refetch_per_minute}"
             )
         if not 1 <= self.candidate_refresh_concurrency <= 16:
             raise ConfigError(
@@ -612,7 +604,6 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         live_symbols=tuple(str(s).upper() for s in sec.get("live_symbols", [])),
         candidate_pool_max_symbols=int(sec.get("candidate_pool_max_symbols", 100)),
         universe_refresh_seconds=float(sec.get("universe_refresh_seconds", 1800.0)),
-        candidate_refetch_per_minute=int(sec.get("candidate_refetch_per_minute", 6)),
         candidate_refresh_concurrency=int(sec.get("candidate_refresh_concurrency", 4)),
         scan_epoch_deadline_seconds=float(sec.get("scan_epoch_deadline_seconds", 600.0)),
         candidate_quote_top_k=int(sec.get("candidate_quote_top_k", 10)),

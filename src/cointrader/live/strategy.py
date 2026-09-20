@@ -31,6 +31,7 @@ from ..errors import LiveGateBlocked
 from ..execution.store import StateStore
 from . import portfolio
 from .decisions import DecisionKind, ReasonCode, StrategyDecision
+from .market_sync import MarketDataSynchronizer, ScanEpoch
 
 logger = logging.getLogger(__name__)
 
@@ -52,16 +53,22 @@ _HOURS_PER_YEAR = Decimal(24 * 365)
 
 
 class StrategyDataProvider(Protocol):
-    """策略数据源（外部注入，单测用 fake，不访问真实交易所）。"""
+    """策略数据源（外部注入，单测用 fake，不访问真实交易所）。
 
-    def funding_rates(self, symbol: str, periods: int) -> list[tuple[int, Decimal, Decimal]]:
-        """升序 (结算时间戳 ms, 单期费率, 结算标记价) 列表，至少 periods 期（若可得）。"""
+    ``funding_rates`` / ``quote_volume_3d_avg`` 支持可选 ``end_ms``：scan epoch
+    用它把窗口固定到统一 cutoff 前（只用已闭合/已发生的数据）。
+    """
+
+    def funding_rates(
+        self, symbol: str, periods: int, *, end_ms: int | None = None
+    ) -> list[tuple[int, Decimal, Decimal]]:
+        """升序 (结算时间戳 ms, 单期费率, 结算标记价)；``end_ms`` 给定只返回 <= end_ms。"""
 
     def funding_interval_hours(self, symbol: str) -> int:
         """该合约的资金费结算周期（小时），必须来自 fundingInfo。"""
 
-    def quote_volume_3d_avg(self, symbol: str) -> Decimal:
-        """最近 3 天平均日成交额（USDT）。"""
+    def quote_volume_3d_avg(self, symbol: str, *, end_ms: int | None = None) -> Decimal:
+        """最近 3 天平均日成交额（USDT）；``end_ms`` 给定只使用闭合于其前的 4h K 线。"""
 
     def tradable_universe(self) -> tuple[str, ...]:
         """全部可交易 USDT 永续 symbol（已排除 exclude_bases）。仅动态候选池模式使用。"""
@@ -91,6 +98,8 @@ class Quote:
     spot_price: Decimal
     perp_price: Decimal
     ts_ms: int  # 本地接收时间（UTC ms）
+    spot_ts_ms: int = 0  # 现货报价接收时间（0 = 用 ts_ms）
+    perp_ts_ms: int = 0  # 永续报价接收时间（0 = 用 ts_ms）
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +124,10 @@ class LiveContext:
     submitted_this_run: frozenset[str] = frozenset()
     account_ok: bool = True
     reconcile_ok: bool = True
+    # scan epoch（实施计划书 v2.0 T2）：无 synchronizer 的旧路径默认 True
+    scan_epoch_id: str = ""
+    decision_cutoff_ms: int = 0
+    market_data_ready: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +145,9 @@ class LiveStrategy:
         strategy_version: 策略版本标签。
         config_hash: 配置摘要 hash。
         now_fn: 可注入时钟（秒）。
+        synchronizer: 可选的 MarketDataSynchronizer；注入后所有排名/开仓/换仓
+            绑定其最近 READY epoch（同一 cutoff 横截面），market_data_ready
+            未就绪时未持仓候选统一 SKIP MARKET_DATA_NOT_READY。
     """
 
     def __init__(
@@ -143,6 +159,7 @@ class LiveStrategy:
         strategy_version: str = "funding_carry-1.0",
         config_hash: str = "",
         now_fn: Callable[[], float] = time.time,
+        synchronizer: MarketDataSynchronizer | None = None,
     ) -> None:
         self.config = config
         self.data = data
@@ -150,11 +167,11 @@ class LiveStrategy:
         self.strategy_version = strategy_version
         self.config_hash = config_hash
         self._now = now_fn
+        self._synchronizer = synchronizer
         self.candidates: dict[str, CandidateCache] = {}
         self._universe: list[str] = []
         self._universe_ts_ms = 0
-        self._refetch_win_start = 0.0
-        self._refetch_win_count = 0
+        self._epoch_id: str = ""
 
     # -- 低频刷新 -------------------------------------------------------------
 
@@ -165,11 +182,19 @@ class LiveStrategy:
 
     @property
     def candidate_symbols(self) -> tuple[str, ...]:
-        """当前候选池。固定模式 = 配置的 ``live_symbols``；动态模式 = 最近一次
+        """当前候选池。epoch 模式 = 最近 READY epoch 的已完成候选；
+        固定模式 = 配置的 ``live_symbols``；legacy 动态模式 = 最近一次
         ``refresh_universe()`` 的结果（首刷前为空，无开仓评估）。"""
+        if self._synchronizer is not None:
+            return tuple(self.candidates.keys())
         if self.dynamic_pool:
             return tuple(self._universe)
         return tuple(self.config.execution.live_symbols)
+
+    def _current_ready_epoch(self) -> ScanEpoch | None:
+        if self._synchronizer is None:
+            return None
+        return self._synchronizer.latest_ready()
 
     def refresh_universe(self) -> None:
         """刷新候选池（动态模式）：可交易永续 → 24h 成交额门槛 → 按量 top N。
@@ -213,12 +238,42 @@ class LiveStrategy:
         return len(removed)
 
     def refresh_candidates(self) -> None:
-        """刷新候选指标缓存（由 service 每个 tick 调用，内部判断超龄才拉取）。
+        """刷新候选指标（由 service 每个 tick 调用）。
 
-        每币刷新间隔 = 该币自己的资金费结算周期（两次结算之间费率不变，
-        提前刷无新信息）；每 60 秒窗口限量 ``candidate_refetch_per_minute``
-        个 symbol，把 00/04/08/12/16/20 UTC 结算边界的全员到点摊开，
-        不撞 API 按分钟计的限流。失败保留旧缓存并标记 error/数据年龄。
+        - epoch 模式：触发/推进 scan epoch 构建；只把最近 READY epoch 的快照
+          写入 ``self.candidates``（同一 cutoff 横截面，READY 前绝不发布）。
+        - legacy 模式：各币按自己结算周期判超龄后刷新（失败保留旧缓存）。
+        """
+        if self._synchronizer is not None:
+            try:
+                self._synchronizer.trigger_refresh()
+            except Exception as exc:  # noqa: BLE001 —— universe 失败保留旧 READY，不中断主循环
+                logger.warning("scan epoch 触发失败（保留旧 READY）: %s", exc)
+            epoch = self._current_ready_epoch()
+            if epoch is not None and epoch.epoch_id != self._epoch_id:
+                self._epoch_id = epoch.epoch_id
+                self.candidates = {
+                    snap.symbol: CandidateCache(
+                        symbol=snap.symbol,
+                        rates=list(snap.rates),
+                        mark_prices=list(snap.mark_prices),
+                        timestamps=list(snap.timestamps),
+                        interval_hours=snap.interval_hours,
+                        volume_3d_avg=snap.quote_volume_3d_avg,
+                        refreshed_ts_ms=snap.fetched_ms,
+                        error="",
+                    )
+                    for snap in self._synchronizer.snapshots_for(epoch.epoch_id).values()
+                }
+            return
+        self._refresh_candidates_legacy()
+
+    def _refresh_candidates_legacy(self) -> None:
+        """legacy 刷新：各币刷新间隔 = 该币自己的资金费结算周期（两次结算之间
+        费率不变）；失败保留旧缓存并标记 error/数据年龄。
+
+        ⚠️ 旧版「每分钟 N 个 symbol」预算已被共享 weight 调度取代（实施计划书
+        v2.0）：预算由 RateLimitCoordinator 按 scope/优先级统一控制。
         """
         self.refresh_universe()
         entry = self.config.strategy.entry
@@ -230,13 +285,6 @@ class LiveStrategy:
         ) + 5
 
         now = self._now()
-        # 每 60s 窗口限流（币安限流按分钟计，边界全员到点不能一次全拉）
-        if now - self._refetch_win_start >= 60.0:
-            self._refetch_win_start = now
-            self._refetch_win_count = 0
-        budget = int(self.config.execution.candidate_refetch_per_minute) - self._refetch_win_count
-        if budget <= 0:
-            return
         min_refetch_ms = int(self.config.execution.candidate_refresh_seconds * 1000)
         due: list[tuple[int, str]] = []
         for symbol in self.candidate_symbols:
@@ -249,9 +297,8 @@ class LiveStrategy:
             if cache.error or age_ms >= max(interval_ms, min_refetch_ms):
                 due.append((cache.refreshed_ts_ms, symbol))
         due.sort(key=lambda item: item[0])  # 最旧的先刷
-        self._refetch_win_count += min(len(due), budget)
 
-        for _ts, symbol in due[:budget]:
+        for _ts, symbol in due:
             old = self.candidates.get(symbol)
             try:
                 raw = self.data.funding_rates(symbol, periods)
@@ -351,6 +398,27 @@ class LiveStrategy:
         """
         decisions: list[StrategyDecision] = []
 
+        # 0) scan epoch 闸门（实施计划书 v2.0 T2）：无 READY epoch 时
+        # 未持仓候选统一 SKIP MARKET_DATA_NOT_READY；持仓评估（风险降低）不被阻止。
+        epoch = self._current_ready_epoch()
+        if self._synchronizer is not None and epoch is None:
+            for symbol in sorted(ctx.held):
+                decisions.append(self._evaluate_exit(symbol, ctx.held[symbol], ctx))
+            for symbol in self._non_held_expected_symbols(ctx.held):
+                skip = self._make_skip(symbol, ctx)
+                decisions.append(
+                    skip(
+                        ReasonCode.MARKET_DATA_NOT_READY,
+                        "无 READY scan epoch（市场数据不完整），禁止新开仓",
+                    )
+                )
+            return decisions
+        if self._synchronizer is not None:
+            assert epoch is not None
+            ctx.market_data_ready = True
+            ctx.scan_epoch_id = epoch.epoch_id
+            ctx.decision_cutoff_ms = epoch.decision_cutoff_ms
+
         # 1) 持仓 symbol：退出/换仓评估（异常退出路径由 service 优先处理）
         for symbol in sorted(ctx.held):
             held = ctx.held[symbol]
@@ -387,13 +455,33 @@ class LiveStrategy:
 
         return decisions
 
+    def _non_held_expected_symbols(self, held: dict[str, HeldPosition]) -> tuple[str, ...]:
+        """无 READY 时仍需产出决策的候选集合（每个 symbol 恰好一条决策）。"""
+        if self._synchronizer is not None:
+            expected = self._synchronizer.expected_symbols()
+            excluded = set()
+            latest = self._synchronizer.latest()
+            if latest is not None:
+                excluded = set(latest.excluded)
+            return tuple(s for s in expected if s not in held and s not in excluded)
+        return tuple(s for s in self.candidate_symbols if s not in held)
+
     # -- 开仓（§7.2 判断顺序，尽早拒绝并记录原因） -----------------------------
+
+    def _epoch_stamp(self) -> tuple[str | None, int | None]:
+        """当前 READY epoch 的审计戳（(epoch_id, cutoff_ms)）；无则 (None, None)。"""
+        epoch = self._current_ready_epoch()
+        if epoch is None:
+            return (None, None)
+        return (epoch.epoch_id, epoch.decision_cutoff_ms)
 
     def _make_skip(self, symbol: str, ctx: LiveContext) -> Callable[..., StrategyDecision]:
         """构造拒绝/中间态决策的闭包（§7.2 判断顺序各处复用同一形状）。"""
 
         def skip(code: str, text: str, kind: str = DecisionKind.SKIP,
                  **metrics: object) -> StrategyDecision:
+            # 已知审计字段提升到顶层列（DB 可直接查询），其余进 metrics
+            scan_epoch_id, decision_cutoff_ms = self._epoch_stamp()
             # 已知审计字段提升到顶层列（DB 可直接查询），其余进 metrics
             lift_keys = (
                 "funding_interval_hours", "trailing_annualized", "exit_average_annualized",
@@ -412,6 +500,8 @@ class LiveStrategy:
                 reason_text=text,
                 strategy_version=self.strategy_version,
                 config_hash=self.config_hash,
+                scan_epoch_id=scan_epoch_id,
+                decision_cutoff_ms=decision_cutoff_ms,
                 metrics=dict(metrics),
                 **lifted,  # type: ignore[arg-type]
             )
@@ -436,6 +526,22 @@ class LiveStrategy:
             return skip(ReasonCode.RECONCILIATION_BLOCKED, "最近对账未通过，禁止新增风险")
         if not ctx.account_ok or ctx.total_capital <= 0:
             return skip(ReasonCode.ACCOUNT_STATE_UNKNOWN, "账户快照缺失/过期/资金为零，禁止开仓")
+
+        # scan epoch 闸门：只允许对 READY 同一 cutoff 横截面内的候选开仓
+        if self._synchronizer is not None:
+            epoch = self._current_ready_epoch()
+            if epoch is None:
+                return skip(ReasonCode.MARKET_DATA_NOT_READY, "无 READY scan epoch，禁止新开仓")
+            if symbol in epoch.excluded:
+                return skip(
+                    ReasonCode.EXCLUDED_ASSET,
+                    f"{symbol} 在 epoch {epoch.epoch_id} 中确定性排除: {epoch.excluded[symbol]}",
+                )
+            if symbol not in self.candidates:
+                return skip(
+                    ReasonCode.MARKET_DATA_NOT_READY,
+                    f"{symbol} 不在 READY epoch {epoch.epoch_id} 的已完成快照内",
+                )
 
         # 5. 排除列表
         if base.upper() in {b.upper() for b in selection.exclude_bases}:
@@ -543,6 +649,7 @@ class LiveStrategy:
     ) -> StrategyDecision:
         """开仓第二阶段（§7.2 步骤 13-15）：报价新鲜度 → 名义额/基差 → build_signal。"""
         selection = self.config.strategy.selection
+        scan_epoch_id, decision_cutoff_ms = self._epoch_stamp()
         cache = self.candidates.get(symbol)
         if cache is None:
             return skip(ReasonCode.INSUFFICIENT_HISTORY, "候选指标缓存缺失（前置检查后异常）")
@@ -554,6 +661,20 @@ class LiveStrategy:
             return skip(ReasonCode.STALE_QUOTE, f"报价年龄 {age}ms > {max_quote_age_ms}ms")
         if quote.spot_price <= 0 or quote.perp_price <= 0:
             return skip(ReasonCode.STALE_QUOTE, "报价非正数")
+
+        # 两市场报价接收时间偏差（AC-05：未同步 Spot/Futures 价格不得生成交易意图）
+        spot_ts = quote.spot_ts_ms or quote.ts_ms
+        perp_ts = quote.perp_ts_ms or quote.ts_ms
+        skew = abs(spot_ts - perp_ts)
+        max_skew_ms = int(self.config.execution.max_quote_skew_ms)
+        if skew > max_skew_ms:
+            return skip(
+                ReasonCode.STALE_QUOTE,
+                f"Spot/Futures 报价接收时间偏差 {skew}ms > {max_skew_ms}ms（两市场不同步）",
+                spot_price=quote.spot_price,
+                perp_price=quote.perp_price,
+                quote_ts_ms=quote.ts_ms,
+            )
 
         # 14. 名义额与意图前市场检查（build_signal 只负责这层，§7.1 第 6 条）
         requested = (ctx.total_capital * Decimal(str(selection.per_position_weight))).quantize(
@@ -607,6 +728,8 @@ class LiveStrategy:
             perp_price=quote.perp_price,
             quote_ts_ms=quote.ts_ms,
             requested_notional=signal.target_notional,
+            scan_epoch_id=scan_epoch_id,
+            decision_cutoff_ms=decision_cutoff_ms,
             metrics={
                 "quote_source": "public",
                 "requested_notional_raw": str(requested),
@@ -700,8 +823,14 @@ class LiveStrategy:
         premium: Decimal,
         held_trailing: Decimal,
     ) -> tuple[str | None, Decimal | None]:
-        """找一个未持仓候选，trailing >= 持仓 trailing × premium。"""
+        """找一个未持仓候选，trailing >= 持仓 trailing × premium。
+
+        epoch 模式：替换候选必须来自同一 READY epoch（无 READY = 数据不足，
+        不得发策略性换仓；风险降低型退出不受影响）。
+        """
         entry = self.config.strategy.entry
+        if self._synchronizer is not None and self._current_ready_epoch() is None:
+            return None, None
         best: tuple[str, Decimal] | None = None
         for symbol in self.candidate_symbols:
             if symbol == held_symbol or symbol in ctx.held:
@@ -772,7 +901,9 @@ class PublicDataStrategyProvider:
             self._intervals = self._intervals_fn(self.client)
         return int(self._intervals.get(symbol))
 
-    def funding_rates(self, symbol: str, periods: int) -> list[tuple[int, Decimal, Decimal]]:
+    def funding_rates(
+        self, symbol: str, periods: int, *, end_ms: int | None = None
+    ) -> list[tuple[int, Decimal, Decimal]]:
         from ..data.funding import fetch_funding_history
 
         interval = self.funding_interval_hours(symbol)
@@ -784,14 +915,44 @@ class PublicDataStrategyProvider:
         for ts, value, mark in zip(rates.index, rates, marks, strict=False):
             import math
 
+            ts_ms = int(ts.timestamp() * 1000)
+            if end_ms is not None and ts_ms > end_ms:
+                continue  # epoch 不变量：只用 cutoff 前已发生的结算
             mark_value = float(mark)
             if math.isnan(mark_value):
                 mark_value = 0.0
-            out.append((int(ts.timestamp() * 1000), Decimal(str(value)), Decimal(str(mark_value))))
+            out.append((ts_ms, Decimal(str(value)), Decimal(str(mark_value))))
         return out
 
-    def quote_volume_3d_avg(self, symbol: str) -> Decimal:
+    def quote_volume_3d_avg(self, symbol: str, *, end_ms: int | None = None) -> Decimal:
         import math
+
+        if end_ms is not None:
+            # epoch 模式：固定到「闭合时间 <= end_ms 的最后一根 4h K 线」，
+            # 只请求最近 18 根闭合 K 线（weight 分档 1~2，不用 limit=1500 耗 10）。
+            bar_ms = 4 * 3600 * 1000
+            close_ms = (end_ms // bar_ms + 1) * bar_ms
+            if close_ms > end_ms:
+                close_ms -= bar_ms
+            start_ms = close_ms - 18 * bar_ms
+            klines = self.client.futures_klines(
+                symbol, "4h", start_ms=start_ms, end_ms=end_ms, limit=20
+            )
+            closed = [k for k in klines if int(k[0]) + bar_ms <= end_ms][-18:]
+            if len(closed) < 18:
+                raise ValueError(f"{symbol} 闭合 4h K 线不足 18 根（window end={close_ms}）")
+            day_totals: dict[int, Decimal] = {}
+            for k in closed:
+                open_ms = int(k[0])
+                day = open_ms // (86_400 * 1000)
+                day_totals[day] = day_totals.get(day, Decimal("0")) + Decimal(str(k[7]))
+            days = sorted(day_totals)
+            if len(days) < 3:
+                raise ValueError(f"{symbol} 成交额窗口不足 3 天")
+            avg = sum((day_totals[d] for d in days[-3:]), Decimal("0")) / 3
+            if not avg.is_finite() or avg <= 0:
+                raise ValueError(f"{symbol} 3 天平均日成交额无效")
+            return avg
 
         from ..data.klines import fetch_historical_quote_volume_3d_avg
 
