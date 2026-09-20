@@ -22,7 +22,10 @@ from .guard import Market, OrderSide, OrderType
 
 __all__ = [
     "AccountSnapshot",
+    "ExchangeSnapshotBundle",
     "Fill",
+    "FundingAuthority",
+    "FundingCashflow",
     "HedgeCheck",
     "Order",
     "OrderIntent",
@@ -31,9 +34,71 @@ __all__ = [
     "PairStatus",
     "PositionSnapshot",
     "ReconciliationResult",
+    "SyncCursor",
     "new_client_order_id",
     "new_id",
 ]
+
+
+#: 资金费事实的权威口径（实施计划书 v2.0 T3，AC-08）：
+# AUTHORITATIVE = 交易所 income 接口实际入账；ESTIMATED = 费率×名义额估算，
+# 两者绝不混入同一个 PnL 口径，同 (symbol, funding_ts) 有 AUTHORITATIVE 时只计它。
+class FundingAuthority(str, Enum):
+    AUTHORITATIVE = "AUTHORITATIVE"
+    ESTIMATED = "ESTIMATED"
+
+
+@dataclass(frozen=True, slots=True)
+class FundingCashflow:
+    """一条资金费事实（exchange income 或估算）。amount 正负号采用交易所事实。"""
+
+    cashflow_id: str
+    market: Market
+    symbol: str
+    funding_ts_ms: int
+    funding_rate: Decimal
+    interval_hours: int
+    amount: Decimal
+    authority: FundingAuthority
+    asset: str = "USDT"
+    exchange_income_id: str | None = None
+    observed_ms: int = 0
+    run_id: str = ""
+    pair_execution_id: str | None = None
+    source: str = ""
+    raw_summary: str = "{}"
+
+
+@dataclass(frozen=True, slots=True)
+class SyncCursor:
+    """同步游标：只前进不后退；单写者（store 事务保护）。"""
+
+    scope: str  # 市场：SPOT / PERP
+    stream: str  # 数据流：fills / funding_income
+    symbol_key: str  # symbol
+    last_time_ms: int = 0
+    last_id: str = ""
+    updated_ms: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeSnapshotBundle:
+    """同一次 capture 的交易所当前快照束（账户/资产/全部持仓/开放订单）。
+
+    字段完整才 ``complete=True``；不完整不得更新可信 current projection /
+    can_open，Reconciler 消费同一 bundle 不重复拉 API。
+    """
+
+    snapshot_id: str
+    capture_start_ms: int
+    capture_end_ms: int
+    spot_account: dict[str, Any]
+    futures_account: dict[str, Any]
+    positions: list[dict[str, Any]]
+    spot_open_orders: list[dict[str, Any]]
+    perp_open_orders: list[dict[str, Any]]
+    source: str = "rest"
+    complete: bool = True
 
 
 def new_id(prefix: str) -> str:

@@ -215,15 +215,20 @@ class TestRunSessionInterruption:
         self._start(store, "run-a", 1000)
         self._start(store, "run-b", 2000)
         store.update_run_session("run-a", status="RECOVERY")  # 模拟处于 RECOVERY 时进程被杀
+        # T3 v2：run-b 有心跳 → 按 heartbeat 截断；run-a 无心跳 → 截断到 started_ms
+        store.update_run_heartbeat("run-b", now_ms=4000)
 
         n = store.mark_interrupted_sessions(now_ms=9000)
         assert n == 2
-        for run_id in ("run-a", "run-b"):
-            row = store.run_session(run_id)
-            assert row is not None
-            assert row["status"] == "INTERRUPTED"
-            assert row["ended_ms"] == 9000
-            assert row["stop_reason"] == "process_exited_without_graceful_stop"
+        row_a = store.run_session("run-a")
+        assert row_a is not None
+        assert row_a["status"] == "INTERRUPTED"
+        assert row_a["ended_ms"] == 1000  # 无 heartbeat → started_ms（停机间隔不计在线）
+        assert row_a["stop_reason"] == "process_exited_without_graceful_stop"
+        row_b = store.run_session("run-b")
+        assert row_b is not None
+        assert row_b["status"] == "INTERRUPTED"
+        assert row_b["ended_ms"] == 4000  # 有 heartbeat → 按心跳截断（不是重启时刻 9000）
 
     def test_closed_sessions_untouched(self, store: StateStore) -> None:
         self._start(store, "run-a", 1000)

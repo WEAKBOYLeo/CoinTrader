@@ -229,3 +229,81 @@ class TestIgnoreAssets:
         env["spot"].balances_map = {"USDC": Decimal("2")}
         result = reconciler.run(reason="ignore-test-3")
         assert any("USDC" in m for m in result.mismatches), "受管理资产差异不得被忽略"
+
+
+def _bundle(*, spot_orders=(), perp_orders=(), positions=(), balances: dict | None = None,
+            complete: bool = True) -> Any:
+    from cointrader.execution.models import ExchangeSnapshotBundle
+
+    return ExchangeSnapshotBundle(
+        snapshot_id="snap-test-1",
+        capture_start_ms=1,
+        capture_end_ms=2,
+        spot_account={"balances": [
+            {"asset": a, "free": str(v), "locked": "0"} for a, v in (balances or {}).items()
+        ]},
+        futures_account={
+            "totalWalletBalance": "10000",
+            "availableBalance": "9999",
+            "totalUnrealizedProfit": "0",
+        },
+        positions=list(positions),
+        spot_open_orders=list(spot_orders),
+        perp_open_orders=list(perp_orders),
+        source="test",
+        complete=complete,
+    )
+
+
+class TestBundle:
+    """T3（AC-06/07）：live 路径消费同一 capture bundle，不重复拉 API。"""
+
+    def test_bundle_consumed_without_adapter_api_calls(self, env: dict) -> None:
+        spot: FakeAdapter = env["spot"]
+        perp: FakeAdapter = env["perp"]
+        # 若对账器重复拉 API（open_orders/balances/positions），fake 会抛错
+        spot.order_query_error = RuntimeError("open_orders must not be called with bundle")
+        perp.order_query_error = RuntimeError("open_orders must not be called with bundle")
+
+        def boom_balances() -> dict[str, Decimal]:
+            raise RuntimeError("balances must not be called with bundle")
+
+        def boom_positions(symbol: str | None = None) -> list[dict[str, Any]]:
+            raise RuntimeError("positions must not be called with bundle")
+
+        spot.balances = boom_balances  # type: ignore[method-assign]
+        perp.balances = boom_balances  # type: ignore[method-assign]
+        spot.positions = boom_positions  # type: ignore[method-assign]
+        perp.positions = boom_positions  # type: ignore[method-assign]
+
+        result = env["reconciler"].run(
+            reason="bundle-test",
+            snapshot=_bundle(),
+        )
+        assert result.consistent is True
+        assert result.details.get("snapshot_id") == "snap-test-1"
+
+    def test_incomplete_bundle_blocks_open(self, env: dict) -> None:
+        result = env["reconciler"].run(
+            reason="incomplete", snapshot=_bundle(complete=False)
+        )
+        assert result.consistent is False
+        assert result.can_open is False
+        assert any("bundle 不完整" in m for m in result.mismatches)
+
+    def test_bundle_unknown_order_blocks_open(self, env: dict) -> None:
+        result = env["reconciler"].run(
+            snapshot=_bundle(spot_orders=[
+                {"clientOrderId": "ct-ghost", "symbol": "BTCUSDT", "origQty": "1"}
+            ])
+        )
+        assert result.can_open is False
+        assert any("ct-ghost" in m for m in result.mismatches)
+
+    def test_bundle_position_mismatch_blocks_open(self, env: dict) -> None:
+        env["store"].record_fill(spot_fill("BTCUSDT", "1"))
+        result = env["reconciler"].run(
+            snapshot=_bundle(balances={"BTC": Decimal("0.5")})
+        )
+        assert result.can_open is False
+        assert any("Spot 余额不一致" in m for m in result.mismatches)

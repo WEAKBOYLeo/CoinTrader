@@ -74,6 +74,7 @@ class PairPnl:
     reconciled: bool
     calc_version: str
     last_updated_ms: int
+    estimated_funding_pnl: Decimal = Decimal("0")
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -104,6 +105,7 @@ class PnlSummary:
     """一次聚合结果（pair / run 级）。"""
 
     funding_pnl: Decimal
+    estimated_funding_pnl: Decimal
     trading_fee: Decimal
     basis_pnl: Decimal
     realized_pnl: Decimal
@@ -116,10 +118,13 @@ class PnlSummary:
     calc_version: str
     last_updated_ms: int
     differences: list[str] = field(default_factory=list)
+    #: False = 窗口内存在只有 estimated 口径的资金费结算（authoritative 不完整）
+    authoritative_complete: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "funding_pnl": str(self.funding_pnl),
+            "estimated_funding_pnl": str(self.estimated_funding_pnl),
             "trading_fee": str(self.trading_fee),
             "basis_pnl": str(self.basis_pnl),
             "realized_pnl": str(self.realized_pnl),
@@ -132,6 +137,7 @@ class PnlSummary:
             "calculation_version": self.calc_version,
             "last_updated_ms": self.last_updated_ms,
             "differences": list(self.differences),
+            "authoritative_complete": self.authoritative_complete,
         }
 
 
@@ -190,17 +196,32 @@ class PnlAggregator:
             base_note.append("存在非 USDT/基础币计费资产，按面额折算（需人工核对）")
         return total, base_note
 
-    def _funding(self, symbol: str, start_ms: int, end_ms: int) -> Decimal:
+    def _funding(self, symbol: str, start_ms: int, end_ms: int) -> tuple[Decimal, Decimal]:
+        """拆分 (authoritative, estimated-only) 资金费（T3，AC-08）。
+
+        同一 (symbol, funding_ts) 存在 authoritative 时只计 authoritative；
+        只有 estimated 的结算单独计入返回值第二项，不得混入 authoritative
+        net_pnl。
+        """
         rows = self.store.funding_cashflows(symbol=symbol, limit=5000)
-        total = Decimal("0")
+        auth_by_ts: dict[int, Decimal] = {}
+        est_by_ts: dict[int, Decimal] = {}
         for row in rows:
             ts = int(row.get("funding_ts_ms") or 0)
             if start_ms and ts < start_ms:
                 continue
             if ts > end_ms:
                 continue
-            total += _d(row.get("amount"))
-        return total
+            authority = str(row.get("authority") or "ESTIMATED").upper()
+            amount = _d(row.get("amount"))
+            target = auth_by_ts if authority == "AUTHORITATIVE" else est_by_ts
+            target[ts] = target.get(ts, Decimal("0")) + amount
+        auth_total = sum(auth_by_ts.values(), Decimal("0"))
+        est_total = sum(
+            (v for ts, v in est_by_ts.items() if ts not in auth_by_ts),
+            Decimal("0"),
+        )
+        return auth_total, est_total
 
     def _cash_delta(self, start_ms: int, end_ms: int) -> Decimal | None:
         rows = self.store.account_snapshots(since_ms=start_ms, until_ms=end_ms, limit=100000)
@@ -296,7 +317,9 @@ class PnlAggregator:
             and perp_entry_qty > 0
         )
 
-        funding = self._funding(symbol, start_ms, end_ms)
+        funding_auth, funding_est = self._funding(symbol, start_ms, end_ms)
+        if funding_est != 0:
+            notes.append(f"存在 {funding_est} USDT 仅 estimated 口径资金费（未计入 authoritative net）")
         basis = Decimal("0")
         if closed:
             qty = min(entry_qty, min(spot_exit_qty, perp_exit_qty))
@@ -310,11 +333,11 @@ class PnlAggregator:
                 notes.append("无最新报价，未实现基差部分未估值")
 
         if closed:
-            realized = funding + (-fees) + basis
+            realized = funding_auth + (-fees) + basis
             unrealized = Decimal("0")
         else:
             realized = Decimal("0")
-            unrealized = funding + (-fees) + basis
+            unrealized = funding_auth + (-fees) + basis
 
         net = realized + unrealized
         return PairPnl(
@@ -323,7 +346,8 @@ class PnlAggregator:
             symbol=symbol,
             kind="round_trip" if close_row is not None else "open",
             status=str((close_row or primary).get("status") or ""),
-            funding_pnl=funding,
+            funding_pnl=funding_auth,
+            estimated_funding_pnl=funding_est,
             trading_fee=-fees,
             basis_pnl=basis,
             realized_pnl=realized,
@@ -372,8 +396,16 @@ class PnlAggregator:
             return sum((getattr(p, attr) for p in per_pair), Decimal("0"))
 
         cash = self._cash_delta(start_ms, end_ms)
+        est_total = _sum("estimated_funding_pnl")
+        authoritative_complete = est_total == 0
+        differences: list[str] = [] if cash is not None else ["账户快照不足，cash_delta 无法交叉验证"]
+        if not authoritative_complete:
+            differences.append(
+                f"authoritative 资金费不完整：{est_total} USDT 仅 estimated 口径，未计入 authoritative net"
+            )
         return PnlSummary(
             funding_pnl=_sum("funding_pnl"),
+            estimated_funding_pnl=est_total,
             trading_fee=_sum("trading_fee"),
             basis_pnl=_sum("basis_pnl"),
             realized_pnl=_sum("realized_pnl"),
@@ -385,7 +417,8 @@ class PnlAggregator:
             period_end_ms=end_ms,
             calc_version=CALC_VERSION,
             last_updated_ms=now_ms,
-            differences=[] if cash is not None else ["账户快照不足，cash_delta 无法交叉验证"],
+            differences=differences,
+            authoritative_complete=authoritative_complete,
         )
 
     def persist_round_trip(self, open_row: dict[str, Any] | None,

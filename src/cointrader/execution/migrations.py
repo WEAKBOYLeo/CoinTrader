@@ -28,7 +28,7 @@ class MigrationError(Exception):
 
 
 #: 本代码支持的 schema 版本
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _now_ms() -> int:
@@ -214,8 +214,198 @@ def _migrate_1(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_2(conn: sqlite3.Connection) -> None:
+    """v1 → v2：heartbeat 截断、scan epoch、同步游标、账户快照组、
+    current projection、funding authority（实施计划书 v2.0 T3，AC-06/08/09/11）。
+
+    全部语句幂等（IF NOT EXISTS / 列存在性检查），单事务内完成；
+    中途断电后重启可续跑。旧 funding 行统一 authority='ESTIMATED'，
+    不静默改写为交易所事实。
+    """
+    # 1) run_sessions.last_heartbeat_ms：异常会话下次接管按 heartbeat 截断，
+    #    不把停机间隔计入在线时长（部分迁移残留的残表不阻塞续跑）
+    _ensure_columns(conn, "run_sessions", {"last_heartbeat_ms": "INTEGER"})
+    if {"ended_ms", "started_ms"} <= _columns(conn, "run_sessions"):
+        conn.execute(
+            "UPDATE run_sessions SET last_heartbeat_ms = COALESCE(ended_ms, started_ms)"
+            " WHERE last_heartbeat_ms IS NULL"
+        )
+
+    # 2) scan epoch 与候选快照（T2 契约持久化）
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS scan_epochs ("
+        " epoch_id TEXT PRIMARY KEY,"
+        " universe_snapshot_ts_ms INTEGER NOT NULL,"
+        " decision_cutoff_ms INTEGER NOT NULL,"
+        " status TEXT NOT NULL,"
+        " expected_json TEXT NOT NULL DEFAULT '[]',"
+        " excluded_json TEXT NOT NULL DEFAULT '{}',"
+        " failed_json TEXT NOT NULL DEFAULT '{}',"
+        " created_ms INTEGER NOT NULL,"
+        " completed_ms INTEGER,"
+        " expires_ms INTEGER NOT NULL,"
+        " error TEXT NOT NULL DEFAULT '')"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS candidate_snapshots ("
+        " epoch_id TEXT NOT NULL,"
+        " symbol TEXT NOT NULL,"
+        " interval_hours INTEGER NOT NULL,"
+        " rates_json TEXT NOT NULL DEFAULT '[]',"
+        " mark_prices_json TEXT NOT NULL DEFAULT '[]',"
+        " timestamps_json TEXT NOT NULL DEFAULT '[]',"
+        " expected_last_funding_ms INTEGER NOT NULL,"
+        " volume_window_end_ms INTEGER NOT NULL,"
+        " quote_volume_3d_avg TEXT,"
+        " fetched_ms INTEGER NOT NULL,"
+        " error TEXT NOT NULL DEFAULT '',"
+        " PRIMARY KEY (epoch_id, symbol))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_epoch"
+        " ON candidate_snapshots(epoch_id)"
+    )
+
+    # 3) 同步游标：(scope, stream, symbol_key) 只前进不后退
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_cursors ("
+        " scope TEXT NOT NULL,"
+        " stream TEXT NOT NULL,"
+        " symbol_key TEXT NOT NULL,"
+        " last_time_ms INTEGER NOT NULL DEFAULT 0,"
+        " last_id TEXT NOT NULL DEFAULT '',"
+        " updated_ms INTEGER NOT NULL,"
+        " PRIMARY KEY (scope, stream, symbol_key))"
+    )
+
+    # 4) 账户快照组与资产明细；既有快照表加 nullable snapshot_id（旧行保持可读）
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS account_snapshot_groups ("
+        " snapshot_id TEXT PRIMARY KEY,"
+        " ts_ms INTEGER NOT NULL,"
+        " capture_start_ms INTEGER NOT NULL,"
+        " capture_end_ms INTEGER NOT NULL,"
+        " source TEXT NOT NULL DEFAULT '',"
+        " spot_equity_usdt TEXT,"
+        " futures_equity_usdt TEXT,"
+        " total_equity_usdt TEXT,"
+        " available_balance_usdt TEXT,"
+        " complete INTEGER NOT NULL DEFAULT 0,"
+        " run_id TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS account_assets ("
+        " snapshot_id TEXT NOT NULL,"
+        " market TEXT NOT NULL,"
+        " asset TEXT NOT NULL,"
+        " free_qty TEXT NOT NULL DEFAULT '0',"
+        " locked_qty TEXT NOT NULL DEFAULT '0',"
+        " total_qty TEXT NOT NULL DEFAULT '0',"
+        " price_usdt TEXT,"
+        " value_usdt TEXT,"
+        " PRIMARY KEY (snapshot_id, market, asset))"
+    )
+    _ensure_columns(conn, "account_snapshots", {"snapshot_id": "TEXT"})
+    _ensure_columns(conn, "position_snapshots", {"snapshot_id": "TEXT"})
+
+    # 5) current projection：只能由完整交易所 snapshot 事务更新
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS current_account ("
+        " id INTEGER PRIMARY KEY CHECK (id = 1),"
+        " snapshot_id TEXT NOT NULL,"
+        " observed_at_ms INTEGER NOT NULL,"
+        " source TEXT NOT NULL DEFAULT '',"
+        " spot_equity_usdt TEXT,"
+        " futures_equity_usdt TEXT,"
+        " total_equity_usdt TEXT,"
+        " available_balance_usdt TEXT,"
+        " complete INTEGER NOT NULL DEFAULT 0,"
+        " updated_ms INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS current_positions ("
+        " symbol TEXT PRIMARY KEY,"
+        " spot_qty TEXT NOT NULL,"
+        " perp_qty TEXT NOT NULL,"
+        " spot_price TEXT,"
+        " perp_price TEXT,"
+        " snapshot_id TEXT,"
+        " observed_at_ms INTEGER NOT NULL,"
+        " source TEXT NOT NULL DEFAULT '',"
+        " reconciled INTEGER NOT NULL DEFAULT 0,"
+        " tombstone INTEGER NOT NULL DEFAULT 0)"
+    )
+
+    # 6) funding_cashflows 重建：移除旧 UNIQUE(symbol, funding_ts_ms)，
+    #    新增 market/exchange_income_id/authority/observed_ms；
+    #    (market, exchange_income_id) 部分唯一索引挡住重复回补；旧行 → ESTIMATED
+    has_old = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'funding_cashflows'"
+    ).fetchone()
+    if has_old is not None:
+        has_authority = "authority" in _columns(conn, "funding_cashflows")
+        if not has_authority:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS funding_cashflows_v2 ("
+                " cashflow_id TEXT PRIMARY KEY,"
+                " run_id TEXT NOT NULL DEFAULT '',"
+                " pair_execution_id TEXT,"
+                " market TEXT NOT NULL DEFAULT 'PERP',"
+                " symbol TEXT NOT NULL,"
+                " funding_ts_ms INTEGER NOT NULL,"
+                " received_ts_ms INTEGER NOT NULL,"
+                " funding_rate TEXT NOT NULL,"
+                " interval_hours INTEGER NOT NULL,"
+                " asset TEXT NOT NULL DEFAULT 'USDT',"
+                " amount TEXT NOT NULL,"
+                " source TEXT NOT NULL DEFAULT '',"
+                " reconciled INTEGER NOT NULL DEFAULT 0,"
+                " raw_summary TEXT NOT NULL DEFAULT '{}',"
+                " exchange_income_id TEXT,"
+                " authority TEXT NOT NULL DEFAULT 'ESTIMATED',"
+                " observed_ms INTEGER NOT NULL DEFAULT 0)"
+            )
+            conn.execute(
+                "INSERT INTO funding_cashflows_v2 (cashflow_id, run_id, pair_execution_id,"
+                " market, symbol, funding_ts_ms, received_ts_ms, funding_rate,"
+                " interval_hours, asset, amount, source, reconciled, raw_summary,"
+                " authority) SELECT cashflow_id, run_id, pair_execution_id, 'PERP',"
+                " symbol, funding_ts_ms, received_ts_ms, funding_rate, interval_hours,"
+                " asset, amount, source, reconciled, raw_summary, 'ESTIMATED'"
+                " FROM funding_cashflows"
+            )
+            conn.execute("DROP TABLE funding_cashflows")
+            conn.execute("ALTER TABLE funding_cashflows_v2 RENAME TO funding_cashflows")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_funding_market_income"
+        " ON funding_cashflows(market, exchange_income_id)"
+        " WHERE exchange_income_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_funding_symbol_ts"
+        " ON funding_cashflows(symbol, funding_ts_ms)"
+    )
+
+    # 7) 版本号（幂等：多行时只升不降，读取用 MAX）
+    conn.execute(
+        "INSERT INTO schema_meta (schema_version, migrated_at_ms) VALUES (?, ?)"
+        " ON CONFLICT DO UPDATE SET"
+        " schema_version = excluded.schema_version,"
+        " migrated_at_ms = excluded.migrated_at_ms",
+        (2, _now_ms()),
+    )
+    conn.execute(
+        "UPDATE schema_meta SET schema_version = ?, migrated_at_ms = ? WHERE schema_version < ?",
+        (2, _now_ms(), 2),
+    )
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}  # noqa: S608
+
+
 #: 版本号 → 迁移函数（顺序执行）
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1}
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1, 2: _migrate_2}
 
 
 def schema_version_of(conn: sqlite3.Connection) -> int:
@@ -225,7 +415,7 @@ def schema_version_of(conn: sqlite3.Connection) -> int:
     ).fetchone()
     if row is None:
         return 0
-    version = conn.execute("SELECT schema_version FROM schema_meta LIMIT 1").fetchone()
+    version = conn.execute("SELECT MAX(schema_version) FROM schema_meta").fetchone()
     return int(version[0]) if version else 0
 
 

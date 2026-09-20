@@ -129,8 +129,44 @@ class FuturesAdapter:
     def all_orders(self, symbol: str, *, limit: int = 100) -> list[dict[str, Any]]:
         return self.client.get("/fapi/v1/allOrders", {"symbol": symbol, "limit": limit}) or []
 
-    def user_trades(self, symbol: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        return self.client.get("/fapi/v1/userTrades", {"symbol": symbol, "limit": limit}) or []
+    def user_trades(
+        self,
+        symbol: str,
+        *,
+        from_id: int | None = None,
+        start_ms: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """合约成交（分页参数以 Binance 官方文档为准：fromId/startTime/limit）。"""
+        params: dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
+        if from_id is not None:
+            params["fromId"] = int(from_id)
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        return self.client.get("/fapi/v1/userTrades", params) or []
+
+    def income_history(
+        self,
+        *,
+        income_type: str = "FUNDING_FEE",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """实际 income（GET /fapi/v1/income，USER_DATA 只读）。
+
+        字段契约（A-01，官方文档核对）：``id``（同一 incomeType 内用户唯一）、
+        ``incomeType``、``time``、``symbol``、``asset``、``income``（正负号为
+        交易所事实，禁止自行翻转）。字段缺失时调用方必须报错，不得猜测。
+        """
+        params: dict[str, Any] = {"limit": int(limit)}
+        if income_type:
+            params["incomeType"] = income_type
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        return cast("list[dict[str, Any]]", self.client.get("/fapi/v1/income", params) or [])
 
     # -- 交易 ----------------------------------------------------------------
 

@@ -125,8 +125,21 @@ class SpotAdapter:
     def all_orders(self, symbol: str, *, limit: int = 100) -> list[dict[str, Any]]:
         return self.client.get("/api/v3/allOrders", {"symbol": symbol, "limit": limit}) or []
 
-    def my_trades(self, symbol: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        return self.client.get("/api/v3/myTrades", {"symbol": symbol, "limit": limit}) or []
+    def my_trades(
+        self,
+        symbol: str,
+        *,
+        from_id: int | None = None,
+        start_ms: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """我的成交（分页参数以 Binance 官方文档为准：fromId/startTime/limit）。"""
+        params: dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
+        if from_id is not None:
+            params["fromId"] = int(from_id)
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        return self.client.get("/api/v3/myTrades", params) or []
 
     def trade_fee(self, symbol: str | None = None) -> Any:
         params = {"symbol": symbol} if symbol else None

@@ -218,7 +218,7 @@ class TestRecoveryAutoClear:
         svc._last_reconcile_ms = 0  # noqa: SLF001
 
         from cointrader.execution.models import ReconciliationResult
-        env["reconciler"].run = lambda *, reason="periodic": ReconciliationResult(  # type: ignore[method-assign]
+        env["reconciler"].run = lambda *, reason="periodic", snapshot=None: ReconciliationResult(  # type: ignore[method-assign]
             ts_ms=int(NOW * 1000), consistent=False, can_open=False,
             mismatches=("BTCUSDT: Spot 余额不一致",), repaired=(),
         )
@@ -236,6 +236,13 @@ class TestRecoveryAutoClear:
             strategy_version="t", config_hash="h", code_revision="rev",
             spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
         )
+        # 另一个遗留会话：有 heartbeat（T3 v2：按 heartbeat 截断，不计停机间隔）
+        store.start_run_session(
+            run_id="run-old2", started_ms=int(NOW * 1000) - 7_200_000, mode="testnet",
+            strategy_version="t", config_hash="h", code_revision="rev",
+            spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
+        )
+        store.update_run_heartbeat("run-old2", now_ms=int(NOW * 1000) - 3_000_000)
 
         # 交易所仍有真实持仓（断点恢复的依据）
         spot = FakeServiceAdapter("spot")
@@ -252,12 +259,16 @@ class TestRecoveryAutoClear:
 
         report = svc.startup()
 
-        # 旧会话被标记 INTERRUPTED（ended_ms=启动时刻，原因固定）
+        # 旧会话被标记 INTERRUPTED（T3：ended_ms 按 heartbeat 截断；无 heartbeat → 起点）
         old = store.run_session("run-old")
         assert old is not None
         assert old["status"] == "INTERRUPTED"
-        assert old["ended_ms"] == int(NOW * 1000)
+        assert old["ended_ms"] == int(NOW * 1000) - 3_600_000  # 无 heartbeat → 截断到 started_ms
         assert old["stop_reason"] == "process_exited_without_graceful_stop"
+        old2h = store.run_session("run-old2")
+        assert old2h is not None
+        assert old2h["status"] == "INTERRUPTED"
+        assert old2h["ended_ms"] == int(NOW * 1000) - 3_000_000  # 有 heartbeat → 按心跳截断
 
         # 新 run_session 开启且 RUNNING
         new = store.latest_run_session()
@@ -274,7 +285,7 @@ class TestRecoveryAutoClear:
         # 旧会话不被后续写操作覆盖（幂等性本身由 tests/test_store.py 覆盖；
         # startup 只在启动时调用一次 mark，新会话在标记之后才创建）
         old2 = store.run_session("run-old")
-        assert old2 is not None and old2["ended_ms"] == int(NOW * 1000)
+        assert old2 is not None and old2["ended_ms"] == int(NOW * 1000) - 3_600_000
         assert report.mode == "testnet"
 
     def test_no_interrupted_sessions_is_noop(self, tmp_path):

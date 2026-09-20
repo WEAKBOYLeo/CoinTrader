@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -36,11 +37,13 @@ from .migrations import (
 from .models import (
     AccountSnapshot,
     Fill,
+    FundingAuthority,
     Order,
     OrderIntent,
     PairExecution,
     PositionSnapshot,
     ReconciliationResult,
+    SyncCursor,
 )
 
 logger = logging.getLogger(__name__)
@@ -625,15 +628,23 @@ class StateStore:
         """把非优雅退出（kill -9/断电）遗留的会话补记为 INTERRUPTED（§断点重连）。
 
         只处理 ``ended_ms IS NULL`` 且状态仍为 RUNNING/RECOVERY 的行；
-        幂等（重复调用返回 0）；返回被标记的行数。
+        结束时间按 ``last_heartbeat_ms`` 截断（缺失时用 started_ms），
+        不把「停机→重启」的墙钟间隔计入在线时长；幂等（重复调用返回 0）。
         """
         cur = self._execute(
-            "UPDATE run_sessions SET ended_ms = ?, status = 'INTERRUPTED',"
+            "UPDATE run_sessions SET ended_ms = COALESCE(last_heartbeat_ms, started_ms),"
+            " status = 'INTERRUPTED',"
             " stop_reason = 'process_exited_without_graceful_stop'"
-            " WHERE ended_ms IS NULL AND status IN ('RUNNING', 'RECOVERY')",
-            (now_ms,),
+            " WHERE ended_ms IS NULL AND status IN ('RUNNING', 'RECOVERY')"
         )
         return cur.rowcount
+
+    def update_run_heartbeat(self, run_id: str, *, now_ms: int) -> None:
+        """主循环每轮更新心跳（v2：异常会话按 heartbeat 截断的基础）。"""
+        self._execute(
+            "UPDATE run_sessions SET last_heartbeat_ms = ? WHERE run_id = ?",
+            (now_ms, run_id),
+        )
 
     def run_session(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -755,25 +766,346 @@ class StateStore:
             run_id=run_id,
         )
 
-    # -- 资金费现金流（§8.1） ------------------------------------------------
+    # -- 资金费现金流（§8.1；v2 增加 authority 口径，AC-08） ----------------
 
-    def record_funding_cashflow(self, *, cashflow_id: str, symbol: str, funding_ts_ms: int,
-                                funding_rate: Decimal, interval_hours: int, amount: Decimal,
-                                source: str, run_id: str = "",
-                                pair_execution_id: str | None = None,
-                                asset: str = "USDT", raw_summary: str = "{}") -> bool:
-        """记录一条已确认资金费。``(symbol, funding_ts_ms)`` 唯一 → 重复结算事件幂等。"""
+    def record_funding_cashflow(
+        self,
+        *,
+        cashflow_id: str,
+        symbol: str,
+        funding_ts_ms: int,
+        funding_rate: Decimal,
+        interval_hours: int,
+        amount: Decimal,
+        source: str,
+        run_id: str = "",
+        pair_execution_id: str | None = None,
+        asset: str = "USDT",
+        raw_summary: str = "{}",
+        market: str = "PERP",
+        exchange_income_id: str | None = None,
+        authority: FundingAuthority | str = FundingAuthority.ESTIMATED,
+        observed_ms: int | None = None,
+    ) -> bool:
+        """记录一条资金费事实。v2：同 (market, exchange_income_id) 唯一 → 重复幂等；
+        无 income id 的估算行靠 cashflow_id 幂等。"""
+        authority_val = (
+            authority.value if isinstance(authority, FundingAuthority) else str(authority).upper()
+        )
         try:
             self._execute(
-                "INSERT INTO funding_cashflows (cashflow_id, run_id, pair_execution_id, symbol,"
-                " funding_ts_ms, received_ts_ms, funding_rate, interval_hours, asset, amount,"
-                " source, reconciled, raw_summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (cashflow_id, run_id, pair_execution_id, symbol, funding_ts_ms, _now_ms(),
-                 _dec(funding_rate), interval_hours, asset, _dec(amount), source, 0, raw_summary),
+                "INSERT INTO funding_cashflows (cashflow_id, run_id, pair_execution_id, market,"
+                " symbol, funding_ts_ms, received_ts_ms, funding_rate, interval_hours, asset,"
+                " amount, source, reconciled, raw_summary, exchange_income_id, authority,"
+                " observed_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cashflow_id, run_id, pair_execution_id, market, symbol, funding_ts_ms,
+                 _now_ms(), _dec(funding_rate), interval_hours, asset, _dec(amount), source,
+                 0, raw_summary, exchange_income_id, authority_val,
+                 int(observed_ms) if observed_ms is not None else _now_ms()),
             )
             return True
         except sqlite3.IntegrityError:
             return False
+
+    # -- 同步游标与 facts 批量幂等写入（v2，AC-06/08） ---------------------
+
+    def get_sync_cursor(self, scope: str, stream: str, symbol_key: str) -> SyncCursor | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT scope, stream, symbol_key, last_time_ms, last_id, updated_ms"
+                " FROM sync_cursors WHERE scope = ? AND stream = ? AND symbol_key = ?",
+                (scope, stream, symbol_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return SyncCursor(
+            scope=str(row[0]), stream=str(row[1]), symbol_key=str(row[2]),
+            last_time_ms=int(row[3]), last_id=str(row[4]), updated_ms=int(row[5]),
+        )
+
+    def _insert_fill_row(self, conn: sqlite3.Connection, fill: Fill) -> bool:
+        try:
+            conn.execute(
+                "INSERT INTO fills (fill_id, client_order_id, exchange_order_id, symbol, market,"
+                " side, quantity, price, fee_asset, fee_amount, ts_ms, run_id, pair_execution_id,"
+                " intent_id, exchange_trade_id, quote_qty, maker_taker, exchange_ts_ms,"
+                " received_ts_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (fill.fill_id, fill.client_order_id, fill.exchange_order_id, fill.symbol,
+                 fill.market.value, fill.side.value, _dec(fill.quantity), _dec(fill.price),
+                 fill.fee_asset, _dec(fill.fee_amount), fill.ts_ms, fill.run_id or None,
+                 fill.pair_execution_id or None, fill.intent_id or None,
+                 fill.exchange_trade_id or None, _dec(fill.quote_qty),
+                 fill.maker_taker or None, fill.exchange_ts_ms or None,
+                 fill.received_ts_ms or None),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def _insert_income_row(self, conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
+        try:
+            conn.execute(
+                "INSERT INTO funding_cashflows (cashflow_id, run_id, pair_execution_id, market,"
+                " symbol, funding_ts_ms, received_ts_ms, funding_rate, interval_hours, asset,"
+                " amount, source, reconciled, raw_summary, exchange_income_id, authority,"
+                " observed_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["cashflow_id"], row.get("run_id", ""), row.get("pair_execution_id"),
+                 row["market"], row["symbol"], row["funding_ts_ms"], _now_ms(),
+                 _dec(row.get("funding_rate", "0")), int(row.get("interval_hours", 8)),
+                 row.get("asset", "USDT"), _dec(row["amount"]), row.get("source", ""),
+                 0, row.get("raw_summary", "{}"), row.get("exchange_income_id"),
+                 row.get("authority", FundingAuthority.AUTHORITATIVE.value),
+                 int(row.get("observed_ms", _now_ms()))),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def write_facts_and_advance_cursor(
+        self,
+        *,
+        scope: str,
+        stream: str,
+        symbol_key: str,
+        fills: list[Fill] | None = None,
+        income_rows: list[dict[str, Any]] | None = None,
+        new_last_time_ms: int,
+        new_last_id: str = "",
+        now_ms: int | None = None,
+    ) -> dict[str, int]:
+        """单事务：写整页 facts（幂等）+ 推进游标。游标绝不越过未提交事实。
+
+        失败时整体回滚：cursor 留在上一页，可安全重跑（facts 由唯一键去重）。
+        """
+        fills = fills or []
+        income_rows = income_rows or []
+        ts = int(now_ms) if now_ms is not None else _now_ms()
+        inserted_fills = 0
+        inserted_income = 0
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN")
+                try:
+                    for fill in fills:
+                        if self._insert_fill_row(self._conn, fill):
+                            inserted_fills += 1
+                    for row in income_rows:
+                        if self._insert_income_row(self._conn, row):
+                            inserted_income += 1
+                    self._conn.execute(
+                        "INSERT INTO sync_cursors (scope, stream, symbol_key, last_time_ms,"
+                        " last_id, updated_ms) VALUES (?,?,?,?,?,?)"
+                        " ON CONFLICT(scope, stream, symbol_key) DO UPDATE SET"
+                        " last_time_ms = MAX(sync_cursors.last_time_ms, excluded.last_time_ms),"
+                        " last_id = CASE WHEN excluded.last_time_ms >= sync_cursors.last_time_ms"
+                        " THEN excluded.last_id ELSE sync_cursors.last_id END,"
+                        " updated_ms = excluded.updated_ms",
+                        (scope, stream, symbol_key, new_last_time_ms, new_last_id, ts),
+                    )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.IntegrityError:
+            raise
+        except sqlite3.Error as exc:
+            raise StoreError(f"facts/游标事务写入失败: {exc}") from exc
+        return {"inserted_fills": inserted_fills, "inserted_income": inserted_income}
+
+    # -- 账户快照组与 current projection（v2，AC-06/07/10） ------------------
+
+    def save_account_snapshot_group(
+        self,
+        *,
+        snapshot_id: str,
+        ts_ms: int,
+        capture_start_ms: int,
+        capture_end_ms: int,
+        source: str,
+        run_id: str = "",
+        spot_equity_usdt: Decimal | None = None,
+        futures_equity_usdt: Decimal | None = None,
+        total_equity_usdt: Decimal | None = None,
+        available_balance_usdt: Decimal | None = None,
+        complete: bool,
+        spot_assets: list[dict[str, Any]] | None = None,
+        positions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """单事务：快照组 + 资产明细 + current account/current positions upsert
+        + 消失持仓写 qty=0 tombstone。``complete=False`` 不得更新 current
+        projection（只留组记录供诊断）。"""
+        spot_assets = spot_assets or []
+        positions = positions or []
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN")
+                try:
+                    self._conn.execute(
+                        "INSERT INTO account_snapshot_groups (snapshot_id, ts_ms,"
+                        " capture_start_ms, capture_end_ms, source, spot_equity_usdt,"
+                        " futures_equity_usdt, total_equity_usdt, available_balance_usdt,"
+                        " complete, run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                        " ON CONFLICT(snapshot_id) DO UPDATE SET ts_ms = excluded.ts_ms,"
+                        " complete = excluded.complete",
+                        (snapshot_id, ts_ms, capture_start_ms, capture_end_ms, source,
+                         _dec(spot_equity_usdt), _dec(futures_equity_usdt),
+                         _dec(total_equity_usdt), _dec(available_balance_usdt),
+                         int(complete), run_id or None),
+                    )
+                    for asset in spot_assets:
+                        self._conn.execute(
+                            "INSERT INTO account_assets (snapshot_id, market, asset, free_qty,"
+                            " locked_qty, total_qty, price_usdt, value_usdt)"
+                            " VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                            (snapshot_id, "SPOT", str(asset["asset"]),
+                             _dec(asset.get("free_qty", "0")), _dec(asset.get("locked_qty", "0")),
+                             _dec(asset.get("total_qty", "0")), _dec(asset.get("price_usdt")),
+                             _dec(asset.get("value_usdt"))),
+                        )
+                    if complete:
+                        self._conn.execute(
+                            "INSERT INTO current_account (id, snapshot_id, observed_at_ms, source,"
+                            " spot_equity_usdt, futures_equity_usdt, total_equity_usdt,"
+                            " available_balance_usdt, complete, updated_ms)"
+                            " VALUES (1,?,?,?,?,?,?,?,?,?)"
+                            " ON CONFLICT(id) DO UPDATE SET snapshot_id = excluded.snapshot_id,"
+                            " observed_at_ms = excluded.observed_at_ms,"
+                            " source = excluded.source,"
+                            " spot_equity_usdt = excluded.spot_equity_usdt,"
+                            " futures_equity_usdt = excluded.futures_equity_usdt,"
+                            " total_equity_usdt = excluded.total_equity_usdt,"
+                            " available_balance_usdt = excluded.available_balance_usdt,"
+                            " complete = excluded.complete, updated_ms = excluded.updated_ms"
+                            " WHERE current_account.observed_at_ms <= excluded.observed_at_ms",
+                            (snapshot_id, ts_ms, source, _dec(spot_equity_usdt),
+                             _dec(futures_equity_usdt), _dec(total_equity_usdt),
+                             _dec(available_balance_usdt), int(complete), ts_ms),
+                        )
+                        seen: set[str] = set()
+                        for pos in positions:
+                            symbol = str(pos["symbol"])
+                            seen.add(symbol)
+                            self._conn.execute(
+                                "INSERT INTO current_positions (symbol, spot_qty, perp_qty,"
+                                " spot_price, perp_price, snapshot_id, observed_at_ms, source,"
+                                " reconciled, tombstone) VALUES (?,?,?,?,?,?,?,?,0,0)"
+                                " ON CONFLICT(symbol) DO UPDATE SET"
+                                " spot_qty = excluded.spot_qty, perp_qty = excluded.perp_qty,"
+                                " spot_price = excluded.spot_price, perp_price = excluded.perp_price,"
+                                " snapshot_id = excluded.snapshot_id,"
+                                " observed_at_ms = excluded.observed_at_ms,"
+                                " source = excluded.source, tombstone = 0",
+                                (symbol, _dec(pos.get("spot_qty", "0")),
+                                 _dec(pos.get("perp_qty", "0")), _dec(pos.get("spot_price")),
+                                 _dec(pos.get("perp_price")), snapshot_id, ts_ms, source),
+                            )
+                        # 本次快照消失的旧持仓 → qty=0 tombstone（不清行，保留审计）
+                        stale = self._conn.execute(
+                            "SELECT symbol FROM current_positions WHERE tombstone = 0"
+                        ).fetchall()
+                        for (symbol,) in stale:
+                            if symbol in seen:
+                                continue
+                            self._conn.execute(
+                                "UPDATE current_positions SET spot_qty = '0', perp_qty = '0',"
+                                " snapshot_id = ?, observed_at_ms = ?, tombstone = 1"
+                                " WHERE symbol = ? AND tombstone = 0",
+                                (snapshot_id, ts_ms, symbol),
+                            )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.Error as exc:
+            raise StoreError(f"账户快照组写入失败: {exc}") from exc
+
+    def current_account(self) -> dict[str, Any] | None:
+        """current account projection；无记录返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT snapshot_id, observed_at_ms, source, spot_equity_usdt,"
+                " futures_equity_usdt, total_equity_usdt, available_balance_usdt, complete,"
+                " updated_ms FROM current_account WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(zip(
+            ("snapshot_id", "observed_at_ms", "source", "spot_equity_usdt",
+             "futures_equity_usdt", "total_equity_usdt", "available_balance_usdt",
+             "complete", "updated_ms"),
+            row, strict=False,
+        ))
+
+    def current_positions(self, *, include_tombstones: bool = False) -> list[dict[str, Any]]:
+        """current positions projection（平仓后为 tombstone 行，qty=0）。"""
+        where = "" if include_tombstones else " WHERE tombstone = 0"
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT symbol, spot_qty, perp_qty, spot_price, perp_price, snapshot_id, "  # noqa: S608
+                f"observed_at_ms, source, reconciled, tombstone FROM current_positions{where}"
+                f" ORDER BY symbol"
+            )
+            rows = cur.fetchall()
+            names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=False)) for row in rows]
+
+    # -- scan epoch 持久化（v2 诊断保留） ------------------------------------
+
+    def record_scan_epoch(self, *, epoch_id: str, universe_snapshot_ts_ms: int,
+                          decision_cutoff_ms: int, status: str,
+                          expected: list[str] | tuple[str, ...],
+                          excluded: dict[str, str], failed: dict[str, str],
+                          created_ms: int, completed_ms: int | None, expires_ms: int,
+                          error: str = "",
+                          snapshots: list[dict[str, Any]] | None = None) -> None:
+        """封存 epoch 时写入（只保留诊断所需；单事务）。"""
+        snapshots = snapshots or []
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN")
+                try:
+                    self._conn.execute(
+                        "INSERT INTO scan_epochs (epoch_id, universe_snapshot_ts_ms,"
+                        " decision_cutoff_ms, status, expected_json, excluded_json,"
+                        " failed_json, created_ms, completed_ms, expires_ms, error)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                        " ON CONFLICT(epoch_id) DO UPDATE SET status = excluded.status,"
+                        " failed_json = excluded.failed_json,"
+                        " completed_ms = COALESCE(excluded.completed_ms, scan_epochs.completed_ms),"
+                        " error = excluded.error",
+                        (epoch_id, universe_snapshot_ts_ms, decision_cutoff_ms, status,
+                         json.dumps(list(expected), ensure_ascii=False, sort_keys=True),
+                         json.dumps(excluded, ensure_ascii=False, sort_keys=True),
+                         json.dumps(failed, ensure_ascii=False, sort_keys=True),
+                         created_ms, completed_ms, expires_ms, error),
+                    )
+                    for snap in snapshots:
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO candidate_snapshots (epoch_id, symbol,"
+                            " interval_hours, rates_json, mark_prices_json, timestamps_json,"
+                            " expected_last_funding_ms, volume_window_end_ms,"
+                            " quote_volume_3d_avg, fetched_ms, error) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (epoch_id, snap["symbol"], int(snap["interval_hours"]),
+                             json.dumps([str(x) for x in snap["rates"]], ensure_ascii=False, sort_keys=True),
+                             json.dumps([str(x) for x in snap["mark_prices"]], ensure_ascii=False, sort_keys=True),
+                             json.dumps([int(x) for x in snap["timestamps"]], ensure_ascii=False, sort_keys=True),
+                             int(snap["expected_last_funding_ms"]),
+                             int(snap["volume_window_end_ms"]), _dec(snap.get("quote_volume_3d_avg")),
+                             int(snap["fetched_ms"]), str(snap.get("error", ""))),
+                        )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    with contextlib.suppress(sqlite3.Error):
+                        self._conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.Error as exc:
+            raise StoreError(f"scan epoch 写入失败: {exc}") from exc
+
+    def scan_epochs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._query_table("scan_epochs", since_ms=None, limit=limit)
+
 
     # -- PnL 账本（§8.4） ---------------------------------------------------
 
@@ -918,7 +1250,8 @@ class StateStore:
     ) -> list[dict[str, Any]]:
         """通用只读查询：按表结构自动带时间 / symbol / run_id 过滤。"""
         ts_col = {"orders": "updated_ms", "pair_executions": "created_ms",
-                  "run_sessions": "started_ms", "funding_cashflows": "funding_ts_ms"}.get(table, "ts_ms")
+                  "run_sessions": "started_ms", "funding_cashflows": "funding_ts_ms",
+                  "scan_epochs": "created_ms"}.get(table, "ts_ms")
         conditions: list[str] = list(where)
         args: list[Any] = []
         if since_ms is not None:

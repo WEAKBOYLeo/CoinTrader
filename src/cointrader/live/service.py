@@ -34,10 +34,12 @@ from ..execution.risk import Position, RiskManager, RiskState
 from ..execution.risk_gate import HaltState, RiskGate
 from ..execution.spot import SpotAdapter
 from ..execution.store import LeaseConflict, StateStore, StoreError
+from ..execution.sync import ExchangeStateSynchronizer, SyncCaptureError
 from ..execution.user_stream import PollingUserStream, UserStream
 from ..reporting.pnl import PnlAggregator
 from .account_state import AccountStateBuilder, AccountStateError, AccountStateResult
 from .decisions import DecisionKind, StrategyDecision
+from .market_sync import MarketDataSynchronizer
 from .portfolio import Signal
 from .strategy import (
     HeldPosition,
@@ -140,6 +142,8 @@ class LiveService:
         code_revision: str = "",
         spot_endpoint: str = "",
         futures_endpoint: str = "",
+        synchronizer: MarketDataSynchronizer | None = None,
+        exch_sync: ExchangeStateSynchronizer | None = None,
     ) -> None:
         self.config = config
         self.mode = config.execution.mode
@@ -179,6 +183,12 @@ class LiveService:
         self._recovery_reason = ""
         self._last_reconcile_ms = 0
         self._started = False
+        # T3：scan epoch 同步器（选币闸门）与交易所事实同步器（账本恢复）
+        self.synchronizer = synchronizer
+        self.exch_sync = exch_sync
+        # 账本同步闸门：无事实同步器时视为 legacy 路径（True）；
+        # 有同步器时首次同步通过前 False（禁止开仓）
+        self._ledger_sync_ok = exch_sync is None
 
     # -- 状态 ---------------------------------------------------------------
 
@@ -199,6 +209,30 @@ class LiveService:
         self._on_alert("RECOVERY", reason)
         self._persist_runtime_state()
         logger.error("【进入 RECOVERY】%s（禁止开新仓，等待对账通过后恢复）", reason)
+
+    @property
+    def _market_data_ready(self) -> bool:
+        """scan epoch 闸门（T2/T3）：无同步器时 legacy 路径视为就绪。"""
+        if self.synchronizer is None:
+            return True
+        return self.synchronizer.latest_ready() is not None
+
+    @property
+    def can_open(self) -> bool:
+        """开仓权限 = 全部闸门通过（实施计划书 v2.0 T3）：
+        state==RUNNING && streams 新鲜 && 账户完整 && 账本同步 && 对账 &&
+        epoch READY && 风控闸门 NORMAL。任一 false 禁止新增风险。"""
+        if self._state is not ServiceState.RUNNING:
+            return False
+        if self.gate.state is not HaltState.NORMAL:
+            return False
+        if not self._reconcile_ok or not self._ledger_sync_ok:
+            return False
+        if not self._market_data_ready:
+            return False
+        if self._account_result is None or not self._account_result.complete:
+            return False
+        return all(s.is_fresh for s in self.streams)
 
     def web_snapshot(self) -> dict[str, Any]:
         """WebUI 用的内存状态快照（只读、无锁）。
@@ -236,7 +270,17 @@ class LiveService:
             "recovery_reason": self._recovery_reason,
             "run_id": self.run_id or None,
             "mode": self.mode,
-            "can_open": self._reconcile_ok and self.state is ServiceState.RUNNING,
+            "can_open": self.can_open,
+            "gates": {
+                "running": self._state is ServiceState.RUNNING,
+                "gate_normal": self.gate.state is HaltState.NORMAL,
+                "reconcile_ok": self._reconcile_ok,
+                "ledger_sync_ok": self._ledger_sync_ok,
+                "market_data_ready": self._market_data_ready,
+                "account_complete": (
+                    self._account_result is not None and self._account_result.complete
+                ),
+            },
             "gate_state": gate_state,
             "held": held,
             "account": None if acct is None else {
@@ -309,16 +353,37 @@ class LiveService:
 
     # -- 账户状态 / 持仓 / 快照（§7.5 / §8.5） -------------------------------
 
-    def _refresh_account_state(self, source: str) -> None:
+    def _refresh_account_state(self, source: str, *, bundle: Any | None = None) -> None:
         if self.account_builder is None:
             return
         if self.strategy is not None and self.strategy.dynamic_pool:
             # 动态候选池：风险快照的持仓范围跟随当前池（builder 构造时池可能为空）
             self.account_builder.candidate_symbols = tuple(self.strategy.candidate_symbols)
+        asset_prices = self._managed_asset_prices()
         result = self.account_builder.snapshot(
-            spot=self.spot, futures=self.futures, source=source, run_id=self.run_id
+            spot=self.spot, futures=self.futures, source=source, run_id=self.run_id,
+            bundle=bundle, asset_prices=asset_prices,
         )
         self._account_result = result
+
+    def _managed_asset_prices(self) -> dict[str, Decimal]:
+        """受管理现货资产的估值价格（无新鲜报价 → 该资产无法估值 → 快照不完整）。
+
+        只对当前有余额的非 USDT 资产取价；无余额资产不参与估值。
+        价格取自公共行情 quote_fetcher（现货价）。
+        """
+        prices: dict[str, Decimal] = {}
+        try:
+            balances = self.spot.balances()
+        except Exception:  # noqa: BLE001 —— 余额查不到时不估值（快照会因缺失而不完整或被拒）
+            return prices
+        for asset, qty in balances.items():
+            if asset == "USDT" or qty <= 0:
+                continue
+            quote = self._quote_fetcher(f"{asset}USDT")
+            if quote is not None and quote.spot_price > 0:
+                prices[asset] = quote.spot_price
+        return prices
 
     def _account_fresh(self, now_ms: int) -> bool:
         if self._account_result is None:
@@ -337,6 +402,56 @@ class LiveService:
             )
             return RiskState(positions={}, total_capital=0.0)
         return result.state
+
+    def _ledger_sync_symbols(self) -> list[str]:
+        """事实回补覆盖的 symbol：持仓 + 未完结 pair + 历史成交 + 候选池
+        （不受当前候选池限制，候选池外已有仓位也要能回补/恢复）。"""
+        symbols: set[str] = set(self._held)
+        try:
+            for pair in self.store.open_pairs():
+                sym = pair.get("symbol")
+                if sym:
+                    symbols.add(str(sym))
+            for fill in self.store.fills(limit=1000):
+                sym = fill.get("symbol")
+                if sym:
+                    symbols.add(str(sym))
+        except Exception:  # noqa: BLE001 —— 账本读失败不阻断（同步本身会报错）
+            logger.debug("事实回补 symbol 集账本查询失败", exc_info=True)
+        if self.strategy is not None:
+            symbols.update(self.strategy.candidate_symbols)
+        return sorted(symbols)
+
+    def _periodic_reconcile(self, now_ms: int) -> bool:
+        """周期/恢复对账：T3 路径复用短期 capture bundle（poll/account/
+        reconcile 单飞），并定期增量同步 facts。返回 True = 本轮对账通过。"""
+        bundle = None
+        if self.exch_sync is not None:
+            try:
+                bundle = self.exch_sync.capture()
+            except SyncCaptureError as exc:
+                self.enter_recovery(f"capture 失败: {exc}")
+                return False
+            if self._ledger_sync_ok:
+                # 增量 facts 同步（节流 = 对账周期）
+                fill_results = self.exch_sync.sync_fills(self._ledger_sync_symbols())
+                income_results = self.exch_sync.sync_funding_income(self._ledger_sync_symbols())
+                bad = [
+                    f"{r.market}/{r.stream}/{r.symbol}: {r.error or '不完整'}"
+                    for r in (*fill_results, *income_results)
+                    if r.error or not r.complete
+                ]
+                if bad:
+                    self._ledger_sync_ok = False
+                    self.enter_recovery(f"事实同步失败: {'; '.join(bad[:3])}")
+                    return False
+        result = self.reconciler.run(reason="periodic", snapshot=bundle)
+        self._last_reconcile_ms = now_ms
+        self._reconcile_ok = result.can_open
+        if not result.can_open:
+            self.enter_recovery(f"周期对账不一致: {list(result.mismatches)}")
+            return False
+        return True
 
     def _refresh_held(self) -> None:
         """以交易所对账后的真实持仓为准刷新 held 集合（§7.3）。"""
@@ -448,6 +563,8 @@ class LiveService:
                         f'{{"mark_price": "{mark}", "short_qty": "{short_qty}", '
                         f'"price_source": "funding_history.mark_price"}}'
                     ),
+                    market="PERP",
+                    authority="ESTIMATED",  # T3：估算口径，不得冒充交易所事实
                 )
                 if added:
                     logger.info("【资金费入账】%s ts=%s rate=%s amount=%s", symbol, ts, rate, amount)
@@ -611,8 +728,30 @@ class LiveService:
                 symbol_detail[symbol] = info
             report.extra["symbols"] = symbol_detail
 
-            # 7. 启动对账（§8.1 第 8 步）
-            result = self.reconciler.run(reason="startup")
+            # 7. 启动对账 + 交易所事实同步（T3：先同步事实，再对账，再启动流）
+            #    capture 一次交易所快照束；fills 与实际 funding income 按游标
+            #    分页回补（幂等）；Reconciler 消费同一 bundle，不重复拉
+            #    账户/仓位/开放订单 API。
+            bundle: Any | None = None
+            startup_gates: list[str] = []
+            if self.exch_sync is not None:
+                try:
+                    bundle = self.exch_sync.capture()
+                except SyncCaptureError as exc:
+                    startup_gates.append(f"capture 失败: {exc}")
+                if bundle is not None:
+                    symbols = self._ledger_sync_symbols()
+                    fill_results = self.exch_sync.sync_fills(symbols)
+                    income_results = self.exch_sync.sync_funding_income(symbols)
+                    bad = [
+                        f"{r.market}/{r.stream}/{r.symbol}: {r.error or '不完整'}"
+                        for r in (*fill_results, *income_results)
+                        if r.error or not r.complete
+                    ]
+                    self._ledger_sync_ok = not bad
+                    if bad:
+                        startup_gates.append(f"事实同步未完成: {'; '.join(bad[:3])}")
+            result = self.reconciler.run(reason="startup", snapshot=bundle)
             self._last_reconcile_ms = int(self._now() * 1000)
             report.reconciliation_consistent = result.consistent
             report.reconciliation_mismatches = result.mismatches
@@ -635,17 +774,35 @@ class LiveService:
 
             # 启动 run_session（§6.1 关联链起点）+ 脱敏配置摘要
             self._ensure_run_session()
+            if self.run_id:
+                try:
+                    self.store.update_run_heartbeat(self.run_id, now_ms=int(self._now() * 1000))
+                except StoreError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.warning("启动 heartbeat 写入失败", exc_info=True)
 
-            # 首次账户快照（失败不拒绝启动，但开仓会被 ACCOUNT_STATE_UNKNOWN 拒绝）
+            # 首次账户快照（消费同一 bundle；失败不拒绝启动，但开仓被拒）
             if self.account_builder is not None:
                 try:
-                    self._refresh_account_state(source="startup")
+                    self._refresh_account_state(source="startup", bundle=bundle)
                 except AccountStateError as exc:
                     self.store.record_risk_decision("ACCOUNT_STATE", False, str(exc))
                     self._on_alert("ACCOUNT_STATE_UNKNOWN", str(exc))
 
+            # 启动闸门（T3）：任一 false → RECOVERING（禁止开仓），
+            # 主循环闸门全绿后自动回 RUNNING。
             if not result.can_open:
-                self.enter_recovery(f"启动对账不一致: {list(result.mismatches)}")
+                startup_gates.append(f"启动对账不一致: {list(result.mismatches)}")
+            acct = self._account_result
+            if self.account_builder is not None and (
+                acct is None or not self._account_fresh(int(self._now() * 1000)) or not acct.complete
+            ):
+                startup_gates.append("账户快照缺失/不完整（资金未知，禁止新增风险）")
+            if self.gate.state is not HaltState.NORMAL:
+                startup_gates.append(f"风控闸门 {self.gate.state.value}")
+            if startup_gates:
+                self.enter_recovery("; ".join(startup_gates))
             else:
                 self._state = ServiceState.RUNNING
                 self._persist_runtime_state()
@@ -666,6 +823,16 @@ class LiveService:
         """执行一轮主循环。可独立单测（不阻塞、不 sleep）。"""
         if self._state is ServiceState.STOPPED:
             return {"state": "STOPPED"}
+
+        # v2 心跳：每轮（成功或受控 RECOVERY）更新；异常会话下次接管按
+        # heartbeat 截断，停机间隔不计入在线时长（T3/AC-09）。
+        if self.run_id:
+            try:
+                self.store.update_run_heartbeat(self.run_id, now_ms=int(self._now() * 1000))
+            except StoreError as exc:
+                logger.warning("heartbeat 写入失败: %s", exc)
+            except Exception:  # noqa: BLE001
+                logger.warning("heartbeat 写入异常", exc_info=True)
 
         # 单实例锁续期（长跑韧性）：TTL 30s、主循环 5s 间隔，裕量 6 倍。
         # 刷新失败只告警不崩溃（DB 写坏会在后续步骤自然暴露）。
@@ -702,13 +869,33 @@ class LiveService:
             interval_ms = int(self.config.execution.reconciliation_interval_seconds * 1000)
             if now_ms - self._last_reconcile_ms < interval_ms:
                 return {"state": "RECOVERY", "reason": self._recovery_reason}
-            result = self.reconciler.run(reason="recovery_check")
+            bundle = None
+            if self.exch_sync is not None:
+                try:
+                    bundle = self.exch_sync.capture()
+                    fill_results = self.exch_sync.sync_fills(self._ledger_sync_symbols())
+                    income_results = self.exch_sync.sync_funding_income(self._ledger_sync_symbols())
+                    bad = [
+                        f"{r.market}/{r.stream}/{r.symbol}: {r.error or '不完整'}"
+                        for r in (*fill_results, *income_results)
+                        if r.error or not r.complete
+                    ]
+                    self._ledger_sync_ok = not bad and bundle.complete
+                except SyncCaptureError as exc:
+                    self._recovery_reason = f"capture 失败: {exc}"
+                    self._persist_runtime_state()
+                    return {"state": "RECOVERY", "reason": self._recovery_reason}
+            result = self.reconciler.run(reason="recovery_check", snapshot=bundle)
             self._last_reconcile_ms = now_ms
-            if not (result.can_open and self.gate.state is HaltState.NORMAL):
+            if not (result.can_open and self._ledger_sync_ok and self.gate.state is HaltState.NORMAL):
                 self._recovery_reason = (
                     f"流恢复后对账/闸门未通过: {list(result.mismatches)}"
                     if not result.can_open
-                    else f"风控闸门未恢复: {self.gate.state.value}"
+                    else (
+                        "账本同步未通过"
+                        if not self._ledger_sync_ok
+                        else f"风控闸门未恢复: {self.gate.state.value}"
+                    )
                 )
                 self._persist_runtime_state()
                 return {"state": "RECOVERY", "reason": self._recovery_reason}
@@ -743,14 +930,10 @@ class LiveService:
                     self._persist_runtime_state()
                     return {"state": "RECOVERY", "reason": self._recovery_reason}
 
-        # 周期性对账（§8.5）
+        # 周期性对账（§8.5；T3：复用短期 capture bundle + 增量 facts 同步）
         interval_ms = int(self.config.execution.reconciliation_interval_seconds * 1000)
         if now_ms - self._last_reconcile_ms >= interval_ms:
-            result = self.reconciler.run(reason="periodic")
-            self._last_reconcile_ms = now_ms
-            self._reconcile_ok = result.can_open
-            if not result.can_open:
-                self.enter_recovery(f"周期对账不一致: {list(result.mismatches)}")
+            if not self._periodic_reconcile(now_ms):
                 self._persist_runtime_state()
                 return {"state": "RECOVERY", "reason": self._recovery_reason}
             # 对账通过后以交易所真实持仓为准（§7.3 去重基础）
@@ -760,8 +943,15 @@ class LiveService:
         snapshot_ms = int(self.config.execution.snapshot_interval_seconds * 1000)
         if self.strategy is not None and now_ms - self._last_snapshot_ms >= snapshot_ms:
             self._last_snapshot_ms = now_ms
+            bundle = None
+            if self.exch_sync is not None:
+                try:
+                    # 复用窗口内返回同一 bundle（single-flight），不重复拉 API
+                    bundle = self.exch_sync.capture()
+                except SyncCaptureError:
+                    bundle = None
             try:
-                self._refresh_account_state(source="periodic")
+                self._refresh_account_state(source="periodic", bundle=bundle)
             except (AccountStateError, StoreError) as exc:
                 self._account_result = None
                 self.store.record_risk_decision("ACCOUNT_STATE", False, str(exc))
@@ -994,6 +1184,11 @@ class LiveService:
         RECOVERY 不自动解除（§7.3）：重启后必须重新预检 + 对账。
         """
         self._state = ServiceState.STOPPED
+        if self.synchronizer is not None:
+            try:
+                self.synchronizer.stop()
+            except Exception:  # noqa: BLE001 —— 超时只告警，不阻止安全停机
+                logger.warning("market-data-sync 停止超时（继续停机）")
         if self.run_id:
             try:
                 self.store.end_run_session(
@@ -1089,8 +1284,22 @@ def build_live_context(  # noqa: PLR0913
     futures_url = futures_base or (api.futures_testnet_base if is_testnet else api.futures_base)
 
     from ..data.binance import BinancePublicClient
+    from ..rate_limit import RateLimitCoordinator, RateLimitScope
 
-    public_client = BinancePublicClient(api, config.data)
+    # T1/T3：同一进程全部 Spot/Futures 请求共享一个限流协调器
+    #（公开行情/候选 P3，账户/恢复 P1，下单 P0 保留预算）
+    data_cfg = config.data.rate_limit
+    coordinator = RateLimitCoordinator(
+        {
+            RateLimitScope.SPOT: int(data_cfg.spot_weight_per_min),
+            RateLimitScope.FUTURES: int(data_cfg.futures_weight_per_min),
+        },
+        soft_limit_ratio=float(data_cfg.soft_limit_ratio),
+        critical_reserve_ratio=float(data_cfg.critical_reserve_ratio),
+        freeze_seconds=float(data_cfg.rate_limit_freeze_seconds),
+        ban_seconds=float(data_cfg.ip_ban_seconds),
+    )
+    public_client = BinancePublicClient(api, config.data, rate_limiter=coordinator)
     config_hash = ""
     if config.source_path is not None:
         try:
@@ -1108,6 +1317,7 @@ def build_live_context(  # noqa: PLR0913
         recv_window_ms=exc.recv_window_ms,
         timeout_seconds=exc.request_timeout_seconds,
         read_max_retries=5,  # 代理链路偶发 SSL 中断，读请求多一层重试裕量
+        rate_limiter=coordinator,
     )
     futures_client = SignedClient(
         base_url=futures_url,
@@ -1117,6 +1327,7 @@ def build_live_context(  # noqa: PLR0913
         recv_window_ms=exc.recv_window_ms,
         timeout_seconds=exc.request_timeout_seconds,
         read_max_retries=5,  # 代理链路偶发 SSL 中断，读请求多一层重试裕量
+        rate_limiter=coordinator,
     )
     spot = SpotAdapter(spot_client)
     futures = FuturesAdapter(futures_client)
@@ -1140,6 +1351,13 @@ def build_live_context(  # noqa: PLR0913
         poll_interval_seconds=0.25,
     )
     reconciler = Reconciler(store, spot, futures, ignore_assets=exc.reconcile_ignore_assets)
+    exch_sync = ExchangeStateSynchronizer(
+        store=store, spot=spot, futures=futures, config=config
+    )
+
+    provider = PublicDataStrategyProvider(config, client=public_client)
+    # T2/T3：scan epoch 同步器（后台有界并发，交易主循环只读 READY 快照）
+    synchronizer = MarketDataSynchronizer(config=config, data=provider)
 
     service = LiveService(
         config=config,
@@ -1151,10 +1369,11 @@ def build_live_context(  # noqa: PLR0913
         reconciler=reconciler,
         strategy=LiveStrategy(
             config=config,
-            data=PublicDataStrategyProvider(config, client=public_client),
+            data=provider,
             store=store,
             strategy_version=executor.strategy_version,
             config_hash=config_hash,
+            synchronizer=synchronizer,
         ),
         account_builder=AccountStateBuilder(
             config=config, store=store, candidate_symbols=tuple(exc.live_symbols)
@@ -1163,6 +1382,8 @@ def build_live_context(  # noqa: PLR0913
         config_hash=config_hash,
         spot_endpoint=spot_url,
         futures_endpoint=futures_url,
+        synchronizer=synchronizer,
+        exch_sync=exch_sync,
     )
 
     # 测试网/demo 的 user stream 端点可在 config 中覆盖（demo trading 域名不同）
@@ -1197,6 +1418,7 @@ def build_live_context(  # noqa: PLR0913
             for market in ("spot", "perp")
         ]
     service.attach_streams(streams)
+    synchronizer.start()
     return service
 
 

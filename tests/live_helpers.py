@@ -315,9 +315,11 @@ class FakeReconciler:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.snapshots: list[Any] = []
 
-    def run(self, *, reason: str = "periodic") -> ReconciliationResult:
+    def run(self, *, reason: str = "periodic", snapshot: Any = None) -> ReconciliationResult:
         self.calls.append(reason)
+        self.snapshots.append(snapshot)
         return _ok_recon()
 
 

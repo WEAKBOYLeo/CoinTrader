@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import Any
 
 from .futures import FuturesAdapter
-from .models import ReconciliationResult
+from .models import ExchangeSnapshotBundle, ReconciliationResult
 from .order_state import OrderState, validate_transition
 from .spot import SpotAdapter
 from .store import StateStore
@@ -57,11 +57,37 @@ class Reconciler:
         # 平台发放/非策略资产（如 demo 的 USDC）：无本地期望持仓时不参与对账
         self._ignore_assets = frozenset(a.upper() for a in ignore_assets)
 
-    def run(self, *, reason: str = "periodic") -> ReconciliationResult:
-        """执行一次完整对账。返回 ReconciliationResult 并写入账本。"""
+    def run(
+        self,
+        *,
+        reason: str = "periodic",
+        snapshot: ExchangeSnapshotBundle | None = None,
+    ) -> ReconciliationResult:
+        """执行一次完整对账。返回 ReconciliationResult 并写入账本。
+
+        ``snapshot`` 给定（live 路径）：消费同一 capture bundle，不重复拉
+        账户/仓位/开放订单 API；bundle 不完整 → ``consistent=False, can_open=False``。
+        未给定（非 live 工具薄包装）：自行经 adapter 拉取（兼容旧调用）。
+        """
         mismatches: list[str] = []
         repaired: list[str] = []
         details: dict[str, Any] = {}
+
+        if snapshot is not None:
+            details["snapshot_id"] = snapshot.snapshot_id
+            if not snapshot.complete:
+                mismatches.append("capture bundle 不完整：账户/仓位/开放订单字段缺失，状态不可信")
+                result = ReconciliationResult(
+                    ts_ms=int(time.time() * 1000),
+                    consistent=False,
+                    mismatches=tuple(mismatches),
+                    repaired=(),
+                    can_open=False,
+                    details=details,
+                )
+                self.store.record_reconciliation(result, reason=reason)
+                logger.error("【对账拒绝】bundle 不完整，can_open=false（reason=%s）", reason)
+                return result
 
         # 1. 订单对账（两市场）
         for market, _adapter, query in (
@@ -69,7 +95,7 @@ class Reconciler:
             ("PERP", self.futures, self._reconcile_futures_orders),
         ):
             try:
-                m, r = query(mismatches, repaired)
+                m, r = query(mismatches, repaired, snapshot=snapshot)
             except Exception as exc:  # noqa: BLE001
                 # 对账请求本身失败 = 状态不可信
                 mismatches.append(f"{market}: 对账查询失败: {exc}")
@@ -79,7 +105,7 @@ class Reconciler:
 
         # 2. 持仓对账
         try:
-            m, r, pos_details = self._reconcile_positions()
+            m, r, pos_details = self._reconcile_positions(snapshot=snapshot)
             mismatches.extend(m)
             repaired.extend(r)
             details["positions"] = pos_details
@@ -107,19 +133,38 @@ class Reconciler:
     # -- 订单对账 -----------------------------------------------------------
 
     def _reconcile_spot_orders(
-        self, mismatches: list[str], repaired: list[str]
+        self,
+        mismatches: list[str],
+        repaired: list[str],
+        *,
+        snapshot: ExchangeSnapshotBundle | None = None,
     ) -> tuple[list[str], list[str]]:
-        return self._reconcile_orders(self.spot, "SPOT", mismatches, repaired)
+        return self._reconcile_orders(self.spot, "SPOT", mismatches, repaired, snapshot=snapshot)
 
     def _reconcile_futures_orders(
-        self, mismatches: list[str], repaired: list[str]
+        self,
+        mismatches: list[str],
+        repaired: list[str],
+        *,
+        snapshot: ExchangeSnapshotBundle | None = None,
     ) -> tuple[list[str], list[str]]:
-        return self._reconcile_orders(self.futures, "PERP", mismatches, repaired)
+        return self._reconcile_orders(self.futures, "PERP", mismatches, repaired, snapshot=snapshot)
 
     def _reconcile_orders(
-        self, adapter: Any, market: str, mismatches: list[str], repaired: list[str]
+        self,
+        adapter: Any,
+        market: str,
+        mismatches: list[str],
+        repaired: list[str],
+        *,
+        snapshot: ExchangeSnapshotBundle | None = None,
     ) -> tuple[list[str], list[str]]:
-        exchange_open = adapter.open_orders()
+        if snapshot is not None:
+            exchange_open = (
+                snapshot.spot_open_orders if market == "SPOT" else snapshot.perp_open_orders
+            )
+        else:
+            exchange_open = adapter.open_orders()
         open_by_client: dict[str, dict[str, Any]] = {}
         for o in exchange_open:
             cid = str(o.get("clientOrderId") or "")
@@ -192,14 +237,28 @@ class Reconciler:
 
     # -- 持仓对账 -----------------------------------------------------------
 
-    def _reconcile_positions(self) -> tuple[list[str], list[str], dict[str, Any]]:
+    def _reconcile_positions(
+        self, *, snapshot: ExchangeSnapshotBundle | None = None
+    ) -> tuple[list[str], list[str], dict[str, Any]]:
         mismatches: list[str] = []
         repaired: list[str] = []
         expected = self.store.expected_positions()
-        spot_balances = self.spot.balances()
-        perp_positions = {p["symbol"]: Decimal(str(p.get("positionAmt") or "0"))
-                          for p in self.futures.positions()
-                          if str(p.get("positionSide") or "BOTH") == "BOTH"}
+        if snapshot is not None:
+            spot_balances = {
+                a["asset"]: Decimal(str(a.get("free") or "0")) + Decimal(str(a.get("locked") or "0"))
+                for a in (snapshot.spot_account.get("balances") or [])
+                if isinstance(a, dict) and a.get("asset")
+            }
+            perp_positions = {
+                str(p.get("symbol")): Decimal(str(p.get("positionAmt") or "0"))
+                for p in snapshot.positions
+                if str(p.get("positionSide") or "BOTH") == "BOTH"
+            }
+        else:
+            spot_balances = self.spot.balances()
+            perp_positions = {p["symbol"]: Decimal(str(p.get("positionAmt") or "0"))
+                              for p in self.futures.positions()
+                              if str(p.get("positionSide") or "BOTH") == "BOTH"}
 
         details: dict[str, Any] = {}
         symbols = set(expected) | {s for s, q in spot_balances.items() if q > QTY_EPSILON}

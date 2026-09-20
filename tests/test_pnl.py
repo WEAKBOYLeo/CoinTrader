@@ -92,11 +92,14 @@ def _seed_round_trip(store: StateStore, *,
         assert store.record_fill(f) is True
 
     if funding is not None:
+        # T3：fixture 资金费按交易所事实（AUTHORITATIVE）入账，保持既有口径断言
         assert store.record_funding_cashflow(
             cashflow_id="cf-1", symbol="BTCUSDT",
             funding_ts_ms=T0 + 8 * 3600 * 1000,
             funding_rate=Decimal("0.0005"), interval_hours=8,
             amount=Decimal(funding), source="test", run_id=run_id,
+            market="PERP", exchange_income_id="inc-test-1",
+            authority="AUTHORITATIVE",
         ) is True
 
     open_row = store.get_pair("pair-open-1")
@@ -161,6 +164,8 @@ class TestForTrip:
             funding_ts_ms=T0 + 8 * 3600 * 1000,
             funding_rate=Decimal("0.0005"), interval_hours=8,
             amount=Decimal("0.5"), source="test",
+            market="PERP", exchange_income_id="inc-open-2",
+            authority="AUTHORITATIVE",
         )
         open_row = store.get_pair("pair-open-2")
         agg = PnlAggregator(store, now_fn=lambda: T1 / 1000)
@@ -277,6 +282,8 @@ def _seed_open_eth_trip(store: StateStore) -> None:
         funding_ts_ms=T0 + 8 * 3600 * 1000,
         funding_rate=Decimal("0.0005"), interval_hours=8,
         amount=Decimal("0.3"), source="test", run_id="run-a",
+        market="PERP", exchange_income_id="inc-eth-1",
+        authority="AUTHORITATIVE",
     )
 
 
@@ -344,3 +351,61 @@ class TestPersist:
             raise AssertionError("未平仓不得写 REALIZED 账本")
         except ValueError:
             pass
+
+
+class TestFundingAuthority:
+    """T3（AC-08）：authoritative / estimated 口径分离，不重复计入。"""
+
+    def test_estimated_only_excluded_from_authoritative_net(self, tmp_path) -> None:
+        store = StateStore(tmp_path / "t.sqlite3")
+        open_row, close_row = _seed_round_trip(store, funding=None)
+        store.record_funding_cashflow(
+            cashflow_id="cf-est-1", symbol="BTCUSDT",
+            funding_ts_ms=T0 + 8 * 3600 * 1000,
+            funding_rate=Decimal("0.0005"), interval_hours=8,
+            amount=Decimal("0.7"), source="funding_history",
+            authority="ESTIMATED",
+        )
+        pnl = PnlAggregator(store, now_fn=lambda: T1 / 1000).for_trip(open_row, close_row)
+        assert pnl.funding_pnl == Decimal("0")
+        assert pnl.estimated_funding_pnl == Decimal("0.7")
+        # estimated 不得计入 authoritative net（只扣手续费）
+        assert pnl.realized_pnl == -Decimal("0.003")
+        summary = PnlAggregator(store, now_fn=lambda: T1 / 1000).for_run("run-pnl")
+        assert summary.estimated_funding_pnl == Decimal("0.7")
+        assert summary.authoritative_complete is False
+
+    def test_authoritative_overrides_estimated_same_ts(self, tmp_path) -> None:
+        store = StateStore(tmp_path / "t.sqlite3")
+        open_row, close_row = _seed_round_trip(store, funding=None)
+        ts = T0 + 8 * 3600 * 1000
+        store.record_funding_cashflow(
+            cashflow_id="cf-est-2", symbol="BTCUSDT",
+            funding_ts_ms=ts, funding_rate=Decimal("0.0005"), interval_hours=8,
+            amount=Decimal("0.9"), source="funding_history", authority="ESTIMATED",
+        )
+        store.record_funding_cashflow(
+            cashflow_id="cf-auth-2", symbol="BTCUSDT",
+            funding_ts_ms=ts, funding_rate=Decimal("0.0005"), interval_hours=8,
+            amount=Decimal("0.4"), source="exchange_income",
+            market="PERP", exchange_income_id="inc-auth-2", authority="AUTHORITATIVE",
+        )
+        pnl = PnlAggregator(store, now_fn=lambda: T1 / 1000).for_trip(open_row, close_row)
+        # 同 ts 有 authoritative：只计 0.4，estimated 0.9 不双计
+        assert pnl.funding_pnl == Decimal("0.4")
+        assert pnl.estimated_funding_pnl == Decimal("0")
+        assert pnl.realized_pnl == Decimal("0.4") - Decimal("0.003")
+
+    def test_duplicate_income_id_counted_once(self, tmp_path) -> None:
+        store = StateStore(tmp_path / "t.sqlite3")
+        open_row, close_row = _seed_round_trip(store, funding=None)
+        ts = T0 + 8 * 3600 * 1000
+        for i in range(3):  # 重复轮询/重启回补：(market, exchange_income_id) 幂等
+            store.record_funding_cashflow(
+                cashflow_id=f"inc-dup-{i}", symbol="BTCUSDT",
+                funding_ts_ms=ts, funding_rate=Decimal("0.0005"), interval_hours=8,
+                amount=Decimal("0.2"), source="exchange_income",
+                market="PERP", exchange_income_id="inc-dup-1", authority="AUTHORITATIVE",
+            )
+        pnl = PnlAggregator(store, now_fn=lambda: T1 / 1000).for_trip(open_row, close_row)
+        assert pnl.funding_pnl == Decimal("0.2")
