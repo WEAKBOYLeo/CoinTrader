@@ -237,6 +237,78 @@ class TestRateLimitConfigValidation:
         with pytest.raises(ConfigError, match="soft_limit_ratio"):
             RateLimitConfig(soft_limit_ratio=ratio)
 
+    @pytest.mark.parametrize("ratio", [0.0, -0.1, 0.8, 1.2])
+    def test_rejects_invalid_critical_reserve_ratio(self, ratio: float) -> None:
+        """critical reserve 必须在 (0, soft_limit_ratio) 内。"""
+        with pytest.raises(ConfigError, match="critical_reserve_ratio"):
+            RateLimitConfig(critical_reserve_ratio=ratio)
+
+    def test_rejects_too_short_rate_limit_freeze(self) -> None:
+        with pytest.raises(ConfigError, match="rate_limit_freeze_seconds"):
+            RateLimitConfig(rate_limit_freeze_seconds=0.5)
+
+    def test_rejects_too_short_ip_ban(self) -> None:
+        with pytest.raises(ConfigError, match="ip_ban_seconds"):
+            RateLimitConfig(ip_ban_seconds=59)
+
+
+class TestSchedulerAndEpochConfig:
+    """共享 weight 调度与 scan epoch 相关配置（实施计划书 v2.0）。"""
+
+    def test_project_config_loads_new_rate_limit_fields(self, project_root: Path) -> None:
+        config = load_config(project_root / "config" / "config.yaml")
+        assert config.data.rate_limit.critical_reserve_ratio == pytest.approx(0.30)
+        assert config.data.rate_limit.rate_limit_freeze_seconds == 120
+        assert config.data.rate_limit.ip_ban_seconds == 3600
+
+    def test_project_config_loads_new_execution_fields(self, project_root: Path) -> None:
+        config = load_config(project_root / "config" / "config.yaml")
+        assert config.execution.candidate_refresh_concurrency == 4
+        assert config.execution.scan_epoch_deadline_seconds == 600
+        assert config.execution.candidate_quote_top_k == 10
+        assert config.execution.max_quote_skew_ms == 500
+        assert config.execution.recovery_backfill_days == 30
+        assert config.execution.exchange_snapshot_reuse_seconds == pytest.approx(2.0)
+
+    def test_project_config_has_no_deprecated_refetch_key(self, project_root: Path) -> None:
+        text = (project_root / "config" / "config.yaml").read_text(encoding="utf-8")
+        assert "candidate_refetch_per_minute" not in text
+
+    def test_deprecated_refetch_key_warns_but_loads(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        path = tmp_path / "legacy.yaml"
+        path.write_text(
+            "execution:\n  candidate_refetch_per_minute: 6\n", encoding="utf-8"
+        )
+        with caplog.at_level("WARNING", logger="cointrader.config"):
+            load_config(path)
+        assert any("candidate_refetch_per_minute" in r.message for r in caplog.records)
+        assert any("weight" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("value", [0, 17])
+    def test_rejects_invalid_refresh_concurrency(self, value: int) -> None:
+        with pytest.raises(ConfigError, match="candidate_refresh_concurrency"):
+            ExecutionConfig(candidate_refresh_concurrency=value)
+
+    def test_rejects_invalid_quote_top_k(self) -> None:
+        with pytest.raises(ConfigError, match="candidate_quote_top_k"):
+            ExecutionConfig(candidate_quote_top_k=0)
+
+    def test_rejects_invalid_quote_skew(self) -> None:
+        with pytest.raises(ConfigError, match="max_quote_skew_ms"):
+            ExecutionConfig(max_quote_skew_ms=0)
+
+    def test_rejects_invalid_backfill_days(self) -> None:
+        with pytest.raises(ConfigError, match="recovery_backfill_days"):
+            ExecutionConfig(recovery_backfill_days=366)
+
+    def test_rejects_snapshot_reuse_exceeding_fresh_window(self) -> None:
+        with pytest.raises(ConfigError, match="exchange_snapshot_reuse_seconds"):
+            ExecutionConfig(exchange_snapshot_reuse_seconds=60.0)
+
+    def test_rejects_nonpositive_epoch_deadline(self) -> None:
+        with pytest.raises(ConfigError, match="scan_epoch_deadline_seconds"):
+            ExecutionConfig(scan_epoch_deadline_seconds=0.0)
+
     def test_rejects_nonpositive_weight(self) -> None:
         with pytest.raises(ConfigError, match="必须为正"):
             RateLimitConfig(futures_weight_per_min=0)

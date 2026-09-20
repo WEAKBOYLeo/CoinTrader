@@ -1,9 +1,11 @@
 """签名 HTTP 传输层 —— 限流、超时、错误分类的唯一出口。
 
-安全规则（开发设计文档 §3.1/§3.5）：
+安全规则（开发设计文档 §3.1/§3.5，实施计划书 v2.0 T1 后）：
 
-1. **全局共享限流**：每个客户端实例一个权重跟踪器（Spot 与 Futures
-   各建一个实例），以响应头 ``x-mbx-used-weight-1m`` 为准（服务端视角）。
+1. **全局共享限流**：每个客户端可注入同一个 ``RateLimitCoordinator``
+   （live 装配中 public/spot signed/futures signed 共享一个实例），
+   以响应头 ``x-mbx-used-weight-1m`` 为准（服务端视角）。
+   账户/恢复请求用 P1 优先级，下单/撤单用 P0（保留预算）。
 2. **订单类请求（critical）永不重试**。
    超时 / 408 / 5xx / 网络中断一律抛 ``UnknownSubmission`` ——
    订单可能已成交，唯一合法的下一步是用 clientOrderId 查询。
@@ -12,8 +14,8 @@
    - 400 → BinanceError / OrderRejected（订单明确拒单，不重试）
    - 401/403 / -1022 → AuthError（立即停机）
    - 408（读请求）/ 5xx → 读请求可重试；critical → UnknownSubmission
-   - 429 → 读请求尊重 Retry-After 重试；critical 直接上抛
-   - 418 → IPBanError，停止一切请求
+   - 429 → coordinator 冻结该 scope；读请求按 Retry-After 退避重试
+   - 418 → coordinator 封禁该 scope + IPBanError，停止一切请求
    - -1021 → ClockError（停止交易，校准 NTP）
 4. 日志永不包含签名、完整认证 URL 或 Secret（redact 兜底）。
 """
@@ -25,7 +27,6 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from threading import Lock
 from typing import Any
 from urllib.parse import quote
 
@@ -40,6 +41,12 @@ from ..errors import (
     OrderRejected,
     RateLimitError,
     UnknownSubmission,
+)
+from ..rate_limit import (
+    RateLimitCoordinator,
+    RateLimitScope,
+    RequestPriority,
+    endpoint_weight,
 )
 from ..redact import redact_url
 from .auth import sign_params
@@ -71,42 +78,9 @@ CLOCK_DRIFT_CODE = -1021
 SIGNATURE_ERROR_CODE = -1022
 
 
-@dataclass
-class _WeightTracker:
-    """按市场跟踪已用权重。以响应头为准（含同 IP 其他进程）。"""
-
-    limit: int
-    soft_limit_ratio: float
-    used: int = 0
-    window_start: float = time.monotonic()
-    _lock: Lock = Lock()
-
-    def observe(self, used_weight: int | None) -> None:
-        if used_weight is None:
-            return
-        with self._lock:
-            self.used = used_weight
-            self._maybe_roll()
-
-    def _maybe_roll(self) -> None:
-        if time.monotonic() - self.window_start >= 60.0:
-            self.window_start = time.monotonic()
-            self.used = 0
-
-    def should_throttle(self) -> bool:
-        with self._lock:
-            self._maybe_roll()
-            return self.used >= self.limit * self.soft_limit_ratio
-
-    def seconds_until_reset(self) -> float:
-        with self._lock:
-            self._maybe_roll()
-            return max(0.0, 60.0 - (time.monotonic() - self.window_start))
-
-    def used_ratio(self) -> float:
-        with self._lock:
-            self._maybe_roll()
-            return self.used / self.limit if self.limit else 0.0
+def _market_to_scope(market: Market) -> RateLimitScope:
+    """Market → 限流 scope（PERP 与 futures 共享同一 IP 计数器）。"""
+    return RateLimitScope.SPOT if market is Market.SPOT else RateLimitScope.FUTURES
 
 
 @dataclass
@@ -141,10 +115,12 @@ class SignedClient:
         api_key: API Key（SecretStr，repr 安全）。
         secret: API Secret（SecretStr）。
         market: 权重跟踪器命名（spot/futures）。
-        weight_limit: 每分钟权重上限。
+        weight_limit: 本市场每分钟权重上限（未注入共享协调器时生效）。
+        rate_limiter: 可注入的共享限流协调器；live 装配必须注入与
+            public/futures 客户端共享的实例；未注入时自建（研究/单测兼容）。
         client: 可注入的 httpx.Client（测试用 mock transport）。
         read_max_retries: 读请求最大重试次数。**critical 请求恒为 0 次。**
-        sleep_fn / now_fn: 可注入，便于测试。
+        sleep_fn / now_fn: 可注入，便于测试（now_fn 同时作为自建协调器的时钟）。
     """
 
     def __init__(
@@ -156,6 +132,10 @@ class SignedClient:
         market: Market | str,
         weight_limit: int = 2400,
         soft_limit_ratio: float = 0.80,
+        critical_reserve_ratio: float = 0.30,
+        freeze_seconds: float = 120.0,
+        ban_seconds: float = 3600.0,
+        rate_limiter: RateLimitCoordinator | None = None,
         recv_window_ms: int = 5000,
         timeout_seconds: float = 5.0,
         read_max_retries: int = 3,
@@ -180,7 +160,22 @@ class SignedClient:
         )
         self._sleep = sleep_fn
         self._now = now_fn
-        self._weight = _WeightTracker(weight_limit, soft_limit_ratio)
+        self._scope = _market_to_scope(self.market)
+        if rate_limiter is not None:
+            self.coordinator = rate_limiter
+        else:
+            # 未注入共享协调器：自建一个（研究 CLI/单测兼容）；
+            # 时钟与 sleep 用注入版本，测试可用假时钟。
+            self.coordinator = RateLimitCoordinator(
+                {self._scope: weight_limit},
+                default_limit=weight_limit,
+                soft_limit_ratio=soft_limit_ratio,
+                critical_reserve_ratio=critical_reserve_ratio,
+                freeze_seconds=freeze_seconds,
+                ban_seconds=ban_seconds,
+                clock=now_fn,
+                sleep=sleep_fn,
+            )
         #: server time 偏移（毫秒）= server - local。由 adapter 的 calibrate() 设置。
         self.time_offset_ms: int = 0
 
@@ -204,19 +199,44 @@ class SignedClient:
 
     # -- 请求入口 -----------------------------------------------------------
 
-    def get(self, path: str, params: dict[str, Any] | None = None, *, sign: bool = True) -> Any:
+    def get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        sign: bool = True,
+        priority: RequestPriority | int = RequestPriority.P1_RECOVERY,
+    ) -> Any:
         """读请求：有限重试 + 限流退避。sign=False 用于公开接口（不附加签名参数）。"""
-        return self._execute("GET", path, params, critical=False, client_order_id=None, sign=sign)
+        return self._execute("GET", path, params, critical=False, client_order_id=None, sign=sign, priority=priority)
 
-    def post(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def post(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        priority: RequestPriority | int = RequestPriority.P1_RECOVERY,
+    ) -> Any:
         """非 critical 写请求（如创建 listenKey）：按读请求策略重试。"""
-        return self._execute("POST", path, params, critical=False, client_order_id=None)
+        return self._execute("POST", path, params, critical=False, client_order_id=None, priority=priority)
 
-    def delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._execute("DELETE", path, params, critical=False, client_order_id=None)
+    def delete(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        priority: RequestPriority | int = RequestPriority.P1_RECOVERY,
+    ) -> Any:
+        return self._execute("DELETE", path, params, critical=False, client_order_id=None, priority=priority)
 
-    def put(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._execute("PUT", path, params, critical=False, client_order_id=None)
+    def put(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        priority: RequestPriority | int = RequestPriority.P1_RECOVERY,
+    ) -> Any:
+        return self._execute("PUT", path, params, critical=False, client_order_id=None, priority=priority)
 
     def place_order(self, path: str, params: dict[str, Any], *, client_order_id: str) -> Any:
         """下单。永不重试；结果未知时抛 UnknownSubmission。"""
@@ -248,32 +268,45 @@ class SignedClient:
         critical: bool,
         client_order_id: str | None,
         sign: bool = True,
+        priority: RequestPriority | int = RequestPriority.P1_RECOVERY,
     ) -> Any:
         max_retries = 0 if critical else self.read_max_retries
-        self._throttle_if_needed()
+        scope = self._scope
+        priority = RequestPriority.P0_CRITICAL if critical else RequestPriority(int(priority))
+        params = params or {}
+        weight = endpoint_weight(scope, path, params, on_unknown=self.coordinator.note_unknown_endpoint)
 
         for attempt in range(max_retries + 1):
-            self.stats.requests += 1
-            try:
-                response = self._send(method, path, params, sign=sign)
-            except httpx.TimeoutException as exc:
-                self._on_network_failure(
-                    f"请求超时: {redact_url(str(exc))}", path, critical, client_order_id, attempt
-                )
-                continue
-            except httpx.HTTPError as exc:
-                self._on_network_failure(
-                    f"网络错误: {redact_url(str(exc))}", path, critical, client_order_id, attempt
-                )
-                continue
+            before = self.coordinator.now()
+            with self.coordinator.acquire(scope, priority, weight, critical=critical):
+                self.stats.requests += 1
+                try:
+                    response = self._send(method, path, params, sign=sign)
+                except httpx.TimeoutException as exc:
+                    self._on_network_failure(
+                        f"请求超时: {redact_url(str(exc))}", path, critical, client_order_id, attempt
+                    )
+                    continue
+                except httpx.HTTPError as exc:
+                    self._on_network_failure(
+                        f"网络错误: {redact_url(str(exc))}", path, critical, client_order_id, attempt
+                    )
+                    continue
 
-            self._weight.observe(_parse_int_header(response.headers.get("x-mbx-used-weight-1m")))
-            result = self._handle_response(
-                response, path, critical, client_order_id, attempt, max_retries
-            )
-            if result is _Retry:
-                continue
-            return result
+                # 每次响应都把服务端视角的已用权重与熔断状态反馈给 coordinator
+                self.coordinator.observe(
+                    scope,
+                    _parse_int_header(response.headers.get("x-mbx-used-weight-1m")),
+                    response.status_code,
+                    _parse_float_header(response.headers.get("retry-after")),
+                )
+                self.stats.throttled_seconds += max(0.0, self.coordinator.now() - before)
+                result = self._handle_response(
+                    response, path, critical, client_order_id, attempt, max_retries
+                )
+                if result is _Retry:
+                    continue
+                return result
 
         # 重试耗尽仍失败
         raise NetworkError(f"请求 {path} 重试耗尽（{max_retries} 次）") from None
@@ -407,20 +440,6 @@ class SignedClient:
         raise BinanceError(
             f"API 错误 (HTTP {status}) at {path}: {body}", code=binance_code, status=status
         )
-
-    def _throttle_if_needed(self) -> None:
-        if self._weight.should_throttle():
-            wait = self._weight.seconds_until_reset()
-            logger.warning(
-                "权重接近上限 (%d/%d)，休眠 %.1fs 等待窗口重置 (%s)",
-                self._weight.used,
-                self._weight.limit,
-                wait,
-                self.base_url,
-            )
-            self.stats.throttled_seconds += wait
-            if wait > 0:
-                self._sleep(wait)
 
     def _backoff(self, attempt: int) -> float:
         """指数退避 + 50%~100% 抖动（避免惊群）。"""

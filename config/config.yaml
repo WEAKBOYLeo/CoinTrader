@@ -12,8 +12,14 @@ data:
   rate_limit:
     futures_weight_per_min: 2400
     spot_weight_per_min: 6000
-    # 达到该比例时主动休眠，给突发请求留余量
+    # 达到该比例时低优先级请求暂停，给突发请求留余量
     soft_limit_ratio: 0.80
+    # P0(下单)/P1(恢复对账) 保留预算比例；P2-P4 不得占用
+    critical_reserve_ratio: 0.30
+    # 429 无/短 Retry-After 时的最小保护冻结（秒，实测 429 封 120s）
+    rate_limit_freeze_seconds: 120
+    # 418 IP 封禁时长（秒，实测 418 封 60min）
+    ip_ban_seconds: 3600
     max_retries: 5
     base_backoff_seconds: 0.5
     max_backoff_seconds: 30.0
@@ -206,8 +212,18 @@ execution:
   candidate_pool_max_symbols: 100
   # 动态候选池刷新周期（秒）；失败保留旧池
   universe_refresh_seconds: 1800
-  # 每 60 秒窗口内最多刷新的候选 symbol 数（API 按分钟限流；摊平结算边界突发）
-  candidate_refetch_per_minute: 6
+  # 候选后台刷新有界并发（共享 weight 调度，1..16）
+  candidate_refresh_concurrency: 4
+  # scan epoch 构建截止（秒）：超时标 DEGRADED 并告警，绝不放行交易
+  scan_epoch_deadline_seconds: 600
+  # READY 排名后取执行报价的最大候选数（top K）
+  candidate_quote_top_k: 10
+  # Spot/Futures 报价接收时间最大偏差（毫秒），超过则本轮 SKIP
+  max_quote_skew_ms: 500
+  # 无同步游标时最大初始补账窗口（天）
+  recovery_backfill_days: 30
+  # 同一轮账户/对账/poll 的 exchange snapshot single-flight 复用窗口（秒）
+  exchange_snapshot_reuse_seconds: 2
   # 候选最小刷新间隔（秒）；实际每币间隔 = max(本值, 该币资金费结算周期 1/4/8h)
   candidate_refresh_seconds: 300
   # 候选指标缓存最大年龄（秒）；超过拒绝开仓

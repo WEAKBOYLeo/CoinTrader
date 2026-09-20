@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,8 @@ from typing import Any
 import yaml
 
 from .errors import ConfigError
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path("config/config.yaml")
 
@@ -37,6 +40,12 @@ class RateLimitConfig:
     futures_weight_per_min: int = 2400
     spot_weight_per_min: int = 6000
     soft_limit_ratio: float = 0.80
+    # P0(下单)/P1(恢复对账) 保留预算比例；P2-P4 不得占用（实施计划书 v2.0 §5）
+    critical_reserve_ratio: float = 0.30
+    # 429 无/短 Retry-After 时的最小保护冻结（秒）
+    rate_limit_freeze_seconds: float = 120.0
+    # 418 无有效 Retry-After 时的 IP 封禁（秒）
+    ip_ban_seconds: float = 3600.0
     max_retries: int = 5
     base_backoff_seconds: float = 0.5
     max_backoff_seconds: float = 30.0
@@ -44,8 +53,21 @@ class RateLimitConfig:
     def __post_init__(self) -> None:
         if not 0.0 < self.soft_limit_ratio <= 1.0:
             raise ConfigError(f"soft_limit_ratio 必须在 (0,1] 内，当前 {self.soft_limit_ratio}")
+        if not 0.0 < self.critical_reserve_ratio < self.soft_limit_ratio:
+            raise ConfigError(
+                f"critical_reserve_ratio 必须在 (0, soft_limit_ratio) 内，"
+                f"当前 {self.critical_reserve_ratio}"
+            )
         if self.futures_weight_per_min <= 0:
             raise ConfigError("futures_weight_per_min 必须为正")
+        if self.spot_weight_per_min <= 0:
+            raise ConfigError("spot_weight_per_min 必须为正")
+        if self.rate_limit_freeze_seconds < 1:
+            raise ConfigError(
+                f"rate_limit_freeze_seconds 必须 >= 1，当前 {self.rate_limit_freeze_seconds}"
+            )
+        if self.ip_ban_seconds < 60:
+            raise ConfigError(f"ip_ban_seconds 必须 >= 60，当前 {self.ip_ban_seconds}")
         if self.max_retries < 0:
             raise ConfigError("max_retries 不能为负")
 
@@ -343,8 +365,21 @@ class ExecutionConfig:
     candidate_pool_max_symbols: int = 100
     # 动态候选池刷新周期（秒）；池内指标仍按各币资金费结算周期刷新
     universe_refresh_seconds: float = 1800.0
-    # 每 60 秒窗口内最多刷新的候选 symbol 数（API 按分钟限流；摊平结算边界突发）
+    # ⚠️ 已废弃（实施计划书 v2.0）：固定 symbol/分钟 预算被共享 weight 调度取代，
+    # 本字段不再控制任何行为，保留仅为加载兼容；将在 scan epoch 任务中彻底移除。
     candidate_refetch_per_minute: int = 6
+    # 候选后台刷新有界并发（1..16）
+    candidate_refresh_concurrency: int = 4
+    # scan epoch 构建截止（秒）：超时标 DEGRADED/告警，绝不放行交易
+    scan_epoch_deadline_seconds: float = 600.0
+    # READY 排名后取执行报价的最大候选数（top K）
+    candidate_quote_top_k: int = 10
+    # Spot/Futures 报价接收时间最大偏差（毫秒）
+    max_quote_skew_ms: int = 500
+    # 无同步游标时最大初始补账窗口（天，1..365）
+    recovery_backfill_days: int = 30
+    # 同一轮账户/对账/poll 的 exchange snapshot single-flight 复用窗口（秒）
+    exchange_snapshot_reuse_seconds: float = 2.0
     # 候选最小刷新间隔（秒）；实际每币间隔 = max(本值, 该币资金费结算周期)
     candidate_refresh_seconds: float = 300.0
     # 候选指标缓存允许的最大年龄（秒）；超过则拒绝开仓
@@ -398,6 +433,35 @@ class ExecutionConfig:
             raise ConfigError(
                 f"execution.candidate_refetch_per_minute 必须 >= 1，"
                 f"当前 {self.candidate_refetch_per_minute}"
+            )
+        if not 1 <= self.candidate_refresh_concurrency <= 16:
+            raise ConfigError(
+                f"execution.candidate_refresh_concurrency 必须在 [1,16]，"
+                f"当前 {self.candidate_refresh_concurrency}"
+            )
+        if self.scan_epoch_deadline_seconds <= 0:
+            raise ConfigError(
+                f"execution.scan_epoch_deadline_seconds 必须 > 0，当前 {self.scan_epoch_deadline_seconds}"
+            )
+        if self.candidate_quote_top_k < 1:
+            raise ConfigError(
+                f"execution.candidate_quote_top_k 必须 >= 1，当前 {self.candidate_quote_top_k}"
+            )
+        if self.max_quote_skew_ms < 1:
+            raise ConfigError(f"execution.max_quote_skew_ms 必须 >= 1，当前 {self.max_quote_skew_ms}")
+        if not 1 <= self.recovery_backfill_days <= 365:
+            raise ConfigError(
+                f"execution.recovery_backfill_days 必须在 [1,365]，当前 {self.recovery_backfill_days}"
+            )
+        if self.exchange_snapshot_reuse_seconds <= 0:
+            raise ConfigError(
+                f"execution.exchange_snapshot_reuse_seconds 必须 > 0，"
+                f"当前 {self.exchange_snapshot_reuse_seconds}"
+            )
+        if self.exchange_snapshot_reuse_seconds > self.user_stream_fresh_seconds:
+            raise ConfigError(
+                f"execution.exchange_snapshot_reuse_seconds 必须 <= user_stream_fresh_seconds"
+                f"（{self.user_stream_fresh_seconds}），当前 {self.exchange_snapshot_reuse_seconds}"
             )
         for symbol in self.live_symbols:
             if not symbol.upper().endswith("USDT"):
@@ -518,6 +582,12 @@ def _build_api(raw: dict[str, Any]) -> ApiConfig:
 
 def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
     sec = _section(raw, "execution")
+    if "candidate_refetch_per_minute" in sec:
+        # 旧字段不再控制行为（实施计划书 v2.0）：候选刷新由共享 weight 调度驱动
+        logger.warning(
+            "execution.candidate_refetch_per_minute 已废弃，不再控制候选刷新节奏；"
+            "请改用 data.rate_limit（共享 weight 调度）"
+        )
     return ExecutionConfig(
         mode=str(sec.get("mode", "paper")).lower(),
         recv_window_ms=int(sec.get("recv_window_ms", 5000)),
@@ -543,6 +613,12 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         candidate_pool_max_symbols=int(sec.get("candidate_pool_max_symbols", 100)),
         universe_refresh_seconds=float(sec.get("universe_refresh_seconds", 1800.0)),
         candidate_refetch_per_minute=int(sec.get("candidate_refetch_per_minute", 6)),
+        candidate_refresh_concurrency=int(sec.get("candidate_refresh_concurrency", 4)),
+        scan_epoch_deadline_seconds=float(sec.get("scan_epoch_deadline_seconds", 600.0)),
+        candidate_quote_top_k=int(sec.get("candidate_quote_top_k", 10)),
+        max_quote_skew_ms=int(sec.get("max_quote_skew_ms", 500)),
+        recovery_backfill_days=int(sec.get("recovery_backfill_days", 30)),
+        exchange_snapshot_reuse_seconds=float(sec.get("exchange_snapshot_reuse_seconds", 2.0)),
         candidate_refresh_seconds=float(sec.get("candidate_refresh_seconds", 300.0)),
         max_candidate_data_age_seconds=float(sec.get("max_candidate_data_age_seconds", 1800.0)),
         snapshot_interval_seconds=int(sec.get("snapshot_interval_seconds", 30)),

@@ -13,12 +13,12 @@
     spot  REQUEST_WEIGHT  6000 / 分钟 (IP 维度)
     响应头  x-mbx-used-weight-1m  ← 已用权重，直接读，不要自己估
 
-限流处理策略：
+限流处理策略（实施计划书 v2.0 T1）：
 
-- 每读一个响应就更新内部权重计数（以响应头为准，比自己记账可靠）
-- 权重超过 ``soft_limit_ratio`` 主动休眠到下一分钟窗口
-- HTTP 429 → 指数退避，并尊重 ``Retry-After``
-- HTTP 418 → **立即抛 IPBanError 停止一切请求**。继续请求会延长封禁
+- 所有请求经共享 ``RateLimitCoordinator`` 申请 permit（按 scope/priority/估算 weight），
+  每次响应都把 ``x-mbx-used-weight-1m`` 反馈给 coordinator（以服务端视角为准）
+- 429 → coordinator 冻结该市场（至少 120s），读请求可退避重试
+- 418 → coordinator 封禁该市场（至少 3600s），**立即抛 IPBanError 停止一切请求**
 """
 
 from __future__ import annotations
@@ -26,9 +26,8 @@ from __future__ import annotations
 import logging
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
-from threading import Lock
 from typing import Any
 from urllib.parse import urlencode
 
@@ -42,6 +41,12 @@ from ..errors import (
     NetworkError,
     ParseError,
     RateLimitError,
+)
+from ..rate_limit import (
+    RateLimitCoordinator,
+    RateLimitScope,
+    RequestPriority,
+    endpoint_weight,
 )
 from ..redact import redact_url
 from .cache import DiskCache, json_or_raise, make_key
@@ -76,53 +81,9 @@ KLINES_MAX_LIMIT = 1500
 FUNDING_MAX_LIMIT = 1000
 
 
-@dataclass
-class _WeightTracker:
-    """按接口类别跟踪已用权重。
-
-    以响应头 ``x-mbx-used-weight-1m`` 为准，因为它反映的是**服务端**视角
-    （含其他进程/其他机器的同 IP 请求），比本地累加准确。
-    """
-
-    limit: int
-    soft_limit_ratio: float
-    used: int = 0
-    window_start: float = field(default_factory=time.monotonic)
-    _lock: Lock = field(default_factory=Lock, repr=False, compare=False)
-
-    def observe(self, used_weight: int | None) -> None:
-        if used_weight is None:
-            return
-        with self._lock:
-            self.used = used_weight
-            self._maybe_roll_window()
-
-    def _maybe_roll_window(self) -> None:
-        """滚动到新的分钟窗口时重置本地计数。
-
-        只在长时间没有请求（因而没有响应头更新）时才需要主动重置；
-        正常情况下窗口滚动由每次 observe 的新值自然覆盖。
-        """
-        now = time.monotonic()
-        if now - self.window_start >= 60.0:
-            self.window_start = now
-            self.used = 0
-
-    def should_throttle(self) -> bool:
-        with self._lock:
-            self._maybe_roll_window()
-            return self.used >= self.limit * self.soft_limit_ratio
-
-    def seconds_until_window_reset(self) -> float:
-        with self._lock:
-            elapsed = time.monotonic() - self.window_start
-            return max(0.0, 60.0 - elapsed)
-
-    def note_request(self, weight: int) -> None:
-        """在没有响应头可用时（如缓存命中前的预估）本地累加。"""
-        with self._lock:
-            self._maybe_roll_window()
-            self.used += weight
+#: K 线单次请求最大条数（币安硬限制，滑动窗口分页时必须遵守）
+KLINES_MAX_LIMIT = 1500
+FUNDING_MAX_LIMIT = 1000
 
 
 @dataclass(slots=True)
@@ -153,6 +114,8 @@ class BinancePublicClient:
         data: 数据/限流/缓存配置。
         client: 可注入的 ``httpx.Client``，便于测试时替换为 mock transport。
         sleep_fn: 可注入的 sleep，便于测试时跳过等待。
+        rate_limiter: 可注入的共享限流协调器；未注入时自建一个（保持研究
+            CLI/单测兼容）。live 装配必须注入与执行层客户端共享的实例。
     """
 
     def __init__(
@@ -162,6 +125,7 @@ class BinancePublicClient:
         *,
         client: httpx.Client | None = None,
         sleep_fn: Any = time.sleep,
+        rate_limiter: RateLimitCoordinator | None = None,
     ) -> None:
         self.api = api
         self.data = data
@@ -169,14 +133,20 @@ class BinancePublicClient:
         self.stats = ClientStats()
         self._sleep = sleep_fn
 
-        self._spot_weight = _WeightTracker(
-            limit=data.rate_limit.spot_weight_per_min,
-            soft_limit_ratio=data.rate_limit.soft_limit_ratio,
-        )
-        self._futures_weight = _WeightTracker(
-            limit=data.rate_limit.futures_weight_per_min,
-            soft_limit_ratio=data.rate_limit.soft_limit_ratio,
-        )
+        if rate_limiter is not None:
+            self.coordinator = rate_limiter
+        else:
+            self.coordinator = RateLimitCoordinator(
+                {
+                    RateLimitScope.SPOT: data.rate_limit.spot_weight_per_min,
+                    RateLimitScope.FUTURES: data.rate_limit.futures_weight_per_min,
+                },
+                soft_limit_ratio=data.rate_limit.soft_limit_ratio,
+                critical_reserve_ratio=data.rate_limit.critical_reserve_ratio,
+                freeze_seconds=data.rate_limit.rate_limit_freeze_seconds,
+                ban_seconds=data.rate_limit.ip_ban_seconds,
+                sleep=sleep_fn,
+            )
 
         self._owns_client = client is None
         self._client = client or httpx.Client(
@@ -217,29 +187,21 @@ class BinancePublicClient:
         delay = min(cap, base * (2**attempt))
         return float(delay * (0.5 + random.random() * 0.5))  # 50%~100% 抖动
 
-    def _throttle_if_needed(self, weight: _WeightTracker) -> None:
-        if weight.should_throttle():
-            wait = weight.seconds_until_window_reset()
-            logger.warning(
-                "权重接近上限 (%d/%d)，休眠 %.1fs 等待窗口重置",
-                weight.used,
-                weight.limit,
-                wait,
-            )
-            self.stats.throttled_seconds += wait
-            if wait > 0:
-                self._sleep(wait)
-
     def _request(
         self,
         base_url: str,
         path: str,
         params: dict[str, Any] | None = None,
         *,
-        weight: _WeightTracker,
-        estimated_weight: int = 1,
+        scope: RateLimitScope,
+        priority: RequestPriority = RequestPriority.P3_CANDIDATE,
+        estimated_weight: int | None = None,
     ) -> Any:
-        """发起一次 GET 请求，含限流、重试、错误分类。
+        """发起一次 GET 请求，经共享限流协调器，含重试与错误分类。
+
+        每次网络请求恰好 acquire/observe/release 一次：
+        acquire 按 scope/priority/估算 weight 排队；响应头反馈给 coordinator；
+        429/418 分别冻结/封禁该 scope。
 
         Returns:
             解析后的 JSON。
@@ -252,86 +214,97 @@ class BinancePublicClient:
         """
         url = f"{base_url}{path}"
         params = params or {}
+        weight = (
+            estimated_weight
+            if estimated_weight is not None
+            else endpoint_weight(scope, path, params, on_unknown=self.coordinator.note_unknown_endpoint)
+        )
         max_retries = self.data.rate_limit.max_retries
 
         for attempt in range(max_retries + 1):
-            self._throttle_if_needed(weight)
-            weight.note_request(estimated_weight)
-            self.stats.requests += 1
+            before = self.coordinator.now()
+            with self.coordinator.acquire(scope, priority, weight):
+                self.stats.requests += 1
 
-            try:
-                response = self._client.get(url, params=params)
-            except httpx.TimeoutException as exc:
-                self.stats.errors += 1
-                if attempt >= max_retries:
-                    raise NetworkError(
-                        f"请求超时（已重试 {attempt} 次）: {redact_url(str(exc))}"
-                    ) from exc
-                self.stats.retries += 1
-                delay = self._backoff_seconds(attempt)
-                logger.warning("请求超时，%.1fs 后重试 (%d/%d)", delay, attempt + 1, max_retries)
-                self._sleep(delay)
-                continue
-            except httpx.HTTPError as exc:
-                self.stats.errors += 1
-                if attempt >= max_retries:
-                    raise NetworkError(
-                        f"网络错误（已重试 {attempt} 次）: {redact_url(str(exc))}"
-                    ) from exc
-                self.stats.retries += 1
-                delay = self._backoff_seconds(attempt)
-                logger.warning("网络错误，%.1fs 后重试 (%d/%d): %s", delay, attempt + 1, max_retries, exc)
-                self._sleep(delay)
-                continue
+                try:
+                    response = self._client.get(url, params=params)
+                except httpx.TimeoutException as exc:
+                    self.stats.errors += 1
+                    if attempt >= max_retries:
+                        raise NetworkError(
+                            f"请求超时（已重试 {attempt} 次）: {redact_url(str(exc))}"
+                        ) from exc
+                    self.stats.retries += 1
+                    delay = self._backoff_seconds(attempt)
+                    logger.warning("请求超时，%.1fs 后重试 (%d/%d)", delay, attempt + 1, max_retries)
+                    self._sleep(delay)
+                    continue
+                except httpx.HTTPError as exc:
+                    self.stats.errors += 1
+                    if attempt >= max_retries:
+                        raise NetworkError(
+                            f"网络错误（已重试 {attempt} 次）: {redact_url(str(exc))}"
+                        ) from exc
+                    self.stats.retries += 1
+                    delay = self._backoff_seconds(attempt)
+                    logger.warning("网络错误，%.1fs 后重试 (%d/%d): %s", delay, attempt + 1, max_retries, exc)
+                    self._sleep(delay)
+                    continue
 
-            # 从响应头更新真实已用权重（服务端视角，比本地记账准）
-            weight.observe(_parse_int_header(response.headers.get("x-mbx-used-weight-1m")))
-
-            status = response.status_code
-
-            if status == 200:
-                return json_or_raise(response.content, f"GET {path}")
-
-            if status == 418:
-                # 不重试。立即上报。
-                self.stats.errors += 1
-                raise IPBanError(
-                    f"IP 已被币安临时封禁 (HTTP 418) at {path}。"
-                    "必须立即停止所有请求并等待封禁解除。",
-                    status=status,
-                )
-
-            if status == 429:
-                self.stats.errors += 1
+                # 每次响应都把服务端视角的已用权重与熔断状态反馈给 coordinator
                 retry_after = _parse_float_header(response.headers.get("retry-after"))
-                if attempt >= max_retries:
-                    raise RateLimitError(
-                        f"限流重试耗尽 (HTTP 429) at {path}",
+                self.coordinator.observe(
+                    scope,
+                    _parse_int_header(response.headers.get("x-mbx-used-weight-1m")),
+                    response.status_code,
+                    retry_after,
+                )
+                self.stats.throttled_seconds += max(0.0, self.coordinator.now() - before)
+
+                status = response.status_code
+
+                if status == 200:
+                    return json_or_raise(response.content, f"GET {path}")
+
+                if status == 418:
+                    # 不重试。立即上报。
+                    self.stats.errors += 1
+                    raise IPBanError(
+                        f"IP 已被币安临时封禁 (HTTP 418) at {path}。"
+                        "必须立即停止所有请求并等待封禁解除。",
                         status=status,
                     )
-                self.stats.retries += 1
-                delay = self._backoff_seconds(attempt, retry_after)
-                logger.warning("被限流 (429)，%.1fs 后重试 (%d/%d)", delay, attempt + 1, max_retries)
-                self.stats.throttled_seconds += delay
-                self._sleep(delay)
-                continue
 
-            if status in _RETRYABLE_STATUS:
+                if status == 429:
+                    self.stats.errors += 1
+                    if attempt >= max_retries:
+                        raise RateLimitError(
+                            f"限流重试耗尽 (HTTP 429) at {path}",
+                            status=status,
+                        )
+                    self.stats.retries += 1
+                    delay = self._backoff_seconds(attempt, retry_after)
+                    logger.warning("被限流 (429)，%.1fs 后重试 (%d/%d)", delay, attempt + 1, max_retries)
+                    self.stats.throttled_seconds += delay
+                    self._sleep(delay)
+                    continue
+
+                if status in _RETRYABLE_STATUS:
+                    self.stats.errors += 1
+                    if attempt >= max_retries:
+                        raise BinanceError(
+                            f"服务端错误重试耗尽 (HTTP {status}) at {path}",
+                            status=status,
+                        )
+                    self.stats.retries += 1
+                    delay = self._backoff_seconds(attempt)
+                    logger.warning("服务端 %d，%.1fs 后重试 (%d/%d)", status, delay, attempt + 1, max_retries)
+                    self._sleep(delay)
+                    continue
+
+                # 4xx（除 429/418）：不可重试。解析币安错误码以给出可读信息。
                 self.stats.errors += 1
-                if attempt >= max_retries:
-                    raise BinanceError(
-                        f"服务端错误重试耗尽 (HTTP {status}) at {path}",
-                        status=status,
-                    )
-                self.stats.retries += 1
-                delay = self._backoff_seconds(attempt)
-                logger.warning("服务端 %d，%.1fs 后重试 (%d/%d)", status, delay, attempt + 1, max_retries)
-                self._sleep(delay)
-                continue
-
-            # 4xx（除 429/418）：不可重试。解析币安错误码以给出可读信息。
-            self.stats.errors += 1
-            raise self._build_client_error(response, path)
+                raise self._build_client_error(response, path)
 
         # 理论上不可达（循环内每条路径要么 return 要么 raise）
         raise BinanceError(f"请求失败且未产生明确结果: {path}")
@@ -386,7 +359,7 @@ class BinancePublicClient:
 
         本地时钟偏差过大会导致签名请求被拒（真实交易时的经典故障）。
         """
-        payload = self._request(self.api.spot_base, SPOT_TIME, weight=self._spot_weight, estimated_weight=1)
+        payload = self._request(self.api.spot_base, SPOT_TIME, scope=RateLimitScope.SPOT)
         return int(payload["serverTime"])
 
     def spot_exchange_info(self, symbol: str | None = None) -> dict[str, Any]:
@@ -401,8 +374,7 @@ class BinancePublicClient:
                 self.api.spot_base,
                 SPOT_EXCHANGE_INFO,
                 params,
-                weight=self._spot_weight,
-                estimated_weight=20 if symbol is None else 2,
+                scope=RateLimitScope.SPOT,
             ),
         )
 
@@ -419,7 +391,7 @@ class BinancePublicClient:
         return self._klines(
             self.api.spot_base,
             SPOT_KLINES,
-            self._spot_weight,
+            RateLimitScope.SPOT,
             "spot_klines",
             symbol,
             interval,
@@ -434,8 +406,7 @@ class BinancePublicClient:
             self.api.spot_base,
             "/api/v3/ticker/price",
             {"symbol": symbol},
-            weight=self._spot_weight,
-            estimated_weight=2,
+            scope=RateLimitScope.SPOT,
         )
         return Decimal(str(payload["price"]))
 
@@ -448,8 +419,7 @@ class BinancePublicClient:
             lambda: self._request(
                 self.api.spot_base,
                 SPOT_TICKER_24H,
-                weight=self._spot_weight,
-                estimated_weight=80,
+                scope=RateLimitScope.SPOT,
             ),
         )
 
@@ -458,7 +428,7 @@ class BinancePublicClient:
     # ======================================================================
 
     def futures_time(self) -> int:
-        payload = self._request(self.api.futures_base, FAPI_TIME, weight=self._futures_weight)
+        payload = self._request(self.api.futures_base, FAPI_TIME, scope=RateLimitScope.FUTURES)
         return int(payload["serverTime"])
 
     def futures_exchange_info(self) -> dict[str, Any]:
@@ -468,7 +438,7 @@ class BinancePublicClient:
             make_key("futures_exchange_info"),
             self.data.cache_ttl.exchange_info,
             lambda: self._request(
-                self.api.futures_base, FAPI_EXCHANGE_INFO, weight=self._futures_weight
+                self.api.futures_base, FAPI_EXCHANGE_INFO, scope=RateLimitScope.FUTURES
             ),
         )
 
@@ -487,7 +457,7 @@ class BinancePublicClient:
             "funding_info",
             make_key("funding_info"),
             self.data.cache_ttl.funding_info,
-            lambda: self._request(self.api.futures_base, FAPI_FUNDING_INFO, weight=self._futures_weight),
+            lambda: self._request(self.api.futures_base, FAPI_FUNDING_INFO, scope=RateLimitScope.FUTURES),
         )
 
     def premium_index(self, symbol: str | None = None) -> Any:
@@ -502,8 +472,7 @@ class BinancePublicClient:
                 self.api.futures_base,
                 FAPI_PREMIUM_INDEX,
                 params,
-                weight=self._futures_weight,
-                estimated_weight=1 if symbol else 10,
+                scope=RateLimitScope.FUTURES,
             ),
         )
 
@@ -550,7 +519,7 @@ class BinancePublicClient:
                     self.api.futures_base,
                     FAPI_FUNDING_RATE,
                     params,
-                    weight=self._futures_weight,
+                    scope=RateLimitScope.FUTURES,
                 )
                 if not page:
                     break
@@ -605,7 +574,7 @@ class BinancePublicClient:
         return self._klines(
             self.api.futures_base,
             FAPI_KLINES,
-            self._futures_weight,
+            RateLimitScope.FUTURES,
             "futures_klines",
             symbol,
             interval,
@@ -622,8 +591,7 @@ class BinancePublicClient:
             lambda: self._request(
                 self.api.futures_base,
                 FAPI_TICKER_24H,
-                weight=self._futures_weight,
-                estimated_weight=40,
+                scope=RateLimitScope.FUTURES,
             ),
         )
 
@@ -633,7 +601,7 @@ class BinancePublicClient:
             self.api.futures_base,
             FAPI_OPEN_INTEREST,
             {"symbol": symbol},
-            weight=self._futures_weight,
+            scope=RateLimitScope.FUTURES,
         )
 
     # ======================================================================
@@ -644,7 +612,7 @@ class BinancePublicClient:
         self,
         base_url: str,
         path: str,
-        weight_tracker: _WeightTracker,
+        scope: RateLimitScope,
         namespace: str,
         symbol: str,
         interval: str,
@@ -671,7 +639,7 @@ class BinancePublicClient:
                 if end_ms is not None:
                     params["endTime"] = end_ms
 
-                page = self._request(base_url, path, params, weight=weight_tracker)
+                page = self._request(base_url, path, params, scope=scope)
                 if not page:
                     break
                 if not isinstance(page, list):

@@ -45,6 +45,10 @@ from cointrader.errors import (
     ParseError,
     RateLimitError,
 )
+from cointrader.rate_limit import (
+    RateLimitCoordinator,
+    RateLimitScope,
+)
 from conftest import make_funding_series
 
 
@@ -228,6 +232,21 @@ def make_client(
     )
 
 
+class _FakeClock:
+    """假单调时钟：sleep 记录并推进时间轴，避免测试真实等待。"""
+
+    def __init__(self) -> None:
+        self.value = 1000.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.value += seconds
+
+
 class TestClientErrorHandling:
     """客户端错误分类与重试。"""
 
@@ -255,9 +274,13 @@ class TestClientErrorHandling:
         client.close()
 
     def test_429_retries_with_backoff(self, tmp_cache_dir: Path) -> None:
-        """HTTP 429 应重试，并尊重 Retry-After 头。"""
+        """HTTP 429 应重试，并尊重 Retry-After 头；coordinator 冻结由假时钟推进。"""
         attempts = {"count": 0}
-        sleep_calls: list[float] = []
+        fake = _FakeClock()
+        coordinator = RateLimitCoordinator(
+            {RateLimitScope.SPOT: 6000, RateLimitScope.FUTURES: 2400},
+            clock=fake, sleep=fake.sleep,
+        )
 
         def handler(request: httpx.Request) -> httpx.Response:
             attempts["count"] += 1
@@ -273,21 +296,30 @@ class TestClientErrorHandling:
             ApiConfig(),
             data_config,
             client=httpx.Client(transport=httpx.MockTransport(handler)),
-            sleep_fn=sleep_calls.append,
+            sleep_fn=fake.sleep,
+            rate_limiter=coordinator,
         )
 
         result = client.futures_time()
 
         assert result == 1789560670000
         assert attempts["count"] == 3
-        # Retry-After: 7 应被尊重
-        assert all(call == 7.0 for call in sleep_calls[:2]), f"未尊重 Retry-After: {sleep_calls}"
+        # 前两次 429 后应分别尊重 Retry-After: 7（客户端退避），随后 coordinator 冻结等待
+        retry_after_sleeps = [s for s in fake.sleeps if s == 7.0]
+        assert len(retry_after_sleeps) == 2, f"应尊重两次 Retry-After: {fake.sleeps}"
+        freeze_waits = [s for s in fake.sleeps if s >= 60.0]
+        assert freeze_waits, f"冻结期应等待而非立即重试: {fake.sleeps}"
         client.close()
 
     def test_429_exhausts_retries_and_raises(self, tmp_cache_dir: Path) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(429, json={"code": -1003})
 
+        fake = _FakeClock()
+        coordinator = RateLimitCoordinator(
+            {RateLimitScope.SPOT: 6000, RateLimitScope.FUTURES: 2400},
+            clock=fake, sleep=fake.sleep,
+        )
         data_config = DataConfig(
             cache_dir=tmp_cache_dir,
             rate_limit=RateLimitConfig(max_retries=2, base_backoff_seconds=0.001),
@@ -296,11 +328,13 @@ class TestClientErrorHandling:
             ApiConfig(),
             data_config,
             client=httpx.Client(transport=httpx.MockTransport(handler)),
-            sleep_fn=lambda _: None,
+            sleep_fn=fake.sleep,
+            rate_limiter=coordinator,
         )
 
         with pytest.raises(RateLimitError):
             client.futures_time()
+        assert fake.sleeps, "冻结等待应经可注入 sleep 完成"
         client.close()
 
     def test_5xx_retries_then_succeeds(self, tmp_cache_dir: Path) -> None:
@@ -392,16 +426,16 @@ class TestRateLimiting:
         )
 
         client.futures_time()
-        assert client._futures_weight.used == 1200, "未读取权重响应头"
+        assert (
+            client.coordinator.snapshot()[RateLimitScope.FUTURES].observed_used == 1200
+        ), "未读取权重响应头"
         client.close()
 
     def test_throttles_when_approaching_limit(self, tmp_cache_dir: Path) -> None:
-        """权重接近上限时应主动休眠。
+        """权重超过 P3 候选预算时应等待窗口滚动。
 
-        不主动节流会一路撞到 429，然后被 418 封 IP。
+        不主动降速会一路撞到 429，然后被 418 封 IP。
         """
-        sleep_calls: list[float] = []
-
         def handler(request: httpx.Request) -> httpx.Response:
             # 每次都返回一个很高的已用权重（超过 80% 的 2400）
             return httpx.Response(
@@ -410,6 +444,11 @@ class TestRateLimiting:
                 json={"serverTime": 1},
             )
 
+        fake = _FakeClock()
+        coordinator = RateLimitCoordinator(
+            {RateLimitScope.SPOT: 6000, RateLimitScope.FUTURES: 2400},
+            clock=fake, sleep=fake.sleep,
+        )
         data_config = DataConfig(
             cache_dir=tmp_cache_dir,
             rate_limit=RateLimitConfig(futures_weight_per_min=2400, soft_limit_ratio=0.80),
@@ -418,13 +457,14 @@ class TestRateLimiting:
             ApiConfig(),
             data_config,
             client=httpx.Client(transport=httpx.MockTransport(handler)),
-            sleep_fn=sleep_calls.append,
+            sleep_fn=fake.sleep,
+            rate_limiter=coordinator,
         )
 
-        client.futures_time()
-        client.futures_time()
+        client.futures_time()  # 首次：观测 2100 > P3 低限 1200
+        client.futures_time()  # 第二次：被共享预算挡住，等待窗口滚动（假时钟）
 
-        assert sleep_calls, "权重达到软上限时应主动休眠"
+        assert fake.sleeps, "权重超过候选预算时应等待窗口滚动"
         assert client.stats.throttled_seconds > 0
         client.close()
 
