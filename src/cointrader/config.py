@@ -335,8 +335,14 @@ class ExecutionConfig:
     webui_enabled: bool = True
     webui_host: str = "0.0.0.0"  # noqa: S104 —— 需局域网/tailscale 访问，见 config.yaml 注释
     webui_port: int = 8888
-    # 实时策略候选池（§7.1：初期固定高流动性 USDT symbol，完成单 pair 闭环后再开放）
-    live_symbols: tuple[str, ...] = ("BTCUSDT",)
+    # 实时策略候选池（§7.1）：
+    #   空 = 动态候选池（回测同口径：可交易 USDT 永续 → 成交额过滤 → top N）
+    #   非空 = 固定候选列表（单 pair 闭环 / 手工选币模式）
+    live_symbols: tuple[str, ...] = ()
+    # 动态候选池最大 symbol 数（0 = 不限；越大 Binance API 权重开销越大）
+    candidate_pool_max_symbols: int = 100
+    # 动态候选池刷新周期（秒）；池内指标仍按 candidate_refresh_seconds 刷新
+    universe_refresh_seconds: float = 1800.0
     # 候选指标低频刷新周期（秒）；主循环不用全市场扫描
     candidate_refresh_seconds: float = 300.0
     # 候选指标缓存允许的最大年龄（秒）；超过则拒绝开仓
@@ -377,11 +383,15 @@ class ExecutionConfig:
             ("snapshot_interval_seconds", self.snapshot_interval_seconds),
             ("time_resync_seconds", self.time_resync_seconds),
             ("watchdog_timeout_seconds", self.watchdog_timeout_seconds),
+            ("universe_refresh_seconds", self.universe_refresh_seconds),
         ):
             if value <= 0:
                 raise ConfigError(f"execution.{name} 必须为正，当前 {value}")
-        if not self.live_symbols:
-            raise ConfigError("execution.live_symbols 不能为空（候选池至少一个 symbol）")
+        if self.candidate_pool_max_symbols < 0:
+            raise ConfigError(
+                f"execution.candidate_pool_max_symbols 必须 >= 0，"
+                f"当前 {self.candidate_pool_max_symbols}"
+            )
         for symbol in self.live_symbols:
             if not symbol.upper().endswith("USDT"):
                 raise ConfigError(f"live_symbols 只允许 USDT 永续对，当前: {symbol}")
@@ -522,7 +532,9 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         margin_type=str(sec.get("margin_type", "isolated")),
         one_way_position_mode=bool(sec.get("one_way_position_mode", True)),
         server_time_offset_limit_ms=int(sec.get("server_time_offset_limit_ms", 3000)),
-        live_symbols=tuple(str(s).upper() for s in sec.get("live_symbols", ["BTCUSDT"])),
+        live_symbols=tuple(str(s).upper() for s in sec.get("live_symbols", [])),
+        candidate_pool_max_symbols=int(sec.get("candidate_pool_max_symbols", 100)),
+        universe_refresh_seconds=float(sec.get("universe_refresh_seconds", 1800.0)),
         candidate_refresh_seconds=float(sec.get("candidate_refresh_seconds", 300.0)),
         max_candidate_data_age_seconds=float(sec.get("max_candidate_data_age_seconds", 1800.0)),
         snapshot_interval_seconds=int(sec.get("snapshot_interval_seconds", 30)),

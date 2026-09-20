@@ -10,6 +10,9 @@
 - ``EXIT``   策略退出（负资金费 / 最长持仓）
 - ``REPLACE`` 换仓（新候选相对优势超过 premium）
 - ``SKIP``   拒绝开仓（``allowed=False``，必须带 reason_code）
+- ``PENDING_QUOTE`` 临时中间态：前置门槛全部通过但本轮上下文无新鲜报价。
+  仅动态候选池模式使用；LiveService 按需获取报价后经
+  ``LiveStrategy.complete_open`` 产出最终决策，本中间态不落账本。
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ class DecisionKind:
     EXIT = "EXIT"
     REPLACE = "REPLACE"
     SKIP = "SKIP"
+    PENDING_QUOTE = "PENDING_QUOTE"
 
 
 class ReasonCode:
@@ -60,6 +64,8 @@ class ReasonCode:
     INVALID_SYMBOL = "INVALID_SYMBOL"
     NOTIONAL_TOO_SMALL = "NOTIONAL_TOO_SMALL"
     ALREADY_SUBMITTED = "ALREADY_SUBMITTED"
+    # 中间态：前置门槛通过，等待 service 获取新鲜报价后由 complete_open 定案
+    PENDING_QUOTE = "PENDING_QUOTE"
     # 退出
     NEGATIVE_EXIT_AVG = "NEGATIVE_EXIT_AVG"
     MAX_HOLDING = "MAX_HOLDING"

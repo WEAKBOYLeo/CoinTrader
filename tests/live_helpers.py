@@ -39,6 +39,7 @@ def make_live_config(
     entry_overrides: dict[str, Any] | None = None,
     exit_overrides: dict[str, Any] | None = None,
     selection_overrides: dict[str, Any] | None = None,
+    exec_overrides: dict[str, Any] | None = None,
 ) -> Config:
     """默认 8h 周期下的紧凑阈值：回看 4 期、连续 3 期、年化 0.30（≈0.000274/期）。"""
     entry: dict[str, Any] = dict(min_annualized_rate=0.30, min_consecutive_positive=3,
@@ -61,7 +62,7 @@ def make_live_config(
         risk=RiskConfig(),
         api=ApiConfig(),
         logging=LoggingConfig(),
-        execution=ExecutionConfig(live_symbols=tuple(live_symbols)),
+        execution=ExecutionConfig(live_symbols=tuple(live_symbols), **(exec_overrides or {})),
     )
 
 

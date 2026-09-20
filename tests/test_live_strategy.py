@@ -168,8 +168,29 @@ class TestEntryPreconditions:
 
 
 class TestQuoteFreshness:
-    def test_no_quote_skips(self, tmp_path):
+    def test_no_quote_pending(self, tmp_path):
+        """前置通过但无报价 → PENDING_QUOTE 中间态（service 按需拉报价后定案）。"""
         decision = _open_decision(tmp_path, _data(), quotes={})
+        assert decision.decision_kind is DecisionKind.PENDING_QUOTE
+        assert decision.reason_code is ReasonCode.PENDING_QUOTE
+        assert not decision.allowed
+
+    def test_complete_open_after_pending(self, tmp_path):
+        strat, _ = make_strategy(tmp_path, _data())
+        strat.refresh_candidates()
+        ctx = make_context()  # 无报价
+        pending = strat.can_open(SYMBOL, ctx)
+        assert pending.decision_kind is DecisionKind.PENDING_QUOTE
+        decision = strat.complete_open(SYMBOL, ctx, make_quote())
+        assert decision.decision_kind is DecisionKind.OPEN
+        assert decision.reason_code is ReasonCode.ENTRY_OK
+
+    def test_complete_open_quote_failed(self, tmp_path):
+        strat, _ = make_strategy(tmp_path, _data())
+        strat.refresh_candidates()
+        ctx = make_context()
+        decision = strat.complete_open(SYMBOL, ctx, None)
+        assert decision.decision_kind is DecisionKind.SKIP
         assert decision.reason_code is ReasonCode.STALE_QUOTE
 
     def test_stale_quote_skips(self, tmp_path):

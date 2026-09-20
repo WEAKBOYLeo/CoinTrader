@@ -37,7 +37,7 @@ from ..execution.store import LeaseConflict, StateStore, StoreError
 from ..execution.user_stream import PollingUserStream, UserStream
 from ..reporting.pnl import PnlAggregator
 from .account_state import AccountStateBuilder, AccountStateError, AccountStateResult
-from .decisions import DecisionKind
+from .decisions import DecisionKind, StrategyDecision
 from .portfolio import Signal
 from .strategy import (
     HeldPosition,
@@ -169,6 +169,7 @@ class LiveService:
         self._held: dict[str, HeldPosition] = {}
         self._last_candidate_refresh_ms = 0
         self._last_snapshot_ms = 0
+        self._leverage_checked: set[str] = set()
         self._reconcile_ok = False
         self._last_resync_ms = 0
         self._on_alert = on_alert or (lambda kind, msg: logger.critical("【告警】%s: %s", kind, msg))
@@ -312,6 +313,9 @@ class LiveService:
     def _refresh_account_state(self, source: str) -> None:
         if self.account_builder is None:
             return
+        if self.strategy is not None and self.strategy.dynamic_pool:
+            # 动态候选池：风险快照的持仓范围跟随当前池（builder 构造时池可能为空）
+            self.account_builder.candidate_symbols = tuple(self.strategy.candidate_symbols)
         result = self.account_builder.snapshot(
             spot=self.spot, futures=self.futures, source=source, run_id=self.run_id
         )
@@ -343,7 +347,12 @@ class LiveService:
             self.store.record_risk_decision("HELD_STATE", False, f"现货余额查询失败: {exc}")
             return
         current: dict[str, HeldPosition] = {}
-        for symbol in self.config.execution.live_symbols:
+        symbols = set(self.config.execution.live_symbols)
+        if self.strategy is not None and self.strategy.dynamic_pool:
+            # 动态候选池：池内 + 已跟踪持仓（池轮换时不丢跟踪）
+            symbols.update(self.strategy.candidate_symbols)
+            symbols.update(self._held)
+        for symbol in sorted(symbols):
             base = symbol.replace("USDT", "")
             spot_qty = spot_balances.get(base, Decimal("0"))
             try:
@@ -364,8 +373,13 @@ class LiveService:
             self._held = current
 
     def _fetch_quotes(self) -> dict[str, Quote]:
+        """本轮批量报价：持仓恒拉；固定候选池全拉；动态候选池只拉持仓
+        （池内通过前置检查的 symbol 在 PENDING_QUOTE 解析时按需获取）。"""
+        symbols: set[str] = set(self._held)
+        if self.strategy is not None and not self.strategy.dynamic_pool:
+            symbols.update(self.strategy.candidate_symbols)
         quotes: dict[str, Quote] = {}
-        for symbol in self.strategy.candidate_symbols if self.strategy else ():
+        for symbol in symbols:
             quote = self._quote_fetcher(symbol)
             if quote is not None:
                 quotes[symbol] = quote
@@ -518,13 +532,26 @@ class LiveService:
             spot_rules = self.spot.load_rules()
             perp_rules = self.futures.load_rules()
             common = sorted(set(spot_rules) & set(perp_rules))
-            report.symbols = tuple(common)
             if not common:
                 raise LiveGateBlocked("Spot 与 Futures 无共同可交易 symbol，拒绝启动")
             want_lev = self.config.execution.leverage
             want_margin = self.config.execution.margin_type
+            # 动态候选池：先构建初始池，剔除无规则 symbol；杠杆/保证金推迟到开仓时
+            # 按需验证（池可能上百个，启动时逐个读/写不现实）。
+            dynamic_pool = self.strategy is not None and self.strategy.dynamic_pool
+            if dynamic_pool and self.strategy is not None:
+                self.strategy.refresh_universe()
+                pruned = self.strategy.prune_universe(set(common))
+                report.symbols = tuple(self.strategy.candidate_symbols)
+                logger.info(
+                    "【动态候选池】启动初始池 %d 个 symbol（剔除无规则 %d 个）；"
+                    "杠杆/保证金开仓时按需验证",
+                    len(report.symbols), pruned,
+                )
+            else:
+                report.symbols = tuple(common)
             symbol_detail: dict[str, Any] = {}
-            for symbol in self.config.execution.live_symbols:
+            for symbol in report.symbols:
                 if symbol not in spot_rules:
                     raise LiveGateBlocked(f"启动预检失败：{symbol} 缺少 Spot 规则")
                 if symbol not in perp_rules:
@@ -544,17 +571,24 @@ class LiveService:
                             f"启动预检失败：{symbol} {label} 最小名义额 {min_notional} "
                             f"高于 canary_notional {canary}，无法合法开仓"
                         )
-                lev, margin, read_available = self._check_leverage_margin(symbol, want_lev, want_margin)
-                info["leverage"] = lev
-                info["margin_type"] = margin
-                info["leverage_read_available"] = read_available
-                report.leverage = lev
-                report.margin_type = margin
-                if (lev, margin) != (want_lev, want_margin):
-                    raise LiveGateBlocked(
-                        f"杠杆/保证金模式不符：{symbol} 当前 ({lev}, {margin})，"
-                        f"期望 ({want_lev}, {want_margin})。启动预检失败（§3.2），拒绝启动。"
-                    )
+                if dynamic_pool:
+                    # 动态池：开仓前 _check_leverage_margin 逐个验证（首次开仓该 symbol 时）
+                    info["leverage"] = want_lev
+                    info["margin_type"] = want_margin
+                    info["leverage_read_available"] = False
+                    info["leverage_checked_at"] = "on_open"
+                else:
+                    lev, margin, read_available = self._check_leverage_margin(symbol, want_lev, want_margin)
+                    info["leverage"] = lev
+                    info["margin_type"] = margin
+                    info["leverage_read_available"] = read_available
+                    report.leverage = lev
+                    report.margin_type = margin
+                    if (lev, margin) != (want_lev, want_margin):
+                        raise LiveGateBlocked(
+                            f"杠杆/保证金模式不符：{symbol} 当前 ({lev}, {margin})，"
+                            f"期望 ({want_lev}, {want_margin})。启动预检失败（§3.2），拒绝启动。"
+                        )
                 symbol_detail[symbol] = info
             report.extra["symbols"] = symbol_detail
 
@@ -763,8 +797,17 @@ class LiveService:
         ctx = self._build_context(now_ms)
         try:
             decisions = self.strategy.evaluate(ctx)
+            # 动态候选池：PENDING_QUOTE 中间态 → 按需获取新鲜报价后定案；
+            # 中间态本身不落账本，只记录最终决策（每 symbol 每轮仍恰好一条）。
+            resolved: list[StrategyDecision] = []
             for decision in decisions:
+                if decision.decision_kind is DecisionKind.PENDING_QUOTE:
+                    quote = self._quote_fetcher(decision.symbol)
+                    decision = self.strategy.complete_open(decision.symbol, ctx, quote)
+                resolved.append(decision)
+            for decision in resolved:
                 self.store.record_signal_decision(decision)
+            decisions = resolved
         except StoreError as exc:
             self.enter_recovery(f"signal_decision 写账本失败: {exc}")
             return {"state": "RECOVERY", "reason": self._recovery_reason}
@@ -821,6 +864,18 @@ class LiveService:
             if quote is None:
                 skipped.append(f"{symbol}: 提交前报价获取失败")
                 continue
+            # 杠杆/保证金：固定池启动预检已验证；动态池 symbol 首次开仓时验证一次
+            if symbol not in self._leverage_checked:
+                lev, margin, _read = self._check_leverage_margin(
+                    symbol, self.config.execution.leverage, self.config.execution.margin_type
+                )
+                if (lev, margin) != (self.config.execution.leverage, self.config.execution.margin_type):
+                    skipped.append(f"{symbol}: 杠杆/保证金 ({lev}, {margin}) 与配置不符，放弃开仓")
+                    self._on_alert(
+                        "OPEN_FAILED", f"{symbol} 杠杆/保证金模式不符: ({lev}, {margin})"
+                    )
+                    continue
+                self._leverage_checked.add(symbol)
             self._submitted_this_run.add(symbol)
             state = self._risk_state_fn()
             pair = self.executor.open_pair(

@@ -63,6 +63,12 @@ class StrategyDataProvider(Protocol):
     def quote_volume_3d_avg(self, symbol: str) -> Decimal:
         """最近 3 天平均日成交额（USDT）。"""
 
+    def tradable_universe(self) -> tuple[str, ...]:
+        """全部可交易 USDT 永续 symbol（已排除 exclude_bases）。仅动态候选池模式使用。"""
+
+    def quote_volume_24h(self) -> dict[str, float]:
+        """全市场各 symbol 的 24h 成交额（USDT）。仅动态候选池模式使用。"""
+
 
 @dataclass(slots=True)
 class CandidateCache:
@@ -145,16 +151,69 @@ class LiveStrategy:
         self.config_hash = config_hash
         self._now = now_fn
         self.candidates: dict[str, CandidateCache] = {}
+        self._universe: list[str] = []
+        self._universe_ts_ms = 0
 
     # -- 低频刷新 -------------------------------------------------------------
 
     @property
+    def dynamic_pool(self) -> bool:
+        """``live_symbols`` 为空 = 动态候选池（回测同口径：可交易永续 + 成交额过滤 + top N）。"""
+        return not self.config.execution.live_symbols
+
+    @property
     def candidate_symbols(self) -> tuple[str, ...]:
-        """候选池 = 配置的 live_symbols（初期固定高流动性 symbol，§7.1 第 7 条）。"""
+        """当前候选池。固定模式 = 配置的 ``live_symbols``；动态模式 = 最近一次
+        ``refresh_universe()`` 的结果（首刷前为空，无开仓评估）。"""
+        if self.dynamic_pool:
+            return tuple(self._universe)
         return tuple(self.config.execution.live_symbols)
 
+    def refresh_universe(self) -> None:
+        """刷新候选池（动态模式）：可交易永续 → 24h 成交额门槛 → 按量 top N。
+
+        固定模式只重置池时间戳（零请求）。动态模式刷新失败保留旧池；
+        池内 symbol 指标缓存的时效由 ``max_candidate_data_age_seconds`` 把关。
+        """
+        if not self.dynamic_pool:
+            self._universe = list(self.config.execution.live_symbols)
+            self._universe_ts_ms = int(self._now() * 1000)
+            return
+        now_ms = int(self._now() * 1000)
+        interval_ms = int(self.config.execution.universe_refresh_seconds * 1000)
+        if self._universe and now_ms - self._universe_ts_ms < interval_ms:
+            return
+        try:
+            symbols = tuple(self.data.tradable_universe())
+            volumes = {str(k): float(v) for k, v in self.data.quote_volume_24h().items()}
+        except Exception as exc:  # noqa: BLE001 —— 保留旧池（可能为空），不中断主循环
+            logger.warning("动态候选池刷新失败（保留旧池 %d 个）: %s", len(self._universe), exc)
+            return
+        min_volume = Decimal(str(self.config.strategy.selection.min_quote_volume_3d_avg))
+        pool = [s for s in symbols if Decimal(str(volumes.get(s, 0.0))) >= min_volume]
+        pool.sort(key=lambda s: volumes.get(s, 0.0), reverse=True)
+        max_n = int(self.config.execution.candidate_pool_max_symbols)
+        if max_n > 0:
+            pool = pool[:max_n]
+        self._universe = pool
+        self._universe_ts_ms = now_ms
+        logger.info(
+            "动态候选池刷新: %d 个 symbol（universe=%d，24h 成交额>= %.0f，top %s）",
+            len(pool), len(symbols), float(min_volume), max_n if max_n > 0 else "不限",
+        )
+
+    def prune_universe(self, allowed: set[str]) -> int:
+        """从池中剔除不在 ``allowed`` 内的 symbol（如启动预检发现无 Spot/Futures 规则）。"""
+        before = len(self._universe)
+        self._universe = [s for s in self._universe if s in allowed]
+        pruned = before - len(self._universe)
+        if pruned:
+            logger.info("候选池剔除 %d 个无规则 symbol: %s", pruned, sorted(allowed))
+        return pruned
+
     def refresh_candidates(self) -> None:
-        """刷新候选指标缓存。失败保留旧缓存并标记 error/数据年龄。"""
+        """刷新候选池（动态模式低频）与候选指标缓存。失败保留旧缓存并标记 error/数据年龄。"""
+        self.refresh_universe()
         entry = self.config.strategy.entry
         exit_cfg = self.config.strategy.exit
         # 需要覆盖：入场窗口 + 连续正计数 + 退出窗口
@@ -273,14 +332,11 @@ class LiveStrategy:
 
     # -- 开仓（§7.2 判断顺序，尽早拒绝并记录原因） -----------------------------
 
-    def can_open(self, symbol: str, ctx: LiveContext) -> StrategyDecision:
-        """统一开仓判断入口（§7.3）。返回 SKIP/OPEN 决策，本身不下单。"""
-        entry = self.config.strategy.entry
-        selection = self.config.strategy.selection
-        base = symbol.replace("USDT", "")
-        cache = self.candidates.get(symbol)
+    def _make_skip(self, symbol: str, ctx: LiveContext) -> Callable[..., StrategyDecision]:
+        """构造拒绝/中间态决策的闭包（§7.2 判断顺序各处复用同一形状）。"""
 
-        def skip(code: str, text: str, **metrics: object) -> StrategyDecision:
+        def skip(code: str, text: str, kind: str = DecisionKind.SKIP,
+                 **metrics: object) -> StrategyDecision:
             # 已知审计字段提升到顶层列（DB 可直接查询），其余进 metrics
             lift_keys = (
                 "funding_interval_hours", "trailing_annualized", "exit_average_annualized",
@@ -293,7 +349,7 @@ class LiveStrategy:
                 symbol=symbol,
                 run_id=ctx.run_id,
                 ts_ms=ctx.now_ms,
-                decision_kind=DecisionKind.SKIP,
+                decision_kind=kind,
                 allowed=False,
                 reason_code=code,
                 reason_text=text,
@@ -302,6 +358,21 @@ class LiveStrategy:
                 metrics=dict(metrics),
                 **lifted,  # type: ignore[arg-type]
             )
+
+        return skip
+
+    def can_open(self, symbol: str, ctx: LiveContext) -> StrategyDecision:
+        """统一开仓判断入口（§7.3）。返回 SKIP/OPEN/PENDING_QUOTE 决策，本身不下单。
+
+        前置门槛（步骤 1-12）通过后若本轮上下文无该 symbol 新鲜报价，返回
+        ``PENDING_QUOTE`` 中间态：LiveService 按需获取报价后调 ``complete_open``
+        产出最终决策（动态候选池池子大，每轮只为通过前置检查的少数候选拉报价）。
+        """
+        skip = self._make_skip(symbol, ctx)
+        entry = self.config.strategy.entry
+        selection = self.config.strategy.selection
+        base = symbol.replace("USDT", "")
+        cache = self.candidates.get(symbol)
 
         # 前置状态（service 也已把关，这里记录原因保证决策链完整）
         if not ctx.reconcile_ok:
@@ -377,10 +448,36 @@ class LiveStrategy:
                 f"当前持仓 {len(ctx.held)} 已达上限 {selection.max_positions}",
             )
 
-        # 13. 新鲜报价
+        # 13. 新鲜报价（动态候选池：上下文未含该 symbol 报价 → PENDING 中间态）
         quote = ctx.quotes.get(symbol)
         if quote is None:
-            return skip(ReasonCode.STALE_QUOTE, "无新鲜报价（本轮未获取到）")
+            return skip(
+                ReasonCode.PENDING_QUOTE,
+                "前置门槛通过，等待新鲜报价（service 按需获取）",
+                kind=DecisionKind.PENDING_QUOTE,
+            )
+        return self._open_with_quote(symbol, ctx, quote, skip)
+
+    def complete_open(
+        self, symbol: str, ctx: LiveContext, quote: Quote | None
+    ) -> StrategyDecision:
+        """第二阶段：LiveService 获取报价后定案（步骤 13-15）。获取失败 = STALE_QUOTE。"""
+        skip = self._make_skip(symbol, ctx)
+        if quote is None:
+            return skip(ReasonCode.STALE_QUOTE, "无新鲜报价（本轮获取失败）")
+        return self._open_with_quote(symbol, ctx, quote, skip)
+
+    def _open_with_quote(
+        self, symbol: str, ctx: LiveContext, quote: Quote,
+        skip: Callable[..., StrategyDecision],
+    ) -> StrategyDecision:
+        """开仓第二阶段（§7.2 步骤 13-15）：报价新鲜度 → 名义额/基差 → build_signal。"""
+        selection = self.config.strategy.selection
+        cache = self.candidates.get(symbol)
+        if cache is None:
+            return skip(ReasonCode.INSUFFICIENT_HISTORY, "候选指标缓存缺失（前置检查后异常）")
+        trailing, streak = self._entry_metrics(cache)
+        min_trailing = Decimal(str(self.config.strategy.entry.min_trailing_annualized))
         max_quote_age_ms = int(self.config.execution.max_market_data_age_seconds * 1000)
         age = ctx.now_ms - quote.ts_ms
         if age < 0 or age > max_quote_age_ms:
@@ -572,6 +669,30 @@ class PublicDataStrategyProvider:
         self.client: BinancePublicClient = client  # type: ignore[assignment]
         self._intervals: FundingIntervals | None = None
         self._intervals_fn = fetch_funding_intervals
+
+    def tradable_universe(self) -> tuple[str, ...]:
+        """全部可交易 USDT 永续（排除 exclude_bases；与回测 scanner 同口径）。"""
+        from ..data.klines import tradable_perpetuals
+
+        info = self.client.futures_exchange_info()
+        return tuple(
+            tradable_perpetuals(
+                info, exclude_bases=self.config.strategy.selection.exclude_bases
+            )
+        )
+
+    def quote_volume_24h(self) -> dict[str, float]:
+        """全市场 24h 成交额（单次 ticker 请求，不做逐币请求）。"""
+        out: dict[str, float] = {}
+        for item in self.client.futures_tickers_24h():
+            symbol = str(item.get("symbol") or "")
+            if not symbol:
+                continue
+            try:
+                out[symbol] = float(item.get("quoteVolume") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def close(self) -> None:
         self.client.close()

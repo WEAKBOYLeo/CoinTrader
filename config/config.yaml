@@ -197,8 +197,15 @@ execution:
   # server time 周期性重校准（秒）：代理 RTT 漂移会让启动时偏移过期→签名 -1021；
   # 长跑定期重校准（单次校准本身多点采样取 RTT 最小样本）
   time_resync_seconds: 300
-  # 实时策略候选池（§7.1：初期固定一个高流动性 USDT symbol，完成单 pair 闭环后再开放多 symbol）
-  live_symbols: [BTCUSDT]
+  # 实时策略候选池（§7.1）：
+  #   空列表 = 动态候选池（回测同口径）：全部可交易 USDT 永续（排除 exclude_bases）
+  #            → 24h 成交额 >= selection.min_quote_volume_3d_avg → 按量取 top N；
+  #   非空    = 固定候选列表（单 pair 闭环 / 手工选币模式）。
+  live_symbols: []
+  # 动态候选池最大 symbol 数（0 = 不限；越大 Binance API 权重开销越大）
+  candidate_pool_max_symbols: 100
+  # 动态候选池刷新周期（秒）；失败保留旧池
+  universe_refresh_seconds: 1800
   # 候选指标低频刷新（秒）；主循环不重复拉历史
   candidate_refresh_seconds: 300
   # 候选指标缓存最大年龄（秒）；超过拒绝开仓

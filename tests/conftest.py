@@ -371,10 +371,17 @@ class FakeStrategyData:
 
     def __init__(self, rates: dict[str, list[tuple[int, Decimal, Decimal]]],
                  interval_hours: dict[str, int] | None = None,
-                 volumes: dict[str, Decimal] | None = None) -> None:
+                 volumes: dict[str, Decimal] | None = None,
+                 universe: tuple[str, ...] = (),
+                 volumes_24h: dict[str, float] | None = None,
+                 universe_fail: bool = False) -> None:
         self._rates = {k: list(v) for k, v in rates.items()}
         self._interval = interval_hours or {}
         self._volume = volumes or {}
+        self._universe = tuple(universe)
+        self._volume_24h = dict(volumes_24h or {})
+        self._universe_fail = universe_fail
+        self.universe_calls = 0
 
     def rates(self, symbol: str) -> list[tuple[int, Decimal, Decimal]]:
         return list(self._rates.get(symbol, []))
@@ -393,6 +400,20 @@ class FakeStrategyData:
 
     def quote_volume_3d_avg(self, symbol: str) -> Decimal:
         return self._volume.get(symbol, Decimal("10000000"))
+
+    def set_universe_fail(self, fail: bool) -> None:
+        self._universe_fail = fail
+
+    def tradable_universe(self) -> tuple[str, ...]:
+        self.universe_calls += 1
+        if self._universe_fail:
+            raise RuntimeError("universe api down")
+        return self._universe
+
+    def quote_volume_24h(self) -> dict[str, float]:
+        if self._universe_fail:
+            raise RuntimeError("ticker api down")
+        return dict(self._volume_24h)
 
 
 def make_rate_series(n: int, rate: str, start_ms: int = 1_700_000_000_000,
