@@ -218,7 +218,14 @@ def parse_futures_exchange_info(payload: dict[str, Any]) -> dict[str, SymbolRule
         filters = sym.get("filters", []) or []
         price_f = _filter_by_type(filters, "PRICE_FILTER") or {}
         lot_f = _filter_by_type(filters, "LOT_SIZE") or {}
-        notional_f = _filter_by_type(filters, "NOTIONAL") or {}
+        # 期货端最小名义额过滤器是 MIN_NOTIONAL（字段名 notional），
+        # 与现货端的 NOTIONAL/minNotional 不同；两者都兼容。
+        notional_f = (
+            _filter_by_type(filters, "MIN_NOTIONAL")
+            or _filter_by_type(filters, "NOTIONAL")
+            or {}
+        )
+        notional_raw = notional_f.get("notional") or notional_f.get("minNotional")
 
         if not symbol or not price_f or not lot_f:
             continue
@@ -233,7 +240,7 @@ def parse_futures_exchange_info(payload: dict[str, Any]) -> dict[str, SymbolRule
             min_qty=_dec(lot_f.get("minQty"), f"{symbol}.minQty"),
             max_qty=_dec(lot_f.get("maxQty"), f"{symbol}.maxQty"),
             step_size=_dec(lot_f.get("stepSize"), f"{symbol}.stepSize"),
-            min_notional=_dec_or(notional_f.get("minNotional"), f"{symbol}.minNotional"),
+            min_notional=_dec_or(notional_raw, f"{symbol}.minNotional"),
             quantity_precision=sym.get("quantityPrecision"),
             price_precision=sym.get("pricePrecision"),
             contract_type=sym.get("contractType"),

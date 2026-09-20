@@ -230,7 +230,8 @@ class TestParseFuturesExchangeInfo:
                 "filters": [
                     {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
                     {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
-                    {"filterType": "NOTIONAL", "minNotional": "5"},
+                    # 币安期货真实格式：MIN_NOTIONAL / notional 字段（demo 实测）
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
                 ],
             },
             {
@@ -261,3 +262,37 @@ class TestParseFuturesExchangeInfo:
         assert r.market == "perp"
         assert r.contract_type == "PERPETUAL"
         assert r.min_notional == Decimal("5")
+
+    def test_min_notional_filter_shape(self) -> None:
+        """MIN_NOTIONAL/notional（期货真实格式）与 NOTIONAL/minNotional 都兼容。"""
+        payload = {
+            "symbols": [
+                {
+                    "symbol": "AUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+                    "baseAsset": "A", "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                        {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "100", "stepSize": "1"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "50"},
+                    ],
+                },
+                {
+                    "symbol": "BUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+                    "baseAsset": "B", "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                        {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "100", "stepSize": "1"},
+                        {"filterType": "NOTIONAL", "minNotional": "20"},
+                    ],
+                },
+                {
+                    "symbol": "CUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+                    "baseAsset": "C", "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                        {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "100", "stepSize": "1"},
+                    ],
+                },
+            ]
+        }
+        rules = parse_futures_exchange_info(payload)
+        assert rules["AUSDT"].min_notional == Decimal("50")
+        assert rules["BUSDT"].min_notional == Decimal("20")
+        assert rules["CUSDT"].min_notional == Decimal("0")

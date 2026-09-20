@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Sequence
@@ -205,6 +206,18 @@ class Reconciler:
 
         for symbol in sorted(symbols):
             base = symbol.replace("USDT", "")
+            # 不可交易灰尘容忍：低于一个 step 的余额无法再下最小单，
+            # 平仓手续费扣减后必然存在（demo 实测 0.0007 扣费后 0.0006993）。
+            # 对账容差 = 基础 epsilon 与该 symbol 最小可交易 step 取大，
+            # 否则 step 以下的灰尘余额会被永久判为不一致 → 卡在 RECOVERY。
+            tolerance_spot = QTY_EPSILON
+            tolerance_perp = QTY_EPSILON
+            if hasattr(self.spot, "rule"):
+                with contextlib.suppress(KeyError):
+                    tolerance_spot = max(tolerance_spot, self.spot.rule(f"{symbol}USDT").step_size)
+            if hasattr(self.futures, "rule"):
+                with contextlib.suppress(KeyError):
+                    tolerance_perp = max(tolerance_perp, self.futures.rule(f"{symbol}USDT").step_size)
             exp_entry = expected.get(symbol)
             if exp_entry is None:
                 # 余额派生的独立 symbol（无同名单元）：
@@ -216,7 +229,7 @@ class Reconciler:
             exp_spot = exp_entry.get("SPOT", Decimal("0")) if exp_entry else Decimal("0")
             act_spot = spot_balances.get(base, Decimal("0"))
             diff_spot = act_spot - exp_spot
-            if abs(diff_spot) > QTY_EPSILON:
+            if abs(diff_spot) > tolerance_spot:
                 mismatches.append(
                     f"{symbol}: Spot 余额不一致 本地期望={exp_spot} 交易所={act_spot} 差={diff_spot}"
                 )
@@ -224,7 +237,7 @@ class Reconciler:
             exp_perp = expected.get(symbol, {}).get("PERP", Decimal("0"))
             act_perp = perp_positions.get(symbol, Decimal("0"))
             diff_perp = act_perp - exp_perp
-            if abs(diff_perp) > QTY_EPSILON:
+            if abs(diff_perp) > tolerance_perp:
                 mismatches.append(
                     f"{symbol}: 永续持仓不一致 本地期望={exp_perp} 交易所={act_perp} 差={diff_perp}"
                 )

@@ -19,7 +19,8 @@ from cointrader.execution.store import StateStore
 
 
 class FakeAdapter:
-    def __init__(self) -> None:
+    def __init__(self, rules: dict[str, Any] | None = None) -> None:
+        self.rules = rules or {}
         self.open_orders_list: list[dict[str, Any]] = []
         self.order_results: dict[str, Order | None] = {}
         self.order_query_error: Exception | None = None
@@ -41,6 +42,11 @@ class FakeAdapter:
 
     def positions(self, symbol: str | None = None) -> list[dict[str, Any]]:  # noqa: ARG002
         return list(self.positions_list)
+
+    def rule(self, symbol: str) -> Any:
+        if symbol not in self.rules:
+            raise KeyError(symbol)
+        return self.rules[symbol]
 
 
 @pytest.fixture
@@ -122,6 +128,35 @@ class TestConsistency:
         result = env["reconciler"].run()
         assert result.consistent is True, "灰尘仓位在容差内不算不一致"
 
+    def test_fee_dust_below_step_is_consistent(self, env: dict) -> None:
+        """手续费在现货腿以基础币扣减，余额低于 step 但高于 QTY_EPSILON（demo 实测 0.0000086）。
+
+        该残灰不可再下最小单，对账不得判为不一致，否则服务永久卡 RECOVERY。
+        """
+        from cointrader.execution.rules import SymbolRules
+        rule = SymbolRules(
+            symbol="BTCUSDT", market="spot", status="TRADING", base_asset="BTC",
+            quote_asset="USDT", tick_size=Decimal("0.01"), min_qty=Decimal("0.00001"),
+            max_qty=Decimal("1000"), step_size=Decimal("0.00001"), min_notional=Decimal("5"),
+        )
+        env["spot"].rules["BTCUSDT"] = rule
+        env["spot"].balances_map["BTC"] = Decimal("0.0000086")  # < step 0.00001
+        result = env["reconciler"].run()
+        assert result.consistent is True, f"sub-step 灰尘应容忍: {result.mismatches}"
+
+    def test_real_residual_above_step_still_mismatches(self, env: dict) -> None:
+        """达到一个 step 以上的残量仍是事故，必须报不一致。"""
+        from cointrader.execution.rules import SymbolRules
+        rule = SymbolRules(
+            symbol="BTCUSDT", market="spot", status="TRADING", base_asset="BTC",
+            quote_asset="USDT", tick_size=Decimal("0.01"), min_qty=Decimal("0.00001"),
+            max_qty=Decimal("1000"), step_size=Decimal("0.00001"), min_notional=Decimal("5"),
+        )
+        env["spot"].rules["BTCUSDT"] = rule
+        env["spot"].balances_map["BTC"] = Decimal("0.00002")  # 2 个 step
+        result = env["reconciler"].run()
+        assert result.consistent is False
+        assert any("Spot 余额不一致" in m for m in result.mismatches)
 
 class TestRepair:
     def test_local_new_order_confirmed_filled_on_exchange_is_repaired(self, env: dict) -> None:

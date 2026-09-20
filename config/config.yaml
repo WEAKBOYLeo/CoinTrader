@@ -179,7 +179,8 @@ execution:
   max_market_data_age_seconds: 5.0
   max_leg_slippage_pct: 0.001    # 单腿滑点保护 0.1%
   hedge_tolerance_pct: 0.005     # 两腿数量容差 0.5%
-  canary_notional: 10.0          # 单 pair 名义额硬顶（USDT），canary 期极小
+  canary_notional: 60.0          # 单 pair 名义额硬顶（USDT）。BTCUSDT 永续最小名义额 50，
+                                  # demo/主网均适用；低于此值会触发 -4164 拒单
   # 主循环连续 tick 异常阈值：达到后优雅停机（退出码 1），由 systemd Restart=always 拉起
   max_consecutive_tick_errors: 10
   # WebUI 实时仪表盘：随 live run 启动，只读、独立线程、故障不影响主循环

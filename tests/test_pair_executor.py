@@ -434,6 +434,45 @@ class TestClosePair:
         assert env["spot"].place_calls == []
         assert env["perp"].place_calls == []
 
+    def test_close_fee_deducted_balance_floors_to_step(self, env: dict, risk_state: RiskState) -> None:
+        """手续费在现货腿以基础币扣减，余额不对齐 step（demo 实测 0.0007→0.00069930）。
+
+        平仓必须把卖出量向下对齐 step，残灰（< 1 step，低于 min_qty 不可再卖）
+        不得触发停机。
+        """
+        executor: PairExecutor = env["executor"]
+        spot: FakeExchange = env["spot"]
+        perp: FakeExchange = env["perp"]
+        # step=0.001：0.9996 对齐后 0.999，残灰 0.0006 < min_qty 0.001
+        spot.balances_map["BTC"] = Decimal("0.9996")
+        perp.position_amt = Decimal("-0.9996")
+        pair = executor.close_pair("BTCUSDT", reason="dust test")
+        assert pair.status == "COMPLETE", f"灰尘残量不得停机: {pair.status} {pair.error}"
+        spot_req = spot.place_calls[0]
+        assert spot_req.quantity == Decimal("0.999"), "卖出量必须向下对齐 step"
+        # 永续腿按实际持仓 reduce-only
+        _, qty, _cid = perp.reduce_calls[0]
+        assert qty == Decimal("0.9996")
+        assert env["gate"].state.name == "NORMAL", "灰尘不得触发风控停机"
+
+    def test_close_real_residual_still_halts(self, env: dict, risk_state: RiskState) -> None:
+        """达到一个 step 以上的残量仍是事故，必须停机。"""
+        executor: PairExecutor = env["executor"]
+        spot: FakeExchange = env["spot"]
+        perp: FakeExchange = env["perp"]
+        # spot 余额 0.007 → 卖出 0.007，但脚本出牌只成交 0.001 → 残 0.006 ≥ 1 step → 停机
+        spot.balances_map["BTC"] = Decimal("0.007")
+        perp.position_amt = Decimal("-0.002")
+        spot.place_results.append(Order(
+            client_order_id="x", exchange_order_id="e", symbol="BTCUSDT",
+            market=Market.SPOT, side=OrderSide.SELL, order_type=OrderType.MARKET,
+            quantity=Decimal("0.007"), state="FILLED", executed_qty=Decimal("0.001"),
+            avg_price=PRICE, reduce_only=False, updated_ms=int(time.time() * 1000),
+        ))
+        pair = executor.close_pair("BTCUSDT", reason="residual test")
+        assert pair.status == "COMPENSATE_RESIDUAL", f"真残量必须停机: {pair.status}"
+        assert env["gate"].state.name != "NORMAL"
+
 
 class TestHaltSemantics:
     def test_halt_blocks_open_but_allows_close(self, env: dict, risk_state: RiskState) -> None:

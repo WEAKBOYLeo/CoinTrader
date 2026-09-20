@@ -34,7 +34,7 @@ from .models import (
 )
 from .risk import RiskState
 from .risk_gate import RiskGate
-from .rules import RuleError, check_notional, floor_to_step, normalize_qty
+from .rules import RuleError, check_notional, floor_to_step, format_decimal
 from .spot import SpotAdapter
 from .store import StateStore
 
@@ -384,25 +384,36 @@ class PairExecutor:
         perp_short = -perp_qty if perp_qty < 0 else Decimal("0")
 
         if spot_qty > 0:
-            try:
-                normalize_qty(spot_qty, self.spot.rule(symbol), is_market=True)
-            except RuleError as exc:
-                self._fail_close(pair, f"现货平仓规则失败: {exc}")
-                return pair
-            req = OrderRequest(
-                client_order_id=new_client_order_id(self.strategy_version, pair.pair_execution_id, "spot"),
-                symbol=symbol,
-                side=OrderSide.SELL,
-                market=Market.SPOT,
-                order_type=OrderType.MARKET,
-                quantity=spot_qty,
-            )
-            order = self._submit_with_recovery(self.spot, req, pair)
-            pair.spot = order
-            if order is None:
-                self._fail_close(pair, f"现货平仓失败: {pair.error}")
-                return pair
-            self.store.upsert_order(order)
+            spot_rule = self.spot.rule(symbol)
+            # 现货平仓用 MARKET 单，数量必须对齐 LOT_SIZE step。
+            # 注意：不能用 normalize_qty(is_market=True) —— 币安 MARKET_LOT_SIZE
+            # stepSize 为 0，会报「step 必须为正」；且开仓成交含手续费扣减后
+            # 余额本身不保证对齐 step（如 0.0007 扣费后 0.00069930），
+            # 直接原样卖出会被 -1013 LOT_SIZE 拒绝（实盘 demo 实测）。
+            sell_qty = floor_to_step(spot_qty, spot_rule.step_size)
+            if sell_qty < spot_rule.min_qty:
+                logger.warning(
+                    "【平仓】%s 现货余额 %s 对齐 step 后 %s 低于最小数量 %s，"
+                    "不可卖出，按灰尘处理",
+                    symbol, format_decimal(spot_qty), format_decimal(sell_qty),
+                    format_decimal(spot_rule.min_qty),
+                )
+                sell_qty = Decimal("0")
+            if sell_qty > 0:
+                req = OrderRequest(
+                    client_order_id=new_client_order_id(self.strategy_version, pair.pair_execution_id, "spot"),
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    market=Market.SPOT,
+                    order_type=OrderType.MARKET,
+                    quantity=sell_qty,
+                )
+                order = self._submit_with_recovery(self.spot, req, pair)
+                pair.spot = order
+                if order is None:
+                    self._fail_close(pair, f"现货平仓失败: {pair.error}")
+                    return pair
+                self.store.upsert_order(order)
 
         if perp_short > 0:
             cid = new_client_order_id(self.strategy_version, pair.pair_execution_id, "perp")
@@ -422,7 +433,13 @@ class PairExecutor:
         pair.touches(PairStatus.RESIDUAL_CHECK.value)
         residual_spot = self._spot_balance(symbol)
         residual_perp = self.futures.position_qty(symbol)
-        if residual_spot > 0 or abs(residual_perp) > 0:
+        # 灰尘容忍：低于一个 step 的余额无法再下最小单（step 以下不可卖），
+        # 不触发停机；达到一个 step 以上的残量才是真事故。
+        spot_step = self.spot.rule(symbol).step_size
+        perp_step = self.futures.rule(symbol).step_size
+        spot_dust = Decimal("0") < residual_spot < spot_step
+        perp_dust = Decimal("0") < abs(residual_perp) < perp_step
+        if (residual_spot > 0 and not spot_dust) or (abs(residual_perp) > 0 and not perp_dust):
             pair.touches(PairStatus.COMPENSATE_RESIDUAL.value,
                          error=f"平仓后残量 spot={residual_spot} perp={residual_perp}")
             self.on_alert("RESIDUAL_AFTER_CLOSE",
@@ -430,6 +447,11 @@ class PairExecutor:
             self.gate.halt(f"{symbol} 平仓后存在残量")
             self._persist(pair)
             return pair
+        if spot_dust or perp_dust:
+            logger.warning(
+                "【平仓】%s 平仓后留下低于 step 的灰尘 spot=%s perp=%s（不可再卖，忽略）",
+                symbol, format_decimal(residual_spot), format_decimal(residual_perp),
+            )
 
         pair.touches(PairStatus.COMPLETE.value)
         pair.completed_ts_ms = _now_ms()
