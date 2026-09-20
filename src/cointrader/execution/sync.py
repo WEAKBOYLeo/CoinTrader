@@ -24,12 +24,20 @@ from decimal import Decimal
 from typing import Any, Protocol, cast
 
 from ..config import Config
-from ..errors import CoinTraderError
+from ..errors import BinanceError, CoinTraderError
 from .guard import Market, OrderSide
 from .models import ExchangeSnapshotBundle, Fill, FundingAuthority, new_id
 from .store import StateStore
 
 logger = logging.getLogger(__name__)
+
+#: 币安「Illegal symbol」：该市场无此交易对/该账户无此交易对（demo 受限交易对）。
+_ILLEGAL_SYMBOL_CODE = -1121
+
+
+def _is_illegal_symbol(exc: Exception) -> bool:
+    return isinstance(exc, BinanceError) and exc.code == _ILLEGAL_SYMBOL_CODE
+
 
 __all__ = [
     "ExchangeStateSynchronizer",
@@ -186,7 +194,12 @@ class ExchangeStateSynchronizer:
                 try:
                     results.append(self._sync_fills_one(market, adapter, symbol))
                 except Exception as exc:  # noqa: BLE001 —— 单 symbol 失败不影响其余
-                    results.append(SyncResult(market, "fills", symbol, 0, 0, 0, False, str(exc)))
+                    if _is_illegal_symbol(exc):
+                        # 该市场无此交易对（demo 受限交易对）：确定性错误，
+                        # 视为「无数据且完整」而非失败，重试不会改变结果。
+                        results.append(SyncResult(market, "fills", symbol, 0, 0, 0, True, ""))
+                    else:
+                        results.append(SyncResult(market, "fills", symbol, 0, 0, 0, False, str(exc)))
         return results
 
     def _sync_fills_one(self, market: str, adapter: Any, symbol: str) -> SyncResult:
@@ -294,9 +307,12 @@ class ExchangeStateSynchronizer:
             try:
                 results.append(self._sync_income_one(symbol))
             except Exception as exc:  # noqa: BLE001
-                results.append(
-                    SyncResult("PERP", "funding_income", symbol, 0, 0, 0, False, str(exc))
-                )
+                if _is_illegal_symbol(exc):
+                    results.append(SyncResult("PERP", "funding_income", symbol, 0, 0, 0, True, ""))
+                else:
+                    results.append(
+                        SyncResult("PERP", "funding_income", symbol, 0, 0, 0, False, str(exc))
+                    )
         return results
 
     def _sync_income_one(self, symbol: str) -> SyncResult:

@@ -493,8 +493,12 @@ class LiveService:
         return result.state
 
     def _ledger_sync_symbols(self) -> list[str]:
-        """事实回补覆盖的 symbol：持仓 + 未完结 pair + 历史成交 + 候选池
-        （不受当前候选池限制，候选池外已有仓位也要能回补/恢复）。"""
+        """事实回补覆盖的 symbol：持仓 + 未完结 pair + 历史成交。
+
+        不含候选池：候选币无账本事实可补，全池同步 = 每周期 100+ 次
+        myTrades/income 请求（weight 爆炸）且 demo 受限交易对必返 -1121。
+        候选池外已有仓位仍由持仓/账本集合覆盖（不受当前池限制）。
+        """
         symbols: set[str] = set(self._held)
         try:
             for pair in self.store.open_pairs():
@@ -507,8 +511,6 @@ class LiveService:
                     symbols.add(str(sym))
         except Exception:  # noqa: BLE001 —— 账本读失败不阻断（同步本身会报错）
             logger.debug("事实回补 symbol 集账本查询失败", exc_info=True)
-        if self.strategy is not None:
-            symbols.update(self.strategy.candidate_symbols)
         return sorted(symbols)
 
     def _periodic_reconcile(self, now_ms: int) -> bool:

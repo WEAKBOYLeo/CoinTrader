@@ -259,3 +259,43 @@ class TestIncomeSync:
         results = sync.sync_funding_income([SYMBOL])
         assert results[0].error != ""
         assert "字段不完整" in results[0].error
+
+
+class TestIllegalSymbol:
+    """-1121（该市场无此交易对，如 demo 受限交易对）：判「无数据且完整」而非失败。
+
+    回归：demo 下候选池全量事实同步对不支持的交易对必返 -1121 →
+    曾被当作同步失败 → 服务永久 RECOVERY 死循环。
+    """
+
+    def test_spot_fill_illegal_symbol_is_complete_empty(self, store, cfg) -> None:
+        from cointrader.errors import BinanceError
+
+        class _SpotNoPair(_FakeSpot):
+            def my_trades(self, symbol, **kw):  # type: ignore[no-untyped-def]
+                raise BinanceError("Illegal symbol", code=-1121, status=400)
+
+        sync = ExchangeStateSynchronizer(
+            store=store, spot=_SpotNoPair({}), futures=_FakeFutures({}, []),
+            config=cfg, now_fn=lambda: NOW,
+        )
+        results = sync.sync_fills([SYMBOL])
+        spot_res = [r for r in results if r.market == "SPOT"][0]
+        assert spot_res.complete is True
+        assert spot_res.error == ""
+        assert spot_res.inserted == 0
+
+    def test_income_illegal_symbol_is_complete_empty(self, store, cfg) -> None:
+        from cointrader.errors import BinanceError
+
+        class _FutNoPair(_FakeFutures):
+            def income_history(self, **kw):  # type: ignore[no-untyped-def]
+                raise BinanceError("Illegal symbol", code=-1121, status=400)
+
+        sync = ExchangeStateSynchronizer(
+            store=store, spot=_FakeSpot({}), futures=_FutNoPair({}, []),
+            config=cfg, now_fn=lambda: NOW,
+        )
+        results = sync.sync_funding_income([SYMBOL])
+        assert results[0].complete is True
+        assert results[0].error == ""
