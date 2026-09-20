@@ -12,14 +12,17 @@ from cointrader.live.decisions import DecisionKind, ReasonCode
 from conftest import FakeStrategyData, make_rate_series
 from live_helpers import (
     NOW,
+    LiveFakeData,
     make_context,
     make_live_config,
+    make_live_rates,
     make_quote,
     make_service,
     make_strategy,
 )
 
 UNIVERSE = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT")
+SYMBOL = "BTCUSDT"
 VOLUMES_24H = {
     "AAAUSDT": 50e6,
     "BBBUSDT": 40e6,
@@ -31,8 +34,8 @@ RATE_OK = "0.0005"  # 年化 0.548 > 0.30
 
 
 def _data() -> FakeStrategyData:
-    return FakeStrategyData(
-        {s: make_rate_series(20, RATE_OK) for s in UNIVERSE},
+    return LiveFakeData(
+        {s: make_live_rates(20, RATE_OK) for s in UNIVERSE},
         universe=UNIVERSE,
         volumes_24h=VOLUMES_24H,
     )
@@ -113,8 +116,8 @@ class TestRefetchRateLimit:
     def _ten_symbol_env(self, tmp_path):
         clock = {"t": NOW}
         universe = tuple(f"S{i:02d}USDT" for i in range(10))
-        data = FakeStrategyData(
-            {s: make_rate_series(20, RATE_OK) for s in universe},
+        data = LiveFakeData(
+            {s: make_live_rates(20, RATE_OK) for s in universe},
             universe=universe,
             volumes_24h={s: 50e6 for s in universe},
         )
@@ -155,6 +158,29 @@ class TestRefetchRateLimit:
         assert data.funding_calls > 10
 
 
+class TestEntryGates:
+    def test_settlement_lag_blocks_entry(self, tmp_path):
+        """最新结算已发生但缓存未刷新 → 禁止开仓（防拿旧数据比收益率）。"""
+        clock = {"t": NOW}
+        data = LiveFakeData({SYMBOL: make_live_rates(40, RATE_OK)})
+        strat, _ = make_strategy(tmp_path, data, now_fn=lambda: clock["t"])
+        strat.refresh_candidates()
+        clock["t"] = NOW + 8 * 3600 + 60  # 结算边界已过 1 分钟，未重刷
+        ctx = make_context(now_ms=clock["t"])
+        decision = strat.can_open(SYMBOL, ctx)
+        assert decision.decision_kind is DecisionKind.SKIP
+        assert decision.reason_code is ReasonCode.SETTLEMENT_LAG
+        # 重刷后解除（数据补齐）
+        data.now_ms = int(clock["t"] * 1000)
+        data.set_rates(
+            SYMBOL,
+            make_rate_series(40, RATE_OK, end_ms=data.now_ms - 30 * 60 * 1000 + 8 * 3600 * 1000),
+        )
+        strat.refresh_candidates()
+        decision2 = strat.can_open(SYMBOL, ctx)
+        assert decision2.decision_kind is DecisionKind.PENDING_QUOTE
+
+
 class TestDynamicOpenFlow:
     def test_pending_then_entry_ok(self, tmp_path):
         strat, _ = make_strategy(tmp_path, _data(), config=_dyn_config())
@@ -162,25 +188,51 @@ class TestDynamicOpenFlow:
         ctx = make_context()  # 动态池上下文：无池报价
         decisions = strat.evaluate(ctx)
         assert len(decisions) == 3
-        assert all(d.decision_kind is DecisionKind.PENDING_QUOTE for d in decisions)
-        assert all(not d.allowed for d in decisions)
-        finals = [strat.complete_open(d.symbol, ctx, make_quote()) for d in decisions]
+        # 3 个通过前置，max_positions=2 → 按收益率取 top 2，第 3 个 RANKED_OUT
+        by_symbol = {d.symbol: d for d in decisions}
+        assert by_symbol["AAAUSDT"].decision_kind is DecisionKind.PENDING_QUOTE
+        assert by_symbol["BBBUSDT"].decision_kind is DecisionKind.PENDING_QUOTE
+        assert by_symbol["CCCUSDT"].reason_code is ReasonCode.RANKED_OUT
+        finals = [
+            strat.complete_open(s, ctx, make_quote())
+            for s in ("AAAUSDT", "BBBUSDT")
+        ]
         assert all(
             d.decision_kind is DecisionKind.OPEN and d.reason_code is ReasonCode.ENTRY_OK
             for d in finals
         )
 
+    def test_top_n_by_trailing_gets_slots(self, tmp_path):
+        """收益率高者得槽位：低收益币不得抢先占用。"""
+        universe = ("LOWUSDT", "HIGHUSDT", "MIDUSDT")
+        data = LiveFakeData(
+            {
+                "LOWUSDT": make_live_rates(20, "0.000275"),   # 年化 ~0.301
+                "HIGHUSDT": make_live_rates(20, "0.001"),     # 年化 ~1.095
+                "MIDUSDT": make_live_rates(20, "0.0005"),     # 年化 ~0.548
+            },
+            universe=universe,
+            volumes_24h={s: 50e6 for s in universe},
+        )
+        strat, _ = make_strategy(tmp_path, data, config=_dyn_config())
+        strat.refresh_candidates()
+        decisions = {d.symbol: d for d in strat.evaluate(make_context())}
+        assert decisions["HIGHUSDT"].decision_kind is DecisionKind.PENDING_QUOTE
+        assert decisions["MIDUSDT"].decision_kind is DecisionKind.PENDING_QUOTE
+        assert decisions["LOWUSDT"].reason_code is ReasonCode.RANKED_OUT
+        assert "排名第 3" in decisions["LOWUSDT"].reason_text
+
     def test_service_run_once_resolves_pending_and_opens(self, tmp_path):
         env = make_service(tmp_path, _data(), config=_dyn_config())
         env["svc"].run_once()
-        # 3 个池 symbol 全部通过门槛 → PENDING → 按需报价 → OPEN
-        assert [c["symbol"] for c in env["executor"].open_calls] == [
-            "AAAUSDT", "BBBUSDT", "CCCUSDT",
-        ]
+        # 3 个池 symbol 全部通过门槛，槽位 2 → 按池序（收益率相同）取前 2 开仓
+        assert [c["symbol"] for c in env["executor"].open_calls] == ["AAAUSDT", "BBBUSDT"]
         rows = env["store"].signal_decisions()
         assert all(r["decision_kind"] != DecisionKind.PENDING_QUOTE for r in rows)
         opens = [r for r in rows if r["reason_code"] == ReasonCode.ENTRY_OK]
-        assert len(opens) == 3
+        assert len(opens) == 2
+        ranked = [r for r in rows if r["reason_code"] == ReasonCode.RANKED_OUT]
+        assert [r["symbol"] for r in ranked] == ["CCCUSDT"]
 
     def test_service_quote_failure_records_stale_quote(self, tmp_path):
         env = make_service(tmp_path, _data(), config=_dyn_config())
@@ -188,5 +240,6 @@ class TestDynamicOpenFlow:
         env["svc"].run_once()
         assert env["executor"].open_calls == []
         rows = env["store"].signal_decisions()
-        assert all(r["reason_code"] == ReasonCode.STALE_QUOTE for r in rows)
-        assert len(rows) == 3
+        stale = [r for r in rows if r["reason_code"] == ReasonCode.STALE_QUOTE]
+        assert len(stale) == 2
+        assert any(r["reason_code"] == ReasonCode.RANKED_OUT for r in rows)

@@ -343,7 +343,12 @@ class LiveStrategy:
     # -- 主入口 ---------------------------------------------------------------
 
     def evaluate(self, ctx: LiveContext) -> list[StrategyDecision]:
-        """评估全部候选与持仓。每个 symbol 恰好一条决策。"""
+        """评估全部候选与持仓。每个 symbol 恰好一条决策。
+
+        开仓槽位按 trailing 年化从高到低分配：只放行 top (max_positions -
+        已持仓)，落选记 ``RANKED_OUT``（防止单 tick 内 held 未更新导致开超
+        上限，也防止低收益币抢先占用槽位）。
+        """
         decisions: list[StrategyDecision] = []
 
         # 1) 持仓 symbol：退出/换仓评估（异常退出路径由 service 优先处理）
@@ -351,11 +356,34 @@ class LiveStrategy:
             held = ctx.held[symbol]
             decisions.append(self._evaluate_exit(symbol, held, ctx))
 
-        # 2) 未持仓候选：开仓评估
+        # 2) 未持仓候选：开仓评估；通过前置门槛的按收益率排序分配槽位
+        pending: list[tuple[Decimal, str, StrategyDecision]] = []
         for symbol in self.candidate_symbols:
             if symbol in ctx.held:
                 continue
-            decisions.append(self.can_open(symbol, ctx))
+            decision = self.can_open(symbol, ctx)
+            if decision.decision_kind is DecisionKind.PENDING_QUOTE:
+                cache = self.candidates[symbol]
+                trailing, _ = self._entry_metrics(cache)
+                pending.append((trailing, symbol, decision))
+            else:
+                decisions.append(decision)
+
+        slots = max(int(self.config.strategy.selection.max_positions) - len(ctx.held), 0)
+        pending.sort(key=lambda item: (-item[0], item[1]))
+        for rank, (trailing, symbol, decision) in enumerate(pending):
+            if rank < slots:
+                decisions.append(decision)
+                continue
+            skip = self._make_skip(symbol, ctx)
+            decisions.append(
+                skip(
+                    ReasonCode.RANKED_OUT,
+                    f"本轮通过门槛 {len(pending)} 个，槽位 {slots} 个；"
+                    f"{symbol} 年化 {trailing} 排名第 {rank + 1}，未进 top {slots}",
+                    trailing_annualized=trailing,
+                )
+            )
 
         return decisions
 
@@ -430,6 +458,15 @@ class LiveStrategy:
                 ReasonCode.STALE_DATA,
                 f"候选指标数据年龄 {self._cache_age_ms(cache)}ms 超过 {stale_after_ms}ms",
             )
+        # 结算滞后门：最新一期结算已发生但缓存未刷新 → 本轮禁止开仓。
+        # 刷新是限流分批的，滞后窗口内拿旧数据比较收益率会选错币。
+        if cache.timestamps:
+            last_settle_ms = cache.timestamps[-1] + int(cache.interval_hours) * 3600 * 1000
+            if last_settle_ms <= ctx.now_ms:
+                return skip(
+                    ReasonCode.SETTLEMENT_LAG,
+                    f"最新结算（{last_settle_ms}）已发生但缓存未刷新，等待数据补齐",
+                )
         if len(cache.rates) < entry.lookback_periods:
             return skip(
                 ReasonCode.INSUFFICIENT_HISTORY,

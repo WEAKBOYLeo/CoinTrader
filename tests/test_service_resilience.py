@@ -24,11 +24,12 @@ import cointrader.execution.store as store_mod
 from cointrader.errors import LiveGateBlocked
 from cointrader.execution.store import LeaseConflict, StateStore
 from cointrader.live.service import ServiceState
-from conftest import FakeStrategyData, make_rate_series
 from live_helpers import (
     NOW,
     FakeServiceAdapter,
+    LiveFakeData,
     make_live_config,
+    make_live_rates,
     make_service,
     make_symbol_rules,
 )
@@ -44,7 +45,7 @@ def _tick_config(max_errors: int = 2):
 
 def _env(tmp_path: Path, *, max_errors: int = 2) -> dict[str, Any]:
     cfg = _tick_config(max_errors)
-    data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0005")})
+    data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")})
     return make_service(tmp_path, data, config=cfg)
 
 
@@ -226,7 +227,7 @@ class TestRecoveryAutoClear:
         assert svc.state is ServiceState.RECOVERY
 
     def test_startup_marks_interrupted_and_restores_held(self, tmp_path):
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0005")})
+        data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")})
         store = StateStore(tmp_path / "trading.sqlite3")
 
         # 上次 run：非优雅退出（kill -9），会话遗留 ended_ms=NULL
@@ -278,7 +279,7 @@ class TestRecoveryAutoClear:
 
     def test_no_interrupted_sessions_is_noop(self, tmp_path):
         """全新账本（无任何会话）：startup 正常，标记数 0。"""
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0005")})
+        data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")})
         env = make_service(tmp_path / "x", data, config=_tick_config())
         svc = env["svc"]
         svc._now = lambda: NOW  # noqa: SLF001

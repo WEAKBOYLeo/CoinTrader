@@ -374,7 +374,8 @@ class FakeStrategyData:
                  volumes: dict[str, Decimal] | None = None,
                  universe: tuple[str, ...] = (),
                  volumes_24h: dict[str, float] | None = None,
-                 universe_fail: bool = False) -> None:
+                 universe_fail: bool = False,
+                 now_ms: int | None = None) -> None:
         self._rates = {k: list(v) for k, v in rates.items()}
         self._interval = interval_hours or {}
         self._volume = volumes or {}
@@ -383,6 +384,7 @@ class FakeStrategyData:
         self._universe_fail = universe_fail
         self.universe_calls = 0
         self.funding_calls = 0
+        self.now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
     def rates(self, symbol: str) -> list[tuple[int, Decimal, Decimal]]:
         return list(self._rates.get(symbol, []))
@@ -393,8 +395,7 @@ class FakeStrategyData:
     def funding_rates(self, symbol: str, periods: int) -> list[tuple[int, Decimal, Decimal]]:
         raw = self._rates.get(symbol, [])
         self.funding_calls += 1
-        now_ms = int(time.time() * 1000)
-        settled = [(ts, r, m) for (ts, r, m) in raw if ts <= now_ms]
+        settled = [(ts, r, m) for (ts, r, m) in raw if ts <= self.now_ms]
         return settled[-periods:]
 
     def funding_interval_hours(self, symbol: str) -> int:
@@ -420,10 +421,16 @@ class FakeStrategyData:
 
 def make_rate_series(n: int, rate: str, start_ms: int = 1_700_000_000_000,
                      interval_ms: int = 8 * 3600 * 1000,
-                     end_ago_ms: int = 0) -> list[tuple[int, Decimal, Decimal]]:
-    """生成 n 条恒定费率序列（funding_ts_ms, rate, mark_rate），全部在过去。"""
+                     end_ago_ms: int = 0,
+                     end_ms: int | None = None) -> list[tuple[int, Decimal, Decimal]]:
+    """生成 n 条恒定费率序列（funding_ts_ms, rate, mark_rate）。
+
+    右端默认在真实当前时刻之前；``end_ms`` 可锚定到逻辑时钟（live 测试用
+    固定的 NOW，避免真实时间与逻辑时钟错位触发结算滞后门）。
+    """
     value = Decimal(rate)
-    base = int(time.time() * 1000) - (n * interval_ms + max(end_ago_ms, 0))
+    anchor = end_ms if end_ms is not None else int(time.time() * 1000)
+    base = anchor - (n * interval_ms + max(end_ago_ms, 0))
     return [(base + i * interval_ms, value, value) for i in range(n)]
 
 

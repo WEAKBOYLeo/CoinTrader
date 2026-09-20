@@ -32,6 +32,25 @@ from cointrader.live.strategy import HeldPosition, LiveContext, LiveStrategy, Qu
 from conftest import FakeStrategyData
 
 NOW = 1_800_000_000.0  # 固定逻辑时钟（秒）
+NOW_MS = int(NOW * 1000)
+
+
+class LiveFakeData(FakeStrategyData):
+    """live 测试数据源："已结算"过滤对齐逻辑时钟 NOW（而非真实时间）。"""
+
+    def __init__(self, *args: Any, **kw: Any) -> None:  # noqa: ARG002
+        kw.setdefault("now_ms", NOW_MS)
+        super().__init__(*args, **kw)
+
+
+def make_live_rates(n: int, rate: str) -> list[tuple[int, Decimal, Decimal]]:
+    """锚定到逻辑时钟 NOW 的费率序列：末期结算在 NOW-30min（已结算且不触发结算滞后门）。
+
+    make_rate_series 的右端 = end_ms - 一个周期，故 end_ms 需加回 8h。
+    """
+    from conftest import make_rate_series
+
+    return make_rate_series(n, rate, end_ms=NOW_MS - 30 * 60 * 1000 + 8 * 3600 * 1000)
 
 
 def make_live_config(

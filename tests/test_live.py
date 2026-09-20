@@ -220,7 +220,7 @@ class TestStartup:
         from cointrader.execution.risk import RiskManager
         from cointrader.execution.risk_gate import RiskGate
         from cointrader.live.strategy import LiveStrategy
-        from conftest import FakeStrategyData, make_rate_series
+        from live_helpers import LiveFakeData, make_live_rates
 
         cfg = make_config()  # live_symbols=() 默认 → 动态候选池
 
@@ -228,8 +228,8 @@ class TestStartup:
             def __init__(self, status: str = "TRADING") -> None:
                 self.status = status
 
-        data = FakeStrategyData(
-            {s: make_rate_series(10, "0.0005")
+        data = LiveFakeData(
+            {s: make_live_rates(10, "0.0005")
              for s in ("AAAUSDT", "BBBUSDT", "CCUSDT")},
             universe=("AAAUSDT", "BBBUSDT", "CCUSDT"),
             volumes_24h={"AAAUSDT": 50e6, "BBBUSDT": 40e6, "CCUSDT": 30e6},

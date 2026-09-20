@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import time
 from decimal import Decimal
 
 from cointrader.live.decisions import DecisionKind, ReasonCode
-from conftest import FakeStrategyData
+from conftest import FakeStrategyData  # noqa: F401  # 类型标注用
 from live_helpers import (
+    NOW_MS,
+    LiveFakeData,
     make_context,
     make_held,
     make_live_config,
@@ -23,7 +24,7 @@ INTERVAL_MS = 8 * 3600 * 1000
 def _rates(*segments: tuple[int, str]) -> list[tuple[int, Decimal, Decimal]]:
     """按 (条数, 费率值) 段拼接连续时间戳的费率序列（全部在过去）。"""
     n = sum(count for count, _ in segments)
-    start = int(time.time() * 1000) - n * INTERVAL_MS
+    start = NOW_MS - 30 * 60 * 1000 - n * INTERVAL_MS
     out: list[tuple[int, Decimal, Decimal]] = []
     i = 0
     for count, value in segments:
@@ -34,7 +35,7 @@ def _rates(*segments: tuple[int, str]) -> list[tuple[int, Decimal, Decimal]]:
 
 
 def _exit_decision(tmp_path, rates, held, *, config=None, quotes=None):
-    data = FakeStrategyData({SYMBOL: rates},
+    data = LiveFakeData({SYMBOL: rates},
                             volumes={SYMBOL: Decimal("10000000")})
     if config is not None:
         strat, _ = make_strategy(tmp_path, data, config=config)
@@ -81,7 +82,7 @@ class TestExit:
     def test_exit_takes_priority_over_replacement(self, tmp_path):
         """负均值退出优先于换仓。"""
         cfg = make_live_config(live_symbols=("BTCUSDT", "ETHUSDT"))
-        data = FakeStrategyData({
+        data = LiveFakeData({
             "BTCUSDT": _rates((14, RATE_OK), (6, "-0.0005")),
             "ETHUSDT": _rates((20, "0.0006")),
         })
@@ -100,7 +101,7 @@ class TestReplacement:
         # max_holding 调大，避免持仓年龄先触发 MAX_HOLDING 干扰换仓判定
         cfg = make_live_config(live_symbols=("BTCUSDT", "ETHUSDT"),
                                exit_overrides={"max_holding_periods": 300})
-        data = FakeStrategyData({
+        data = LiveFakeData({
             "BTCUSDT": _rates((20, btc_value)),
             "ETHUSDT": _rates((20, eth_value)),
         })
@@ -138,7 +139,7 @@ class TestReplacement:
     def test_replacement_picks_best_candidate(self, tmp_path):
         cfg = make_live_config(live_symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
                                exit_overrides={"max_holding_periods": 300})
-        data = FakeStrategyData({
+        data = LiveFakeData({
             "BTCUSDT": _rates((20, RATE_OK)),
             "ETHUSDT": _rates((20, "0.0006")),
             "SOLUSDT": _rates((20, "0.0009")),  # 最佳

@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 from dataclasses import replace
 from decimal import Decimal
@@ -18,8 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from cointrader.live.decisions import DecisionKind
-from conftest import FakeStrategyData, make_rate_series
-from live_helpers import NOW, make_live_config, make_service
+from conftest import FakeStrategyData
+from live_helpers import NOW, NOW_MS, LiveFakeData, make_live_config, make_live_rates, make_service
 
 SYMBOL = "BTCUSDT"
 INTERVAL_MS = 8 * 3600 * 1000
@@ -27,7 +26,7 @@ INTERVAL_MS = 8 * 3600 * 1000
 
 def _neg_tail_rates(n: int = 20) -> list[tuple[int, Decimal, Decimal]]:
     """前 14 期正、最近 6 期负（退出窗口均值转负）。"""
-    start = int(time.time() * 1000) - n * INTERVAL_MS
+    start = NOW_MS - 30 * 60 * 1000 - n * INTERVAL_MS
     values = ["0.0005"] * 14 + ["-0.0005"] * 6
     return [(start + i * INTERVAL_MS, Decimal(v), Decimal("100")) for i, v in enumerate(values)]
 
@@ -39,7 +38,7 @@ def _env(tmp_path: Path) -> dict[str, Any]:
                                          candidate_refresh_seconds=5,
                                          reconciliation_interval_seconds=5,
                                          snapshot_interval_seconds=5))
-    data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0005")})
+    data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")})
     return make_service(tmp_path, data, config=cfg)
 
 

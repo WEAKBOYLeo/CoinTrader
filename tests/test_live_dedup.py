@@ -15,8 +15,7 @@ from typing import Any
 from cointrader.execution.guard import Market, OrderSide, OrderType
 from cointrader.execution.models import Fill, Order, OrderIntent, PairExecution
 from cointrader.execution.store import StateStore
-from conftest import FakeStrategyData, make_rate_series
-from live_helpers import NOW, FakeServiceAdapter, make_service
+from live_helpers import NOW, FakeServiceAdapter, LiveFakeData, make_live_rates, make_service
 
 SYMBOL = "BTCUSDT"
 
@@ -103,7 +102,7 @@ class TestStoreDedup:
 
 
 def _env(tmp_path, **kw: Any) -> dict[str, Any]:
-    data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0005")})
+    data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")})
     return make_service(tmp_path, data, **kw)
 
 
@@ -154,7 +153,7 @@ class TestServiceDedup:
 
     def test_restart_no_reopen_with_existing_position(self, tmp_path):
         """重启（新 service + 同一账本）且交易所仍有持仓 → 不得再开仓。"""
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0005")})
+        data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")})
         env1 = make_service(tmp_path, data)
         svc1 = env1["svc"]
         svc1.run_id = "run-restart"

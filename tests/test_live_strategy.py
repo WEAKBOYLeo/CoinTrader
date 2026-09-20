@@ -6,16 +6,18 @@
 
 from __future__ import annotations
 
-import time
 from decimal import Decimal
 
 from cointrader.live.decisions import DecisionKind, ReasonCode
 from cointrader.live.strategy import HeldPosition
-from conftest import FakeStrategyData, make_rate_series
+from conftest import FakeStrategyData
 from live_helpers import (
     NOW,
+    NOW_MS,
+    LiveFakeData,
     make_context,
     make_live_config,
+    make_live_rates,
     make_quote,
     make_strategy,
 )
@@ -25,7 +27,7 @@ RATE_OK = "0.0005"  # 年化 0.0005*1095 ≈ 0.548 > 0.30
 
 
 def _data() -> FakeStrategyData:
-    return FakeStrategyData({SYMBOL: make_rate_series(20, RATE_OK)})
+    return LiveFakeData({SYMBOL: make_live_rates(20, RATE_OK)})
 
 
 def _open_decision(tmp_path, data: FakeStrategyData, **ctx_kw):
@@ -50,43 +52,43 @@ class TestEntry:
         assert float(decision.trailing_annualized) > 0.30
 
     def test_trailing_below_threshold_skips(self, tmp_path):
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0001")})  # 年化 0.1095
+        data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0001")})  # 年化 0.1095
         decision = _open_decision(tmp_path, data)
         assert decision.decision_kind is DecisionKind.SKIP
         assert decision.reason_code is ReasonCode.TRAILING_RATE_BELOW_THRESHOLD
 
     def test_trailing_at_boundary_passes(self, tmp_path):
         # 0.000274 × 1095 = 0.30003 ≥ 0.30
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.000274")})
+        data = LiveFakeData({SYMBOL: make_live_rates(20, "0.000274")})
         decision = _open_decision(tmp_path, data)
         assert decision.decision_kind is DecisionKind.OPEN
 
     def test_trailing_just_below_boundary_skips(self, tmp_path):
         # 0.0002739 × 1095 = 0.2999157 < 0.30
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0002739")})
+        data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0002739")})
         decision = _open_decision(tmp_path, data)
         assert decision.reason_code is ReasonCode.TRAILING_RATE_BELOW_THRESHOLD
 
     def test_consecutive_positive_too_short(self, tmp_path):
         # 尾部 4 期全正（trailing 达标），但往回数只有 2 个滑动均值为正
-        tail_start = int(time.time() * 1000) - 20 * 8 * 3600 * 1000
+        tail_start = NOW_MS - 30 * 60 * 1000 - 19 * 8 * 3600 * 1000  # 末期结算 = NOW-30min
         values = ["-0.001"] * 16 + [RATE_OK] * 4
         rates = [(tail_start + i * 8 * 3600 * 1000, Decimal(v), Decimal("100"))
                  for i, v in enumerate(values)]
-        data = FakeStrategyData({SYMBOL: rates})
+        data = LiveFakeData({SYMBOL: rates})
         decision = _open_decision(tmp_path, data)
         assert decision.decision_kind is DecisionKind.SKIP
         assert decision.reason_code is ReasonCode.CONSECUTIVE_POSITIVE_TOO_SHORT
         assert decision.consecutive_positive_periods == 2
 
     def test_insufficient_history(self, tmp_path):
-        data = FakeStrategyData({SYMBOL: make_rate_series(3, RATE_OK)})
+        data = LiveFakeData({SYMBOL: make_live_rates(3, RATE_OK)})
         decision = _open_decision(tmp_path, data)
         assert decision.reason_code is ReasonCode.INSUFFICIENT_HISTORY
 
     def test_low_liquidity_skips(self, tmp_path):
-        data = FakeStrategyData(
-            {SYMBOL: make_rate_series(20, RATE_OK)},
+        data = LiveFakeData(
+            {SYMBOL: make_live_rates(20, RATE_OK)},
             volumes={SYMBOL: Decimal("500000")},
         )
         decision = _open_decision(tmp_path, data)
@@ -94,7 +96,7 @@ class TestEntry:
 
     def test_excluded_asset_skips(self, tmp_path):
         cfg = make_live_config(live_symbols=("USDCUSDT",))
-        data = FakeStrategyData({"USDCUSDT": make_rate_series(20, RATE_OK)})
+        data = LiveFakeData({"USDCUSDT": make_live_rates(20, RATE_OK)})
         strat, _ = make_strategy(tmp_path, data, config=cfg)
         strat.refresh_candidates()
         decision = strat.can_open("USDCUSDT", make_context())
@@ -103,7 +105,7 @@ class TestEntry:
     def test_stale_candidate_data_skips(self, tmp_path):
         clock = {"t": NOW}
         cfg = make_live_config()
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, RATE_OK)})
+        data = LiveFakeData({SYMBOL: make_live_rates(20, RATE_OK)})
         strat, _ = make_strategy(tmp_path, data, config=cfg, now_fn=lambda: clock["t"])
         strat.refresh_candidates()
         # 超龄上限 = 结算周期 8h + max_candidate_data_age 30min；超过 9h 才拒绝
@@ -113,7 +115,7 @@ class TestEntry:
 
     def test_candidate_refresh_failure_keeps_old_cache_and_flags_error(self, tmp_path):
         clock = {"t": NOW}
-        data = FakeStrategyData({SYMBOL: make_rate_series(20, RATE_OK)})
+        data = LiveFakeData({SYMBOL: make_live_rates(20, RATE_OK)})
         strat, _ = make_strategy(tmp_path, data, now_fn=lambda: clock["t"])
         strat.refresh_candidates()
         # 刷新失败 → 保留旧缓存但标记 error，本轮拒绝
@@ -126,18 +128,18 @@ class TestEntry:
         strat.data = _Boom({})  # type: ignore[assignment]
         clock["t"] = NOW + 8 * 3600 + 60  # 跨过结算周期 → 触发重刷 → 失败
         strat.refresh_candidates()
-        decision = strat.can_open(SYMBOL, make_context(now_ms=int(clock["t"] * 1000)))
+        decision = strat.can_open(SYMBOL, make_context(now_ms=clock["t"]))
         assert decision.reason_code is ReasonCode.STALE_DATA
         assert "api down" in decision.reason_text
 
     def test_no_future_data_used(self, tmp_path):
         """未来时间戳（未结算）的费率必须被数据源丢弃，不影响决策。"""
-        base = make_rate_series(20, RATE_OK)
+        base = make_live_rates(20, RATE_OK)
         future = [
-            (int(time.time() * 1000) + 8 * 3600 * 1000, Decimal("-0.01"), Decimal("100"))
+            (NOW_MS + 8 * 3600 * 1000, Decimal("-0.01"), Decimal("100"))
         ]
-        data_no_future = FakeStrategyData({SYMBOL: base})
-        data_with_future = FakeStrategyData({SYMBOL: base + future})
+        data_no_future = LiveFakeData({SYMBOL: base})
+        data_with_future = LiveFakeData({SYMBOL: base + future})
         d1 = _open_decision(tmp_path, data_no_future)
         d2 = _open_decision(tmp_path, data_with_future)
         assert d1.decision_kind is DecisionKind.OPEN
@@ -232,7 +234,7 @@ class TestDedup:
     def test_max_positions(self, tmp_path):
         cfg = make_live_config(live_symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
                                selection_overrides={"max_positions": 2})
-        data = FakeStrategyData({s: make_rate_series(20, RATE_OK)
+        data = LiveFakeData({s: make_live_rates(20, RATE_OK)
                                  for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT")})
         strat, _ = make_strategy(tmp_path, data, config=cfg)
         strat.refresh_candidates()

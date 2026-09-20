@@ -66,6 +66,10 @@ class ReasonCode:
     ALREADY_SUBMITTED = "ALREADY_SUBMITTED"
     # 中间态：前置门槛通过，等待 service 获取新鲜报价后由 complete_open 定案
     PENDING_QUOTE = "PENDING_QUOTE"
+    # 缓存缺最新一期结算（刷新滞后窗口内），本轮禁止开仓（防拿旧数据交易）
+    SETTLEMENT_LAG = "SETTLEMENT_LAG"
+    # 收益率排名未进 top N（槽位按 trailing 年化排序分配）
+    RANKED_OUT = "RANKED_OUT"
     # 退出
     NEGATIVE_EXIT_AVG = "NEGATIVE_EXIT_AVG"
     MAX_HOLDING = "MAX_HOLDING"
