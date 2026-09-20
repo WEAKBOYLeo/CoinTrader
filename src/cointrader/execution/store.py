@@ -669,6 +669,33 @@ class StateStore:
             ).fetchall()
         return [r for r in (self.run_session(str(row[0])) for row in rows) if r is not None]
 
+    def online_stats(self, now_ms: int) -> dict[str, Any]:
+        """累计在线统计（跨重启，WebUI 展示用）。
+
+        在线时长 = 各已结束的 run_session 时长之和 + 当前未结束 run 的
+        已运行时长（ended_ms IS NULL 的 RUNNING/RECOVERY 会话计到 now_ms）。
+        INTERRUPTED/STOPPED 会话的 ended_ms 已由停机/接管路径写入，不重复计。
+
+        Returns:
+            {"first_start_ms": 首次启动时间 | None, "total_online_ms": 累计在线毫秒, "run_count": N}
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT started_ms, ended_ms FROM run_sessions ORDER BY started_ms"
+            ).fetchall()
+        total_ms = 0
+        first_start_ms: int | None = None
+        for started_ms, ended_ms in rows:
+            if first_start_ms is None:
+                first_start_ms = int(started_ms)
+            end = int(ended_ms) if ended_ms is not None else now_ms
+            total_ms += max(0, end - int(started_ms))
+        return {
+            "first_start_ms": first_start_ms,
+            "total_online_ms": total_ms,
+            "run_count": len(rows),
+        }
+
     def lease_holders(self) -> list[dict[str, Any]]:
         """当前 service_leases 表内容（只读诊断用）。"""
         with self._lock:

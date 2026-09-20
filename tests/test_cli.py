@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import io
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -416,7 +417,7 @@ class TestSigTermHandler:
 
         from cointrader import cli as cli_mod
 
-        installed: dict[int, object] = {}
+        installed: dict[int, Callable[..., object]] = {}
         monkeypatch.setattr(cli_mod.signal, "signal", lambda sig, handler: installed.setdefault(sig, handler))
         cli_mod._install_sigterm_handler()
         assert _signal.SIGTERM in installed, "必须在 startup 前注册 SIGTERM handler"

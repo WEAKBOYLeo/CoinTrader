@@ -99,7 +99,10 @@ def _seed_round_trip(store: StateStore, *,
             amount=Decimal(funding), source="test", run_id=run_id,
         ) is True
 
-    return store.get_pair("pair-open-1"), store.get_pair("pair-close-1")
+    open_row = store.get_pair("pair-open-1")
+    close_row = store.get_pair("pair-close-1")
+    assert open_row is not None and close_row is not None
+    return open_row, close_row
 
 
 class TestForTrip:

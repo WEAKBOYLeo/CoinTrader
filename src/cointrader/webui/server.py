@@ -132,6 +132,7 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
                 "recovery_reason": runtime.get("recovery_reason", {}).get("value", ""),
                 "run_id": runtime.get("run_id", {}).get("value") or (latest_run or {}).get("run_id"),
                 "run": latest_run,
+                "online": store.online_stats(now_ms),
                 "mode": runtime.get("mode", {}).get("value"),
                 "can_open": runtime.get("can_open", {}).get("value") == "1",
                 "total_capital": runtime.get("total_capital", {}).get("value"),
@@ -220,10 +221,17 @@ def _make_handler(
     class _UiContext:
         __slots__ = ("config", "state_provider", "index_html")
 
-    ctx = _UiContext()
-    ctx.config = config
-    ctx.state_provider = state_provider
-    ctx.index_html = index_html
+        def __init__(
+            self,
+            config: Config,
+            state_provider: Callable[[], dict] | None,
+            index_html: bytes,
+        ) -> None:
+            self.config = config
+            self.state_provider = state_provider
+            self.index_html = index_html
+
+    ctx = _UiContext(config, state_provider, index_html)
 
     class _Handler(BaseHTTPRequestHandler):
         server_version = "CoinTraderWebUI/1.0"

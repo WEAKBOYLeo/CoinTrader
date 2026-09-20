@@ -1309,7 +1309,7 @@ def _stop_live_webui(webui: object | None) -> None:
     if webui is None:
         return
     try:
-        webui.stop()  # type: ignore[union-attr]
+        webui.stop()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
         print(f"  ⚠️ WebUI 停止异常（忽略）: {exc}", file=sys.stderr)
 

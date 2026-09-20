@@ -54,7 +54,7 @@ def env(tmp_path) -> dict[str, Any]:
     store = StateStore(tmp_path / "trading.sqlite3")
     spot = FakeAdapter()
     perp = FakeAdapter()
-    reconciler = Reconciler(store, spot, perp)
+    reconciler = Reconciler(store, spot, perp)  # type: ignore[arg-type]  # 结构化 FakeAdapter
     return {"store": store, "spot": spot, "perp": perp, "reconciler": reconciler}
 
 
@@ -166,7 +166,8 @@ class TestRepair:
         result = env["reconciler"].run()
         assert result.consistent is True, "事件丢失导致的滞后属于修复，不算 mismatch"
         assert any("ct-a" in r for r in result.repaired)
-        assert store.get_order("ct-a")["state"] == "FILLED"
+        row = store.get_order("ct-a")
+        assert row is not None and row["state"] == "FILLED"
 
     def test_local_new_order_absent_on_exchange_marked_canceled(self, env: dict) -> None:
         store: StateStore = env["store"]
@@ -174,7 +175,8 @@ class TestRepair:
         # 交易所查不到该订单 → 明确未接单 → 本地标 CANCELED
         result = env["reconciler"].run()
         assert result.consistent is True
-        assert store.get_order("ct-b")["state"] == "CANCELED"
+        row = store.get_order("ct-b")
+        assert row is not None and row["state"] == "CANCELED"
 
     def test_partial_fill_order_absent_on_exchange_is_mismatch(self, env: dict) -> None:
         store: StateStore = env["store"]

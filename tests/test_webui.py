@@ -61,6 +61,37 @@ def test_build_payload_with_empty_store(webui_config, tmp_path: Path):
     assert payload["pnl"] is None
 
 
+def test_build_payload_online_stats_cumulative(webui_config):
+    """累计在线时长跨重启累加：已结束 run 时长之和 + 当前未结束 run 已运行时长。"""
+    store = StateStore(webui_config.execution.state_db)
+    t0 = 1_000_000_000_000  # 基准毫秒
+    # 第一段 run：在线 60s 后优雅停机
+    store.start_run_session(
+        run_id="run-1", started_ms=t0, mode="testnet", strategy_version="t",
+        config_hash="h", code_revision="r", spot_endpoint="e", futures_endpoint="f",
+        user_stream_mode="poll",
+    )
+    store.end_run_session("run-1", ended_ms=t0 + 60_000, status="STOPPED", stop_reason="graceful_stop")
+    # 第二段 run：未结束（当前在线）
+    store.start_run_session(
+        run_id="run-2", started_ms=t0 + 100_000, mode="testnet", strategy_version="t",
+        config_hash="h", code_revision="r", spot_endpoint="e", futures_endpoint="f",
+        user_stream_mode="poll",
+    )
+    store.close()
+
+    payload = build_payload(webui_config, state_provider=lambda: {})
+    online = payload["status"]["online"]
+    assert online["first_start_ms"] == t0
+    assert online["run_count"] == 2
+    # 60s 已结束 + 第二段从 t0+100s 计到 now（容差 5s：now_ms 取点差异）
+    expected = 60_000 + (payload["now_ms"] - (t0 + 100_000))
+    assert abs(online["total_online_ms"] - expected) <= 5_000
+    # 累计 >= 单段 run 时长（重启不得清零）
+    run = payload["status"]["run"]
+    assert run["run_id"] == "run-2"
+
+
 def test_build_payload_survives_bad_state_provider(webui_config):
     """state_provider 抛异常 → 降级为 {"error": ...}，其余区块不受影响。"""
     def boom() -> dict:

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import httpx
 import pytest
 
@@ -27,7 +29,7 @@ KEY = "test-api-key"
 
 
 def make_client(
-    handler: httpx.MockTransport, **overrides: object
+    handler: Callable[[httpx.Request], httpx.Response], **overrides: object
 ) -> tuple[SignedClient, _RecordingSleep]:
     transport = httpx.MockTransport(handler)
     sleeper = _RecordingSleep()

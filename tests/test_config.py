@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -223,8 +224,9 @@ class TestApiConfigValidation:
         """明文 HTTP 会暴露请求内容（含签名），必须拒绝。"""
         from cointrader.config import ApiConfig
 
+        kwargs: dict[str, Any] = {field: "http://example.com"}
         with pytest.raises(ConfigError, match="必须使用 https"):
-            ApiConfig(**{field: "http://example.com"})
+            ApiConfig(**kwargs)
 
 
 class TestRateLimitConfigValidation:

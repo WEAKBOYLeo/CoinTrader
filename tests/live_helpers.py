@@ -41,12 +41,12 @@ def make_live_config(
     selection_overrides: dict[str, Any] | None = None,
 ) -> Config:
     """默认 8h 周期下的紧凑阈值：回看 4 期、连续 3 期、年化 0.30（≈0.000274/期）。"""
-    entry = dict(min_annualized_rate=0.30, min_consecutive_positive=3,
+    entry: dict[str, Any] = dict(min_annualized_rate=0.30, min_consecutive_positive=3,
                  lookback_periods=4, min_trailing_annualized=0.30)
     entry.update(entry_overrides or {})
-    exit_ = dict(exit_lookback_periods=6, max_holding_periods=10)
+    exit_: dict[str, Any] = dict(exit_lookback_periods=6, max_holding_periods=10)
     exit_.update(exit_overrides or {})
-    selection = dict(max_positions=2, per_position_weight=0.3,
+    selection: dict[str, Any] = dict(max_positions=2, per_position_weight=0.3,
                      min_quote_volume_3d_avg=1_000_000)
     selection.update(selection_overrides or {})
     return Config(
@@ -61,7 +61,7 @@ def make_live_config(
         risk=RiskConfig(),
         api=ApiConfig(),
         logging=LoggingConfig(),
-        execution=ExecutionConfig(live_symbols=list(live_symbols)),
+        execution=ExecutionConfig(live_symbols=tuple(live_symbols)),
     )
 
 
@@ -327,14 +327,14 @@ def make_service(tmp_path: Path, data: FakeStrategyData, *,
     svc = LiveService(
         config=cfg,
         store=store,
-        gate=FakeGate(),
-        executor=executor,
-        reconciler=reconciler,
+        gate=FakeGate(),  # type: ignore[arg-type]  # 结构化 fake，接口一致
+        executor=executor,  # type: ignore[arg-type]
+        reconciler=reconciler,  # type: ignore[arg-type]
         strategy=strategy,
         account_builder=builder,
         now_fn=clock,
-        spot=spot,
-        futures=futures,
+        spot=spot,  # type: ignore[arg-type]
+        futures=futures,  # type: ignore[arg-type]
         quote_fetcher=lambda _sym: make_quote(),
         on_alert=lambda kind, msg: None,
     )

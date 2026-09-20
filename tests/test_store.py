@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from decimal import Decimal
 
 import pytest
@@ -25,7 +26,7 @@ from cointrader.execution.store import LeaseConflict, StateStore
 
 
 @pytest.fixture
-def store(tmp_path) -> StateStore:
+def store(tmp_path) -> Iterator[StateStore]:
     s = StateStore(tmp_path / "trading.sqlite3")
     yield s
     s.close()

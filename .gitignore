@@ -11,6 +11,7 @@ KILL_SWITCH
 # --- 数据与产物 ---
 data/cache/
 data/raw/
+data/live/
 *.sqlite3-shm
 *.sqlite3-wal
 reports/

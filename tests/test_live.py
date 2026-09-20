@@ -22,7 +22,7 @@ from cointrader.live.service import LiveService, ServiceState
 NOW_MS = int(time.time() * 1000)
 
 
-def make_config(**exc_overrides: object) -> Config:
+def make_config(**exc_overrides: Any) -> Config:
     from cointrader.config import (
         ApiConfig,
         BacktestConfig,
@@ -49,7 +49,7 @@ def make_config(**exc_overrides: object) -> Config:
 class TestBuildSignal:
     def test_basic_signal(self) -> None:
         sig = build_signal(
-            "BTCUSDT", spot_price=100, perp_price=100.5, quote_ts_ms=NOW_MS,
+            "BTCUSDT", spot_price=100, perp_price=100.5, quote_ts_ms=NOW_MS, now_ms=NOW_MS,
             requested_notional=50, config=make_config(canary_notional=200),
         )
         assert sig is not None
@@ -59,7 +59,7 @@ class TestBuildSignal:
 
     def test_notional_capped_at_canary(self) -> None:
         sig = build_signal(
-            "BTCUSDT", spot_price=100, perp_price=100, quote_ts_ms=NOW_MS,
+            "BTCUSDT", spot_price=100, perp_price=100, quote_ts_ms=NOW_MS, now_ms=NOW_MS,
             requested_notional=5000, config=make_config(canary_notional=10),
         )
         assert sig is not None
@@ -69,7 +69,7 @@ class TestBuildSignal:
         with pytest.raises(LiveGateBlocked, match="过期"):
             build_signal(
                 "BTCUSDT", spot_price=100, perp_price=100,
-                quote_ts_ms=NOW_MS - 60_000, requested_notional=10,
+                quote_ts_ms=NOW_MS - 60_000, now_ms=NOW_MS, requested_notional=10,
                 config=make_config(),
             )
 
@@ -77,25 +77,25 @@ class TestBuildSignal:
         with pytest.raises(LiveGateBlocked):
             build_signal(
                 "BTCUSDT", spot_price=100, perp_price=100,
-                quote_ts_ms=NOW_MS + 60_000, requested_notional=10,
+                quote_ts_ms=NOW_MS + 60_000, now_ms=NOW_MS, requested_notional=10,
                 config=make_config(),
             )
 
     def test_deep_discount_skipped(self) -> None:
         """深度贴水（perp < spot 超容差）：开空头不利，跳过。"""
         sig = build_signal(
-            "BTCUSDT", spot_price=100, perp_price=98, quote_ts_ms=NOW_MS,
+            "BTCUSDT", spot_price=100, perp_price=98, quote_ts_ms=NOW_MS, now_ms=NOW_MS,
             requested_notional=10, config=make_config(hedge_tolerance_pct=0.005),
         )
         assert sig is None
 
     def test_invalid_inputs(self) -> None:
         cfg = make_config()
-        assert build_signal("BTCDOM", spot_price=100, perp_price=100, quote_ts_ms=NOW_MS,
+        assert build_signal("BTCDOM", spot_price=100, perp_price=100, quote_ts_ms=NOW_MS, now_ms=NOW_MS,
                             requested_notional=10, config=cfg) is None
-        assert build_signal("BTCUSDT", spot_price=0, perp_price=100, quote_ts_ms=NOW_MS,
+        assert build_signal("BTCUSDT", spot_price=0, perp_price=100, quote_ts_ms=NOW_MS, now_ms=NOW_MS,
                             requested_notional=10, config=cfg) is None
-        assert build_signal("BTCUSDT", spot_price=100, perp_price=100, quote_ts_ms=NOW_MS,
+        assert build_signal("BTCUSDT", spot_price=100, perp_price=100, quote_ts_ms=NOW_MS, now_ms=NOW_MS,
                             requested_notional=0, config=cfg) is None
 
 
@@ -208,7 +208,7 @@ class TestStartup:
     def test_happy_path_reaches_running(self, service_env: dict) -> None:
         service: LiveService = service_env["service"]
         s_spot, s_perp = FakeStream("spot"), FakeStream("perp")
-        service.attach_streams([s_spot, s_perp])
+        service.attach_streams([s_spot, s_perp])  # type: ignore[list-item]  # 结构化 fake
         report = service.startup()
         assert service.state is ServiceState.RUNNING
         assert report.reconciliation_consistent is True
@@ -252,7 +252,7 @@ class TestStartup:
             {"clientOrderId": "ct-ghost", "symbol": "BTCUSDT", "origQty": "1", "type": "MARKET"}
         )
         s_spot, s_perp = FakeStream("spot"), FakeStream("perp")
-        service.attach_streams([s_spot, s_perp])
+        service.attach_streams([s_spot, s_perp])  # type: ignore[list-item]  # 结构化 fake
         report = service.startup()
         assert service.state is ServiceState.RECOVERY
         assert report.reconciliation_consistent is False
@@ -263,14 +263,15 @@ class TestStartup:
 class TestRunLoop:
     def _started(self, service_env: dict) -> LiveService:
         service: LiveService = service_env["service"]
-        service.attach_streams([FakeStream("spot"), FakeStream("perp")])
+        service.attach_streams([FakeStream("spot"), FakeStream("perp")])  # type: ignore[list-item]
         service.startup()
         return service
 
     def test_running_executes_signals(self, service_env: dict) -> None:
         service = self._started(service_env)
         sig = build_signal("BTCUSDT", spot_price=100, perp_price=100.1,
-                           quote_ts_ms=NOW_MS, requested_notional=10, config=service.config)
+                           quote_ts_ms=NOW_MS, now_ms=NOW_MS, requested_notional=10, config=service.config)
+        assert sig is not None
         service._signal_provider = lambda: [sig]  # type: ignore[method-assign]  # noqa: SLF001
         result = service.run_once()
         assert result["state"] == "RUNNING"
@@ -282,7 +283,8 @@ class TestRunLoop:
         service.config = make_config(mode="shadow")
         service.mode = "shadow"
         sig = build_signal("BTCUSDT", spot_price=100, perp_price=100.1,
-                           quote_ts_ms=NOW_MS, requested_notional=10, config=service.config)
+                           quote_ts_ms=NOW_MS, now_ms=NOW_MS, requested_notional=10, config=service.config)
+        assert sig is not None
         service._signal_provider = lambda: [sig]  # type: ignore[method-assign]  # noqa: SLF001
         result = service.run_once()
         assert result["state"] == "RUNNING"
@@ -294,7 +296,7 @@ class TestRunLoop:
         """启动前流未新鲜 → 拒绝启动（避免首轮误入不可自动解除的 RECOVERY）。"""
         service: LiveService = service_env["service"]
         s_spot = FakeStream("spot", fresh=False)
-        service.attach_streams([s_spot, FakeStream("perp")])
+        service.attach_streams([s_spot, FakeStream("perp")])  # type: ignore[list-item]
         service.fresh_wait_seconds = 0.2
         with pytest.raises(LiveGateBlocked, match="新鲜"):
             service.startup()
@@ -302,7 +304,7 @@ class TestRunLoop:
     def test_stale_stream_after_startup_enters_recovery(self, service_env: dict) -> None:
         service: LiveService = service_env["service"]
         s_spot = FakeStream("spot")
-        service.attach_streams([s_spot, FakeStream("perp")])
+        service.attach_streams([s_spot, FakeStream("perp")])  # type: ignore[list-item]
         service.fresh_wait_seconds = 0.2
         service.startup()
         s_spot._fresh = False  # noqa: SLF001
@@ -314,7 +316,8 @@ class TestRunLoop:
         service = self._started(service_env)
         service.gate.halt("incident")
         sig = build_signal("BTCUSDT", spot_price=100, perp_price=100.1,
-                           quote_ts_ms=NOW_MS, requested_notional=10, config=service.config)
+                           quote_ts_ms=NOW_MS, now_ms=NOW_MS, requested_notional=10, config=service.config)
+        assert sig is not None
         service._signal_provider = lambda: [sig]  # type: ignore[method-assign]  # noqa: SLF001
         result = service.run_once()
         assert result["state"] == "HALTED"
@@ -332,7 +335,7 @@ class TestRunLoop:
         service = self._started(service_env)
         service_env["executor"].status = "FAILED"
         sig = build_signal("BTCUSDT", spot_price=100, perp_price=100.1,
-                           quote_ts_ms=NOW_MS, requested_notional=10, config=service.config)
+                           quote_ts_ms=NOW_MS, now_ms=NOW_MS, requested_notional=10, config=service.config)
         provider = {"calls": 0}
 
         def once() -> list:
@@ -366,7 +369,7 @@ class TestStop:
     def test_stop_closes_streams_and_releases_lease(self, service_env: dict) -> None:
         service: LiveService = service_env["service"]
         s_spot, s_perp = FakeStream("spot"), FakeStream("perp")
-        service.attach_streams([s_spot, s_perp])
+        service.attach_streams([s_spot, s_perp])  # type: ignore[list-item]  # 结构化 fake
         service.startup()
         service.stop()
         assert s_spot.stopped and s_perp.stopped

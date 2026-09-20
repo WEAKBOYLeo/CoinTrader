@@ -294,6 +294,12 @@ class PollingUserStream:
     - 连续失败超过阈值 → 标记不可信并回调 ``on_untrusted``（上层进入 RECOVERY）；
     - 成交/订单状态由执行器自身订单轮询与周期对账发现，本类无事件语义。
 
+    存活冗余（单线程挂起防线）：轮询跑在独立 worker 线程，另有 monitor
+    线程监视 worker 心跳。worker 卡死（如代理连接黑洞，account() 永不返回）
+    或异常退出 → monitor 弃旧线程、以新代次重建 worker，无需重启进程。
+    被弃的旧线程是 daemon，若日后从挂起中醒来只看到 retire 标记即静默退出，
+    其迟到的失败不得影响新代次状态（所有代次敏感字段均在锁内替换）。
+
     接口与 :class:`UserStream` 保持子集兼容（market/generation/is_fresh/
     start/stop），便于上层无缝切换。
     """
@@ -306,24 +312,34 @@ class PollingUserStream:
         poll_seconds: float = 5.0,
         fresh_seconds: float = 15.0,
         max_consecutive_failures: int = 3,
+        hang_threshold_seconds: float = 120.0,
+        monitor_check_seconds: float = 5.0,
         on_untrusted: Callable[[str], None] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], float] = time.time,
     ) -> None:
         if poll_seconds <= 0 or fresh_seconds < poll_seconds:
             raise ValueError("fresh_seconds 必须 >= poll_seconds > 0")
+        if hang_threshold_seconds <= 0 or monitor_check_seconds <= 0:
+            raise ValueError("hang_threshold_seconds / monitor_check_seconds 必须 > 0")
         self.market = market
         self.adapter = adapter
         self.poll_seconds = poll_seconds
         self.fresh_seconds = fresh_seconds
         self.max_consecutive_failures = max(1, max_consecutive_failures)
+        self.hang_threshold_seconds = hang_threshold_seconds
+        self.monitor_check_seconds = monitor_check_seconds
         self.on_untrusted = on_untrusted
         self._sleep = sleep_fn
         self._now = now_fn
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+        self._retire: threading.Event | None = None
+        self._monitor: threading.Thread | None = None
         self.generation = 0
         self.last_poll_ts: float | None = None
+        self._last_attempt_ts: float | None = None
         self.connected = False
         self.untrusted = False
 
@@ -352,42 +368,96 @@ class PollingUserStream:
     # -- 生命周期 -----------------------------------------------------------
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, name=f"polling-stream-{self.market}", daemon=True
-        )
-        self._thread.start()
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._stop.clear()
+            self._start_worker_locked("start")
+            if self._monitor is None or not self._monitor.is_alive():
+                self._monitor = threading.Thread(
+                    target=self._monitor_loop, name=f"poll-monitor-{self.market}", daemon=True
+                )
+                self._monitor.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
+        with self._lock:
+            retire, self._retire = self._retire, None
+            worker, self._worker = self._worker, None
+        if retire is not None:
+            retire.set()
+        if worker is not None:
+            worker.join(timeout=5)
+        if self._monitor is not None:
+            self._monitor.join(timeout=5)
+            self._monitor = None
         self.connected = False
+
+    # -- worker / monitor（挂起自愈） ---------------------------------------
+
+    def _start_worker_locked(self, reason: str) -> None:
+        """（持锁）弃旧 worker、以新代次重建。被弃线程无法强杀，靠 retire
+        标记使其醒来后静默退出；其迟到写入因 last_poll_ts 代次校验被忽略。"""
+        old_retire, self._retire = self._retire, threading.Event()
+        if old_retire is not None:
+            old_retire.set()
+        self.generation += 1
+        self._last_attempt_ts = self._now()
+        self._worker = threading.Thread(
+            target=self._run, name=f"polling-stream-{self.market}-gen{self.generation}", daemon=True
+        )
+        self._worker.start()
+        if reason != "start":
+            logger.warning("【轮询流 worker 重建】%s 代次=%d 原因=%s", self.market, self.generation, reason)
+
+    def _monitor_loop(self) -> None:
+        """监视 worker 存活：卡死（心跳超阈值）或意外退出 → 重建代次。"""
+        while not self._stop.wait(self.monitor_check_seconds):
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                worker = self._worker
+                if worker is None:
+                    self._start_worker_locked("worker 缺失")
+                    continue
+                if not worker.is_alive():
+                    self._start_worker_locked("worker 意外退出")
+                    continue
+                attempt = self._last_attempt_ts
+                if attempt is not None and self._now() - attempt > self.hang_threshold_seconds:
+                    self._start_worker_locked(
+                        f"worker 挂起（{self._now() - attempt:.0f}s 无轮询心跳，"
+                        f"阈值 {self.hang_threshold_seconds:.0f}s）"
+                    )
 
     # -- 主循环 -------------------------------------------------------------
 
     def _run(self) -> None:
-        self.generation = 1
+        # 闭包捕获本代次的 retire 事件：旧代次线程被弃后醒来只认自己的标记。
+        # 代次内的失败计数也是线程局部，旧线程迟到的失败不得重置新代次。
+        retire = self._retire
+        my_generation = self.generation
         failures = 0
-        while not self._stop.is_set():
+        while not self._stop.is_set() and (retire is None or not retire.is_set()):
+            self._last_attempt_ts = self._now()
             try:
                 # 账户快照查询（现货/合约均有 account()）：成功 = 状态可观测
                 self.adapter.account()
-                failures = 0
-                self.last_poll_ts = self._now()
-                self.connected = True
-                if self.untrusted:
-                    # 恢复可观测后解除不可信标记（上层 RECOVERY 解除仍按其自身规则）
-                    logger.warning("【轮询流恢复】%s", self.market)
-                    self.untrusted = False
             except Exception as exc:  # noqa: BLE001
                 failures += 1
                 if failures >= self.max_consecutive_failures:
                     self.connected = False
                     self._mark_untrusted(f"连续 {failures} 次轮询失败: {exc}")
-            if self._stop.is_set():
+            else:
+                failures = 0
+                # 代次校验：被弃旧线程的迟到成功不得污染新代次的新鲜度
+                if self.generation == my_generation:
+                    self.last_poll_ts = self._now()
+                self.connected = True
+                if self.untrusted:
+                    # 恢复可观测后解除不可信标记（上层 RECOVERY 解除仍按其自身规则）
+                    logger.warning("【轮询流恢复】%s", self.market)
+                    self.untrusted = False
+            if self._stop.is_set() or (retire is not None and retire.is_set()):
                 break
             self._sleep(self.poll_seconds)

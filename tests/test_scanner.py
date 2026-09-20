@@ -145,8 +145,7 @@ def make_handler(
 
         if path == "/fapi/v1/klines":
             symbol = params.get("symbol")
-            cfg = symbols.get(symbol)
-            if cfg is None:
+            if symbol is None or (cfg := symbols.get(symbol)) is None:
                 return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
             interval_ms = 4 * 3_600_000
             bar_volume = float(cfg.get("volume", 0.0)) / 6.0
@@ -172,8 +171,7 @@ def make_handler(
 
         if path == "/fapi/v1/fundingRate":
             symbol = params.get("symbol")
-            cfg = symbols.get(symbol)
-            if cfg is None:
+            if symbol is None or (cfg := symbols.get(symbol)) is None:
                 return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
             limit = int(params.get("limit", 1000))
             records = _funding_records(

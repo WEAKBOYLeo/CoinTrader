@@ -424,6 +424,8 @@ function render(d) {
     ? svc.account.total_capital
     : st.total_capital;
   const runDur = (st.run && st.run.started_ms) ? d.now_ms - Number(st.run.started_ms) : null;
+  const online = st.online || {};
+  const totalOnline = (typeof online.total_online_ms === "number") ? online.total_online_ms : runDur;
   const runId = svc.run_id || st.run_id || "-";
   $("cards").innerHTML = [
     card("服务状态", esc(state), state === "RUNNING" ? "good" : (state === "STARTING" ? "warn" : "bad")),
@@ -433,7 +435,7 @@ function render(d) {
       fmtAge(recon.ts_ms ? d.now_ms - Number(recon.ts_ms) : null) + " 前"),
     card("总资金 USDT", num(capital), "info"),
     card("账户快照", fmtAge(acctAge)),
-    card("Run 时长", fmtAge(runDur)),
+    card("累计在线", fmtAge(totalOnline), "info", "Run 时长 " + (fmtAge(runDur) || "—")),
     card("持仓数", String((d.positions || []).filter(p => !p.error).length)),
   ].join("");
 

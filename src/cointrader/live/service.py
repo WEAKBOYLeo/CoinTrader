@@ -215,7 +215,7 @@ class LiveService:
                  "opened_ms": h.opened_ms or None}
                 for h in self._held.values()
             ),
-            key=lambda r: r["symbol"],
+            key=lambda r: str(r["symbol"]),
         )
         streams: list[dict[str, Any]] = []
         for s in self.streams:
@@ -635,15 +635,40 @@ class LiveService:
             logger.warning("【闸门恢复】回到 RUNNING")
 
         # 用户流新鲜度（§3.4：断线/过期 = 状态不可信）
-        for stream in self.streams:
-            if not stream.is_fresh:
-                self.enter_recovery(f"用户流 {stream.market} 不新鲜/不可信（代次 {stream.generation}）")
+        now_ms = int(self._now() * 1000)
+        stale = [s for s in self.streams if not s.is_fresh]
+        if stale:
+            detail = ", ".join(f"{s.market}（代次 {s.generation}）" for s in stale)
+            self.enter_recovery(f"用户流不新鲜/不可信: {detail}")
+            return {"state": "RECOVERY", "reason": self._recovery_reason}
+
+        # RECOVERY 自动解除（长跑自愈）：全部用户流恢复新鲜后做一次恢复对账，
+        # 通过且风控闸门 NORMAL → 回 RUNNING，无需重启进程。
+        # 对账按周期节流，避免 RECOVERY 期间每个 tick 全量对账。
+        if self._state is ServiceState.RECOVERY:
+            interval_ms = int(self.config.execution.reconciliation_interval_seconds * 1000)
+            if now_ms - self._last_reconcile_ms < interval_ms:
                 return {"state": "RECOVERY", "reason": self._recovery_reason}
+            result = self.reconciler.run(reason="recovery_check")
+            self._last_reconcile_ms = now_ms
+            if not (result.can_open and self.gate.state is HaltState.NORMAL):
+                self._recovery_reason = (
+                    f"流恢复后对账/闸门未通过: {list(result.mismatches)}"
+                    if not result.can_open
+                    else f"风控闸门未恢复: {self.gate.state.value}"
+                )
+                self._persist_runtime_state()
+                return {"state": "RECOVERY", "reason": self._recovery_reason}
+            self._reconcile_ok = True
+            self._recovery_reason = ""
+            self._state = ServiceState.RUNNING
+            self._refresh_held()
+            self._persist_runtime_state()
+            logger.warning("【RECOVERY 解除】用户流全部新鲜 + 对账通过 + 闸门 NORMAL，回到 RUNNING")
 
         if self._state is not ServiceState.RUNNING:
             return {"state": "RECOVERY", "reason": self._recovery_reason}
 
-        now_ms = int(self._now() * 1000)
         opened: list[str] = []
         skipped: list[str] = []
         closed: list[str] = []
@@ -848,21 +873,32 @@ class LiveService:
         """
         max_errors = self.config.execution.max_consecutive_tick_errors
         consecutive_errors = 0
-        while not (stop_check and stop_check()):
-            try:
-                self.run_once()
-            except Exception as exc:  # noqa: BLE001 tick 级容错是长跑设计：瞬时故障（网络抖动/瞬时 DB 错误）不得崩溃进程；KeyboardInterrupt 等 BaseException 不被捕获
-                consecutive_errors += 1
-                logger.error("【主循环 tick 异常】连续 %d/%d: %s", consecutive_errors, max_errors, exc)
-                self.enter_recovery(f"主循环 tick 异常: {exc}")
-                if consecutive_errors >= max_errors:
-                    self._on_alert("TICK_LOOP_FAILURE",
-                                   f"连续 {consecutive_errors} 轮 tick 异常，优雅停机等待守护进程重启")
-                    self.stop()
-                    return False
-            else:
-                consecutive_errors = 0
-            time.sleep(tick_seconds)
+        from .watchdog import LoopWatchdog
+
+        watchdog = LoopWatchdog(
+            timeout_seconds=self.config.execution.watchdog_timeout_seconds,
+        )
+        watchdog.start()
+        try:
+            while not (stop_check and stop_check()):
+                # 心跳在轮首打点：单轮正常耗时（对账/候选刷新）不触发误杀
+                watchdog.beat()
+                try:
+                    self.run_once()
+                except Exception as exc:  # noqa: BLE001 tick 级容错是长跑设计：瞬时故障（网络抖动/瞬时 DB 错误）不得崩溃进程；KeyboardInterrupt 等 BaseException 不被捕获
+                    consecutive_errors += 1
+                    logger.error("【主循环 tick 异常】连续 %d/%d: %s", consecutive_errors, max_errors, exc)
+                    self.enter_recovery(f"主循环 tick 异常: {exc}")
+                    if consecutive_errors >= max_errors:
+                        self._on_alert("TICK_LOOP_FAILURE",
+                                       f"连续 {consecutive_errors} 轮 tick 异常，优雅停机等待守护进程重启")
+                        self.stop()
+                        return False
+                else:
+                    consecutive_errors = 0
+                time.sleep(tick_seconds)
+        finally:
+            watchdog.stop()
         return True
 
     # -- 停机 --------------------------------------------------------------

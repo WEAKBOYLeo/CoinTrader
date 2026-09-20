@@ -684,7 +684,7 @@ class TestEdgeCases:
 
         # 尾部期数必须被结算（不能被 break 掉）
         # 最后一期若仍持仓，应有 end_of_data 记录
-        total_accrued = result.trades and sum(t.holding_periods for t in result.trades)
+        total_accrued = sum(t.holding_periods for t in result.trades)
         assert total_accrued > 0
 
 

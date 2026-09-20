@@ -93,7 +93,8 @@ src/cointrader/
   research/    纯计算：成本模型、绩效指标
   backtest/    确定性回测引擎 + 破产情景分析
   execution/   签名 REST、订单状态机、双腿执行、对账（默认禁用）
-  live/        实盘编排：启动预检、主循环、信号→意图（上层）
+  live/        实盘编排：启动预检、主循环、信号→意图（上层）、主循环看门狗
+  webui/       只读实时仪表盘（独立守护线程，/api/state + /healthz）
   reporting/   报告导出
 tests/         含安全静态扫描与前瞻偏差证伪
 ```
@@ -135,7 +136,15 @@ uv run cointrader live report    # 只读：导出完整报告数据包
 
 `live run` 支持服务器长期不间断运行：主循环单轮异常只进 RECOVERY 不崩溃；
 进程被 kill -9 / 关机 / 断电后重新拉起即从上次状态继续（SQLite 事件账本 + 交易所对账恢复，
-旧会话自动标 `INTERRUPTED`，历史数据零丢失）。
+旧会话自动标 `INTERRUPTED`，历史数据零丢失）。另有两道挂死兜底：
+
+- **主循环看门狗**（`live/watchdog.py`）：独立线程监视 tick 心跳，
+  超过 `execution.watchdog_timeout_seconds`（默认 300s，须覆盖最慢正常单轮）无心跳 = 主线程
+  挂死（代理黑洞/锁等待等）→ 以非 0 码终止进程，systemd `Restart=always` 拉起后从账本恢复；
+  正常 `stop()` 先停看门狗，不影响优雅退出。
+- **poll 流 worker 自愈**：`user_stream_mode: poll` 下轮询 worker 另有 monitor 线程监视，
+  worker 挂起（`hang_threshold_seconds`，默认 120s）或意外退出 → 弃旧线程、以新代次重建，
+  旧代次迟到的失败/写入被代次校验忽略，无需重启进程。
 
 ```bash
 # systemd 守护（root；用户级 unit 加 --user）
@@ -169,7 +178,7 @@ uv run cointrader live pnl --all-runs  # 跨所有 run 的 PnL 汇总
 ⚠️ 页面展示交易数据（不含 API 密钥）；生产环境请仅在可信网络内暴露，
 或用 SSH 隧道/反代加认证。
 
-⚠️ 当前处于 **M4（Demo Trading 端到端 7 天长跑）** 阶段（见 docs/开发日志.md）。
+⚠️ 当前处于 **M4（Demo Trading 端到端 7 天长跑）** 阶段（阶段定义见 docs/开发设计文档.md §12）。
 M4 与 M6（主网 canary）尚未通过，`live run` 目前只应在 demo 环境使用；
 主网启动必须走完开发设计文档 §13 清单，在此之前主网放量（M7）一律禁止。
 

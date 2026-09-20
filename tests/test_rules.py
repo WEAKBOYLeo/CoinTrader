@@ -51,7 +51,7 @@ class TestFormatDecimal:
             (2, "2"),
         ],
     )
-    def test_no_scientific_notation(self, value: object, expected: str) -> None:
+    def test_no_scientific_notation(self, value: Decimal | str | int, expected: str) -> None:
         text = format_decimal(value)
         assert text == expected
         assert "e" not in text.lower(), "交易所参数禁止科学计数法"

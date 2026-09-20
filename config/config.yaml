@@ -183,6 +183,8 @@ execution:
                                   # demo/主网均适用；低于此值会触发 -4164 拒单
   # 主循环连续 tick 异常阈值：达到后优雅停机（退出码 1），由 systemd Restart=always 拉起
   max_consecutive_tick_errors: 10
+  # 主循环看门狗心跳超时（秒）：心跳超时 = 主线程挂死 → 非 0 退出，systemd 拉起
+  watchdog_timeout_seconds: 300
   # WebUI 实时仪表盘：随 live run 启动，只读、独立线程、故障不影响主循环
   # 浏览器访问 http://<本机IP>:8888/
   webui_enabled: true

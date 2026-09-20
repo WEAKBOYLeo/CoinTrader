@@ -516,7 +516,7 @@ class TestDoubleLegExecution:
             state=RiskState(total_capital=10000.0),
         )
 
-        assert not legs.perp.ok
+        assert legs.perp is not None and not legs.perp.ok
         assert legs.spot is None, "永续腿失败后不应再下现货腿"
         assert not legs.is_naked
         assert len(exchange.orders) == 1, f"应只尝试了永续腿，实际: {exchange.orders}"
@@ -544,7 +544,7 @@ class TestDoubleLegExecution:
             state=RiskState(total_capital=10000.0),
         )
 
-        assert legs.perp.ok and not legs.spot.ok
+        assert legs.perp is not None and legs.spot is not None and legs.perp.ok and not legs.spot.ok
         assert legs.is_naked, "只有一腿成交时必须被识别为裸头寸"
         assert "裸头寸" in legs.describe()
 

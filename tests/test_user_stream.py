@@ -107,13 +107,18 @@ class TestEventDelivery:
         ws = FakeWS([_msg("executionReport", 100)])
         urls: list[str] = []
         received: list = []
+
+        def _connect(_url: str):
+            urls.append(_url)
+            return ws
+
         stream = UserStream(
             market="perp",
             adapter=adapter,
             ws_base="wss://example",
             on_event=received.append,
             staleness_seconds=3600,
-            connect_factory=lambda url: (urls.append(url), ws)[1],
+            connect_factory=_connect,
         )
         stream.start()
         try:
@@ -239,7 +244,7 @@ class TestReconnect:
 
     def test_stop_terminates_thread_and_closes_listen_key(self, adapter: FakeAdapter) -> None:
         # 消息永不断：stop 后线程必须退出、listenKey 被关闭
-        messages = [_msg("executionReport", 100 + i) for i in range(200)]
+        messages: list[str | Exception] = [_msg("executionReport", 100 + i) for i in range(200)]
         stream = UserStream(
             market="spot",
             adapter=adapter,
@@ -350,3 +355,65 @@ class TestPollingUserStream:
 
         with _pytest.raises(ValueError):
             PollingUserStream(market="spot", adapter=object(), poll_seconds=5.0, fresh_seconds=1.0)
+
+    def test_hung_worker_replaced_by_monitor(self) -> None:
+        """worker 卡死在 account()（代理连接黑洞）→ monitor 弃旧重建，
+        解除后新代次轮询成功 → 恢复新鲜，无需重启进程。"""
+        import threading
+
+        from cointrader.execution.user_stream import PollingUserStream
+
+        release = threading.Event()
+
+        class HangingAdapter:
+            def account(self) -> dict:
+                release.wait(timeout=30)  # 模拟永不返回的连接
+                return {"ok": True}
+
+        stream = PollingUserStream(
+            market="perp", adapter=HangingAdapter(),
+            poll_seconds=0.05, fresh_seconds=0.2,
+            hang_threshold_seconds=0.3, monitor_check_seconds=0.05,
+            sleep_fn=time.sleep, now_fn=time.time,
+        )
+        stream.start()
+        try:
+            # monitor 检测到心跳超时 → 代次递增（worker 被替换）
+            _wait_until(lambda: stream.generation >= 2, timeout=10.0)
+            assert stream.generation >= 2, "挂起 worker 必须被 monitor 替换"
+            # 解除挂起 → 当前代次轮询成功 → 新鲜
+            release.set()
+            _wait_until(lambda: stream.is_fresh, timeout=10.0)
+            assert stream.is_fresh
+        finally:
+            release.set()
+            stream.stop()
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_dead_worker_restarted_by_monitor(self) -> None:
+        """worker 线程意外死亡（BaseException 泄漏）→ monitor 重建，服务不冻结。"""
+        from cointrader.execution.user_stream import PollingUserStream
+
+        class SuicidalAdapter:
+            calls = 0
+
+            def account(self) -> dict:
+                SuicidalAdapter.calls += 1
+                if SuicidalAdapter.calls == 1:
+                    raise SystemExit(9)  # except Exception 捕不到 → 线程死亡
+                return {"ok": True}
+
+        stream = PollingUserStream(
+            market="spot", adapter=SuicidalAdapter(),
+            poll_seconds=0.05, fresh_seconds=0.2,
+            hang_threshold_seconds=30.0, monitor_check_seconds=0.05,
+            sleep_fn=time.sleep, now_fn=time.time,
+        )
+        stream.start()
+        try:
+            # 第一次调用杀死 worker → monitor 发现线程不存活 → 新代次
+            _wait_until(lambda: stream.generation >= 2 and stream.is_fresh, timeout=10.0)
+            assert stream.generation >= 2
+            assert stream.is_fresh, "重建后的 worker 必须恢复轮询"
+        finally:
+            stream.stop()

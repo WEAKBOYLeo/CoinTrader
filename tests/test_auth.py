@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from typing import Any
 
 import pytest
 
@@ -51,7 +52,7 @@ class TestCanonicalPayload:
         assert canonical_payload(params) == "b=2&a=1&c=3", "参数顺序必须保持插入顺序"
 
     def test_values_coerced_to_str(self) -> None:
-        params = {"q": 10, "p": 1.5}
+        params: dict[str, Any] = {"q": 10, "p": 1.5}
         assert canonical_payload(params) == "q=10&p=1.5"
 
     def test_url_encodes_special_chars(self) -> None:

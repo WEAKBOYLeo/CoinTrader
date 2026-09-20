@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -210,7 +211,7 @@ class TestTimeResync:
 
         # _now 返回秒（calibrate 内部 ×1000）；true offset = 100ms
         samples_now = iter([0.0, 0.3, 1.0, 1.1, 2.0, 2.05])
-        servers = iter([250, 1200, 2125])
+        servers: Iterator[int] = iter([250, 1200, 2125])
 
         class _FakeSpot(SpotAdapter):
             def server_time_ms(self) -> int:

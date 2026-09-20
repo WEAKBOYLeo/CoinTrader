@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -52,7 +53,7 @@ class FakeExchange:
         self.market_name = market
         self._rule = make_rule(market)
         self._counter = 0
-        self.place_results: list[Order | Exception] = []
+        self.place_results: list[Order | Exception | Callable[[OrderRequest], Order]] = []
         self.query_results: dict[str, Order | None] = {}
         self.place_calls: list[OrderRequest] = []
         self.query_calls: list[str] = []
@@ -162,8 +163,8 @@ def env(tmp_path) -> dict[str, Any]:
     gate = RiskGate(_make_risk_manager())
     alerts: list[tuple[str, str]] = []
     executor = PairExecutor(
-        spot=spot,
-        futures=perp,
+        spot=spot,  # type: ignore[arg-type]  # 结构化 FakeExchange
+        futures=perp,  # type: ignore[arg-type]
         store=store,
         gate=gate,
         on_alert=lambda kind, msg: alerts.append((kind, msg)),
@@ -307,7 +308,7 @@ class TestOpenPair:
             original_query(symbol, cid)
             return order
 
-        perp.query_by_client_order_id = dynamic_query  # type: ignore[method-assign]
+        perp.query_by_client_order_id = dynamic_query  # type: ignore[method-assign, assignment]
         pair = executor.open_pair("BTCUSDT", Decimal("100"), state=risk_state, **open_kwargs(int(time.time() * 1000)))
         assert pair.status == "COMPLETE", f"查询确认成交后应继续完成，实际 {pair.status}: {pair.error}"
         perp_cids = [r.client_order_id for r in perp.place_calls if r.side is OrderSide.SELL]

@@ -805,7 +805,7 @@ class TestPagination:
             params = dict(request.url.params)
             start = int(params.get("startTime", 0))
             limit = int(params.get("limit", 1000))
-            all_records = [
+            all_records: list[dict[str, str | int]] = [
                 {
                     "symbol": "BTCUSDT",
                     "fundingTime": base_time + i * step,
@@ -814,7 +814,7 @@ class TestPagination:
                 }
                 for i in range(total)
             ]
-            window = [r for r in all_records if r["fundingTime"] >= start][:limit]
+            window = [r for r in all_records if int(r["fundingTime"]) >= start][:limit]
             return httpx.Response(200, json=window)
 
         data_config = DataConfig(cache_dir=tmp_cache_dir)
@@ -862,12 +862,12 @@ class TestPagination:
             params = dict(request.url.params)
             start = int(params.get("startTime", 0))
             # 只有三条数据，起始时间分别是 1000/2000/3000
-            all_records = [
+            all_records: list[dict[str, str | int]] = [
                 {"symbol": "X", "fundingTime": t, "fundingRate": "0.0001", "markPrice": "1"}
                 for t in (1000, 2000, 3000)
             ]
             limit = int(params.get("limit", 1000))
-            window = [r for r in all_records if r["fundingTime"] >= start][:limit]
+            window = [r for r in all_records if int(r["fundingTime"]) >= start][:limit]
             return httpx.Response(200, json=window)
 
         data_config = DataConfig(cache_dir=tmp_cache_dir)
@@ -891,14 +891,14 @@ class TestPagination:
             params = dict(request.url.params)
             start = int(params.get("startTime", 0))
             limit = int(params.get("limit", 1500))
-            all_candles = [
+            all_candles: list[list[str | int]] = [
                 [
                     base_time + i * step, "100", "110", "90", "105", "1000",
                     base_time + i * step + step - 1, "100000", 10, "500", "50000", "0",
                 ]
                 for i in range(total)
             ]
-            window = [c for c in all_candles if c[0] >= start][:limit]
+            window = [c for c in all_candles if int(c[0]) >= start][:limit]
             return httpx.Response(200, json=window)
 
         data_config = DataConfig(cache_dir=tmp_cache_dir)

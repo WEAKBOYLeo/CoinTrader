@@ -100,7 +100,7 @@ class TestTickFaultTolerance:
     def test_normal_stop_returns_true(self, tmp_path):
         env = _env(tmp_path)
         svc = env["svc"]
-        ticks = {"n": 0}
+        ticks: dict[str, int] = {"n": 0}
 
         def stop_check() -> bool:
             ticks["n"] += 1
@@ -165,6 +165,65 @@ class TestLeaseLifetime:
 
 class TestRestartRecovery:
     """AC-03：kill -9 / 断电后重启 —— 中断会话标记 + 持仓恢复。"""
+
+
+class _FakeStream:
+    """最小用户流替身：新鲜度可控。"""
+
+    def __init__(self, market: str, fresh: bool = True) -> None:
+        self.market = market
+        self.generation = 1
+        self.fresh = fresh
+
+    @property
+    def is_fresh(self) -> bool:
+        return self.fresh
+
+
+class TestRecoveryAutoClear:
+    """RECOVERY 自动解除（长跑自愈）：流恢复新鲜 + 对账通过 → 回 RUNNING。"""
+
+    def test_streams_stale_keeps_recovery(self, tmp_path):
+        env = _env(tmp_path)
+        svc = env["svc"]
+        svc._now = lambda: NOW  # noqa: SLF001
+        svc.attach_streams([_FakeStream("spot", fresh=False), _FakeStream("perp", fresh=True)])
+        r = svc.run_once()
+        assert r["state"] == "RECOVERY"
+        assert svc.state is ServiceState.RECOVERY
+
+    def test_streams_fresh_and_recon_ok_clears_recovery(self, tmp_path):
+        env = _env(tmp_path)
+        svc = env["svc"]
+        svc._now = lambda: NOW  # noqa: SLF001
+        svc.attach_streams([_FakeStream("spot"), _FakeStream("perp")])
+        svc._state = ServiceState.RECOVERY  # noqa: SLF001
+        svc._recovery_reason = "用户流不新鲜（测试）"  # noqa: SLF001
+        svc._last_reconcile_ms = 0  # noqa: SLF001 强制触发 recovery_check
+
+        r = svc.run_once()
+        assert r["state"] == "RUNNING", f"流新鲜+对账通过应回 RUNNING: {r}"
+        assert svc.state is ServiceState.RUNNING
+        assert svc._reconcile_ok is True  # noqa: SLF001
+        assert "recovery_check" in env["reconciler"].calls  # noqa: SLF001
+
+    def test_streams_fresh_but_recon_fails_keeps_recovery(self, tmp_path):
+        env = _env(tmp_path)
+        svc = env["svc"]
+        svc._now = lambda: NOW  # noqa: SLF001
+        svc.attach_streams([_FakeStream("spot"), _FakeStream("perp")])
+        svc._state = ServiceState.RECOVERY  # noqa: SLF001
+        svc._recovery_reason = "用户流不新鲜（测试）"  # noqa: SLF001
+        svc._last_reconcile_ms = 0  # noqa: SLF001
+
+        from cointrader.execution.models import ReconciliationResult
+        env["reconciler"].run = lambda *, reason="periodic": ReconciliationResult(  # type: ignore[method-assign]
+            ts_ms=int(NOW * 1000), consistent=False, can_open=False,
+            mismatches=("BTCUSDT: Spot 余额不一致",), repaired=(),
+        )
+        r = svc.run_once()
+        assert r["state"] == "RECOVERY"
+        assert svc.state is ServiceState.RECOVERY
 
     def test_startup_marks_interrupted_and_restores_held(self, tmp_path):
         data = FakeStrategyData({SYMBOL: make_rate_series(20, "0.0005")})

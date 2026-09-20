@@ -327,6 +327,10 @@ class ExecutionConfig:
     time_resync_seconds: float = 300.0
     # 主循环连续 tick 异常阈值：达到后优雅停机并退出码 1，交给 systemd Restart 拉起。
     max_consecutive_tick_errors: int = 10
+    # 主循环看门狗心跳超时（秒）：tick 心跳超时未更新 = 主线程挂死，
+    # 看门狗以非 0 码终止进程，systemd Restart=always 拉起后从账本恢复。
+    # 必须大于正常单轮最坏耗时（对账/候选刷新/权重休眠），默认 300s。
+    watchdog_timeout_seconds: float = 300.0
     # WebUI 实时仪表盘（live run 进程内独立守护线程；只读，故障与主循环隔离）
     webui_enabled: bool = True
     webui_host: str = "0.0.0.0"  # noqa: S104 —— 需局域网/tailscale 访问，见 config.yaml 注释
@@ -372,6 +376,7 @@ class ExecutionConfig:
             ("max_candidate_data_age_seconds", self.max_candidate_data_age_seconds),
             ("snapshot_interval_seconds", self.snapshot_interval_seconds),
             ("time_resync_seconds", self.time_resync_seconds),
+            ("watchdog_timeout_seconds", self.watchdog_timeout_seconds),
         ):
             if value <= 0:
                 raise ConfigError(f"execution.{name} 必须为正，当前 {value}")
@@ -522,6 +527,7 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         max_candidate_data_age_seconds=float(sec.get("max_candidate_data_age_seconds", 1800.0)),
         snapshot_interval_seconds=int(sec.get("snapshot_interval_seconds", 30)),
         max_consecutive_tick_errors=int(sec.get("max_consecutive_tick_errors", 10)),
+        watchdog_timeout_seconds=float(sec.get("watchdog_timeout_seconds", 300.0)),
         webui_enabled=bool(sec.get("webui_enabled", True)),
         webui_host=str(sec.get("webui_host", "0.0.0.0")),  # noqa: S104
         webui_port=int(sec.get("webui_port", 8888)),
