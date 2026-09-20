@@ -152,12 +152,38 @@ t1:  卖出现货 + 平掉永续 → 回收本金 ± 基差损益 - 交易成本
    418 意味着已经违反限流，继续请求会延长封禁
 5. 收到 **5xx** → 指数退避重试，最多 5 次
 
+**共享限流协调器（`rate_limit.py::RateLimitCoordinator`，v2 起强制）**：同一进程内
+全部 Spot/Futures 请求（公开行情、候选扫描、账户/恢复查询、下单）共享一个
+协调器，按 scope（spot 6000/min、futures 2400/min）记权重，不按模块各算各的。
+请求分优先级：P0 下单/平仓（关键保留预算）、P1 账户/恢复/对账、
+P2 普通私有、P3 公开行情/候选扫描。软限（默认 80%）以上按优先级排队等待，
+429 → 该 scope 冻结（尊重 Retry-After，冻结中 P0 之外全部等待），
+418 → 单请求后全 scope ban（立即停手）。协调器快照（used/in-flight/frozen/bans）
+供 Web「数据状态」区与日志诊断，不暴露 URL/密钥。
+
 ### 3.3 缓存策略
 
 - 历史数据**不可变**：资金费历史、已收盘 K 线 → 永久缓存
 - 实时快照**易变**：premiumIndex、盘口 → 带 TTL 的短期缓存（默认 5s）
 - 所有缓存写入使用**原子写**（写临时文件 → `os.replace`），防止进程中断留下半个文件
 - 缓存文件名包含参数哈希，避免不同参数互相覆盖
+
+### 3.4 状态账本 v2：current projection 与 authority（v2 起）
+
+账本从“事件历史”升级为“事件历史 + 可信当前投影”：
+
+- **current projection**：`current_account` / `current_positions` 单行投影，只在
+  同一次交易所 capture（账户+仓位+开放订单，single-flight 复用）完整后才更新；
+  不完整/接口失败 → UNKNOWN/STALE，禁止用旧值或默认值放行开仓；消失持仓写
+  qty=0 tombstone（不删行，审计可见）。
+- **facts 回补**：fills（`/myTrades`/`/userTrades`）与 funding income
+  （`/fapi/income`）按游标分页回补，「整页 facts + 游标推进」单事务，
+  幂等由 `(market, exchange_trade_id)` / `(market, exchange_income_id)` 唯一键保证；
+  kill -9 后重启从游标续跑，重复回补零新增。
+- **authority**：资金费分 AUTHORITATIVE（交易所事实）与 ESTIMATED（本地估算），
+  PnL 只计 authoritative，estimated 单独展示（见开发文档 §8.4）。
+- **在线/中断时长**：heartbeat 截断 + 区间合并，停机不计在线、重启不清零
+  （见开发文档 §8.1 v2 口径）。
 
 ---
 

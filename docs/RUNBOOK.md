@@ -250,6 +250,90 @@ cointrader live status       # 当前 run 已恢复；锁由新实例持有
 若想用绝对路径（任意目录都可触发），在 `.env` 里设 `COINTRADER_KILL_SWITCH_FILE` 为绝对路径。
 急停后恢复仍需重新预检+对账（RECOVERY 不自动解除）。
 
+#### 2.6.5 限流 / 429 / 418 如何看与处置（v2）
+
+- **看限流**：Web「数据状态」区有限流行（每 scope `used / limit`、in-flight、
+  frozen/banned 标签）；或日志里的限流器告警。所有 Spot/Futures 请求（行情、
+  候选、账户、下单）共享同一协调器，按 P0 下单 > P1 恢复/对账 > P2 私有 >
+  P3 行情/候选 排队。
+- **429**：该 scope 自动冻结（尊重 Retry-After），冻结中低优先级请求等待、
+  P0 保留预算；冻结解除后自动继续，无需人工干预。持续频繁冻结 → 检查是否
+  有扫描/回补风暴，必要时调低 `data.rate_limit.*` 或候选池大小。
+- **418**：立即全 scope 停止（单请求后 ban），见 §5.2；不要并发多实例打同一
+  IP，共享代理出口也会累计 IP 权重。
+- **候选扫描被限流拖慢**：看 epoch 状态（下条）；DEGRADED 不会无限重试到撞限，
+  会保持上一 READY epoch（只减风险）。
+
+#### 2.6.6 如何看 scan epoch 与 DEGRADED 含义
+
+Web「数据状态」区 epoch 行：状态（READY/BUILDING/DEGRADED/EXPIRED）、
+覆盖 completed/expected、decision cutoff 时间、epoch id；
+`cointrader live status --json` 的 `service.market_data` 同口径。
+
+- **只有 READY 才允许 OPEN/REPLACE**：候选横截面必须全部候选完整、
+  cutoff 不变量成立；缺任何一个 symbol 都不 READY。
+- **DEGRADED 为何禁开仓**：本轮扫描有候选失败/不完整，排名基于残缺数据，
+  开仓等于用未知数据比收益率；但 EXIT/减仓不受影响（持仓管理优先级最高）。
+- **cutoff 失效**：cutoff 后任一候选发生新结算/K 线闭合 → 上一 READY 失效，
+  候选不会跨结算边界用旧费率。
+
+#### 2.6.7 kill -9 / 断电恢复演练（v2 完整口径）
+
+在 2.6.2 基础上，v2 额外核验（全部离线可查）：
+
+```bash
+# facts 回补游标（重启后续跑点）
+sqlite3 data/live/trading.sqlite3 \
+  "SELECT scope,stream,symbol_key,last_time_ms FROM sync_cursors ORDER BY 1,2,3;"
+# 事实行数幂等（重启前后应不变）
+sqlite3 data/live/trading.sqlite3 \
+  "SELECT market,COUNT(*) FROM fills GROUP BY 1; SELECT authority,COUNT(*) FROM funding_cashflows GROUP BY 1;"
+# current projection 与 tombstone
+sqlite3 data/live/trading.sqlite3 \
+  "SELECT symbol,spot_qty,perp_qty,tombstone FROM current_positions;"
+```
+
+预期：旧会话 `INTERRUPTED` 且 `ended_ms` 按 `last_heartbeat_ms` 截断（停机间隔
+不计在线）；fills/income 重复回补零新增（唯一键）；候选池外持仓也出现在
+`current_positions`；`live status` 的「在线时长」行：累计/本次/首启至今/中断分开。
+
+#### 2.6.8 SQLite v2 备份与完整性检查
+
+```bash
+# 一致性检查（只读，不锁定）
+sqlite3 data/live/trading.sqlite3 "PRAGMA integrity_check; SELECT schema_version FROM schema_meta;"
+# 在线备份（WAL 安全）
+sqlite3 data/live/trading.sqlite3 ".backup /backups/trading-$(date +%F).sqlite3"
+```
+
+备份保留至少 7 份；恢复演练在副本上做（v1→v2 迁移单事务，失败回滚保持 v1，
+可重试；schema_version 高于代码支持版本会拒绝启动）。
+
+#### 2.6.9 账户 UNKNOWN / STALE 排障
+
+Web/CLI 的 `current projection` 状态与 `账户/对账/心跳年龄`（数据状态区）：
+
+- **UNKNOWN**：从未建立完整投影（服务未跑过或启动闸门未过）。此时 Web/CLI
+  不得当作“无持仓”；先 `cointrader live status` 看 RECOVERY 原因（账户接口/
+  对账/流/账本同步）。
+- **STALE**：投影存在但过期（账户/对账长时间未刷新）：检查网络/代理（本机
+  代理端口 7897）、`x-mbx-used-weight` 冻结、心跳年龄（心跳 > 2 分钟说明主循环
+  卡住/重启中）。
+- **资金显示 UNKNOWN 不是 0**：资金未知时开仓闸门拒绝（`ACCOUNT_STATE_UNKNOWN`），
+  这是设计行为，不是 bug。
+
+#### 2.6.10 Web 时间口径说明
+
+「在线时长」卡片四个数字互不重叠：
+
+- **累计在线** = 各 run 有效在线区间之和（重叠去重、负值截断，重启不清零）；
+- **本次运行** = 当前未结束 run 的在线（计到 `min(now, last_heartbeat + 2min)`）；
+- **首启至今** = 首次启动 → now（含当前停机段）；
+- **中断** = 首启至今 − 累计在线（kill→重启间隔、停机中都在这里）。
+
+INTERRUPTED 会话按 heartbeat 截断，所以“停机 5 小时再重启”不会把这 5 小时
+算进在线。
+
 ---
 
 ## 3. 如何解读回测报告
