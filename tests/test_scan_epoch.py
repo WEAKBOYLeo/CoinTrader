@@ -510,3 +510,37 @@ class TestEightHourNormalization:
         lb = cfg.strategy.entry.lookback_periods
         expect = sum(cache.rates[-lb:], Decimal("0")) / lb * 3 * 365
         assert trailing == expect
+    def test_dynamic_interval_symbol_not_false_lag(self, tmp_path) -> None:
+        """动态周期币（历史混合 1h/4h/8h 间隔）按 fundingInfo 声明周期判滞后。
+
+        回归：live 实测 ACEUSDT 历史含 1h 间隔，最小间隔推断把阈值压到 2h，
+        8h 声明周期的健康币被误判结算滞后（33/71 候选假 failed）。
+        """
+        clock = {"t": NOW}
+        cutoff_ms = int(clock["t"] * 1000)
+        h_ms = 3600 * 1000
+        base = (cutoff_ms // h_ms) * h_ms
+        recs = [
+            (base - 80 * h_ms, Decimal("0.001"), Decimal("1")),  # 8h 间隔
+            (base - 79 * h_ms, Decimal("0.001"), Decimal("1")),  # 1h 间隔（动态周期历史）
+            (base - 75 * h_ms, Decimal("0.001"), Decimal("1")),  # 4h 间隔
+        ] + [(base - 75 * h_ms + k * 8 * h_ms, Decimal("0.001"), Decimal("1")) for k in range(10)]
+        assert recs[-1][0] == base - 75 * h_ms + 9 * 8 * h_ms  # 末条在 cutoff 前（k 到 9）
+        data = EpochFakeData(
+            {"DYNUSDT": recs},
+            universe=("DYNUSDT",),
+            interval_hours={"DYNUSDT": 8},
+            volumes_24h={"DYNUSDT": 50e6},
+            now_ms=NOW_MS,
+        )
+        data.funding_interval_hours = lambda symbol: 8  # type: ignore[method-assign]
+        cfg = _cfg()
+        sync = MarketDataSynchronizer(
+            config=cfg, data=data,
+            server_time_fn=lambda: cutoff_ms, now_fn=lambda: clock["t"],
+        )
+        sync.build_once()
+        epoch = sync.latest_ready()
+        assert epoch is not None and epoch.status is ScanEpochStatus.READY
+        assert "DYNUSDT" not in epoch.failed
+

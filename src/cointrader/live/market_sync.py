@@ -58,8 +58,8 @@ _KNOWN_SETTLE_INTERVALS_MS = (3600 * 1000, 4 * 3600 * 1000, 8 * 3600 * 1000)
 def _infer_settle_interval_ms(raw: list[tuple[int, Decimal, Decimal]]) -> int:
     """从连续结算记录推断结算间隔（1h/4h/8h），未知时回退 8h。
 
-    用最小正间隔（取最近已知值）：只要数据里存在一对相邻结算就准确；
-    偶发的缺失/修订不会把最小值拉大，只会暴露为更小的间隔（不会误判）。
+    仅在 fundingInfo 无声明周期时的兜底：动态周期币历史会混合 1h/4h/8h
+    间隔，最小间隔推断会把健康币误判为滞后，优先用声明值。
     """
     gaps = [
         b[0] - a[0]
@@ -183,6 +183,18 @@ class EpochDataProvider(Protocol):
 
     def quote_volume_24h(self) -> dict[str, float]:
         """全市场各 symbol 的 24h 成交额（USDT）。"""
+
+
+def _declared_interval_hours(data: Any, symbol: str) -> int | None:
+    """provider 声明的结算周期（小时）；不支持/异常时 None。"""
+    fn = getattr(data, "funding_interval_hours", None)
+    if fn is None:
+        return None
+    try:
+        hours = int(fn(symbol))
+    except Exception:  # noqa: BLE001 —— 兜底推断，不得阻断候选
+        return None
+    return hours if hours > 0 else None
 
 
 def _accepts_end_ms(fn: Any) -> bool:
@@ -534,10 +546,15 @@ class MarketDataSynchronizer:
             if timestamps[-1] > cutoff:  # 防御：上面已过滤，正常不可达
                 raise ValueError(f"funding 桶 {timestamps[-1]} 晚于 cutoff {cutoff}")
             # 不变量 3：真实结算滞后 = cutoff 距最后一条到账结算超过 2 个结算
-            # 间隔（1h 币 >2h、4h 币 >8h、8h 币 >16h）。不能用「cutoff 整点
-            # 结算未到账」判滞后：结算恰在 cutoff 发生时 API 可能尚未返回它
-            # （非滞后，下一轮自然补齐）
-            settle_ms = _infer_settle_interval_ms(raw)
+            # 间隔（8h 币 >16h、4h 币 >8h、1h 币 >2h）。间隔取 fundingInfo
+            # 声明值（动态周期币历史混合间隔，最小间隔推断会误判）；不能用
+            # 「cutoff 整点结算未到账」判滞后（刚发生的结算 API 可能未返回）
+            declared_hours = _declared_interval_hours(self._data, symbol)
+            settle_ms = (
+                declared_hours * 3600 * 1000
+                if declared_hours is not None
+                else _infer_settle_interval_ms(raw)
+            )
             if cutoff - last_raw_ts[-1] > 2 * settle_ms:
                 raise ValueError(
                     f"最后结算 {last_raw_ts[-1]} 距 cutoff {cutoff} 超过 2 个结算间隔，结算滞后"
