@@ -40,7 +40,7 @@ _FILL_LIMIT = 50
 
 
 def _current_positions(
-    store: Any, now_ms: int, *, stale_after_ms: int
+    queries: Any, now_ms: int, *, stale_after_ms: int
 ) -> tuple[list[dict[str, Any]], str]:
     """current positions projection（T4/AC-12）+ 状态标签。
 
@@ -49,10 +49,10 @@ def _current_positions(
     状态：OK / STALE（projection 过期）/ UNKNOWN（从未建立投影）。
     价格/基准率仅作展示从最近快照补充（不影响数量口径）。
     """
-    rows = store.current_positions(include_tombstones=False)
+    rows = queries.current_positions(include_tombstones=False)
     live = [r for r in rows if _is_live_position(r)]
     if not rows:
-        state = "UNKNOWN" if store.current_account() is None else "OK"
+        state = "UNKNOWN" if queries.current_account() is None else "OK"
         return [], state
     latest_observed = max(int(r.get("observed_at_ms") or 0) for r in rows)
     state = ("STALE"
@@ -60,7 +60,7 @@ def _current_positions(
              else "OK")
     # 展示层补充：最近快照的价格/基准（趋势参考，不是数量来源）
     price_map: dict[str, dict[str, Any]] = {}
-    for snap in store.position_snapshots(limit=10000):
+    for snap in queries.position_snapshots(limit=10000):
         symbol = snap.get("symbol")
         if symbol and symbol not in price_map:
             price_map[symbol] = snap
@@ -70,7 +70,7 @@ def _current_positions(
         spot_qty = Decimal(str(row.get("spot_qty") or 0))
         perp_qty = Decimal(str(row.get("perp_qty") or 0))
         snap = price_map.get(symbol, {})
-        opened_ms = store.position_opened_ms(symbol) or row.get("observed_at_ms")
+        opened_ms = queries.position_opened_ms(symbol) or row.get("observed_at_ms")
         positions.append({
             "symbol": symbol,
             "spot_qty": str(spot_qty),
@@ -92,17 +92,17 @@ def _is_live_position(row: dict[str, Any]) -> bool:
     return spot_qty > 0 or abs(perp_qty) > 0
 
 
-def _pnl_block(store: Any) -> dict[str, Any] | None:
+def _pnl_block(queries: Any) -> dict[str, Any] | None:
     """PnL 默认跨 run（for_all_runs）；current run id 仅作上下文。
 
     口径标签（T4/AC-12）：``authoritative_complete`` 与
     ``estimated_funding_pnl`` 单独字段展示，估算不得混入 authoritative。
     """
-    run = store.latest_run_session()
+    run = queries.latest_run_session()
     try:
         from ..reporting.pnl import PnlAggregator
 
-        summary = PnlAggregator(store).for_all_runs()
+        summary = PnlAggregator(queries).for_all_runs()
         return {
             "run_id": "ALL",
             "current_run_id": str(run["run_id"]) if run else None,
@@ -118,8 +118,18 @@ def _pnl_block(store: Any) -> dict[str, Any] | None:
         }
 
 
-def build_payload(config: Config, state_provider: Callable[[], dict] | None = None) -> dict[str, Any]:
-    """聚合 WebUI 单次轮询需要的全部数据。任何子块失败降级，不抛异常。"""
+def build_payload(
+    config: Config,
+    state_provider: Callable[[], dict] | None = None,
+    *,
+    queries_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    """聚合 WebUI 单次轮询需要的全部数据。任何子块失败降级，不抛异常。
+
+    T4.4：账本读取一律经 ``LedgerQueryService``（唯一查询端口）；
+    ``queries_factory`` 仅测试注入 fake 用，生产为 None（内部建 StateStore）。
+    ``state_provider``（LiveService 内存快照）只作运行诊断字段。
+    """
     now_ms = int(time.time() * 1000)
     service: dict[str, Any] = {}
     if state_provider is not None:
@@ -130,6 +140,12 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
     payload: dict[str, Any] = {
         "now_ms": now_ms,
         "service": service,
+        # T4.4：服务内存块仅为运行诊断字段（明确来源+时间）；
+        # 当前持仓/订单事实源是下方 ledger 只读 query projection。
+        "service_source": {
+            "source": "LiveService.web_snapshot（服务内存，仅诊断，非持仓/订单事实源）",
+            "captured_at_ms": now_ms,
+        },
         "status": {},
         "positions": [],
         "positions_state": "UNKNOWN",
@@ -153,19 +169,27 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
     payload["store_available"] = True
 
     from ..execution.store import StateStore
+    from ..ledger.service import LedgerQueryService
 
-    store = StateStore(db_path)
+    if queries_factory is not None:
+        queries = queries_factory()
+        store = getattr(queries, "_ledger", None)  # 测试 fake 无 close 也可
+    else:
+        # T4.4：账本读取一律经 LedgerQueryService（唯一查询端口）；
+        # StateStore 实例仅用于生命周期（close），不再直接查询。
+        store = StateStore(db_path)
+        queries = LedgerQueryService(store)
     try:
         # 状态块
         try:
-            runtime = store.runtime_state()
-            latest_run = store.latest_run_session()
-            recon_rows = store.reconciliation_runs(limit=1)
+            runtime = queries.runtime_state()
+            latest_run = queries.latest_run_session()
+            recon_rows = queries.reconciliation_runs(limit=1)
             recon = recon_rows[0] if recon_rows else None
-            acct_rows = store.account_snapshots(limit=2)
+            acct_rows = queries.account_snapshots(limit=2)
             acct = acct_rows[0] if acct_rows else None
             alerts = [
-                e for e in store.exchange_events(limit=20)
+                e for e in queries.exchange_events(limit=20)
                 if str(e.get("event_type")) == "alert"
             ]
             payload["status"] = {
@@ -173,11 +197,11 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
                 "recovery_reason": runtime.get("recovery_reason", {}).get("value", ""),
                 "run_id": runtime.get("run_id", {}).get("value") or (latest_run or {}).get("run_id"),
                 "run": latest_run,
-                "online": store.online_stats(now_ms),
+                "online": queries.online_stats(now_ms),
                 "mode": runtime.get("mode", {}).get("value"),
                 "can_open": runtime.get("can_open", {}).get("value") == "1",
                 "total_capital": runtime.get("total_capital", {}).get("value"),
-                "current_account": store.current_account(),
+                "current_account": queries.current_account(),
                 "account_snapshot_ts_ms": acct.get("ts_ms") if acct else None,
                 "account_snapshot_age_ms": (
                     now_ms - int(acct["ts_ms"]) if acct and acct.get("ts_ms") else None
@@ -200,9 +224,9 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
                     {"pair_execution_id": str(r.get("pair_execution_id")),
                      "symbol": str(r.get("symbol")), "kind": str(r.get("kind")),
                      "run_id": r.get("run_id")}
-                    for r in store.open_pairs()
+                    for r in queries.open_pairs()
                 ],
-                "lease_holders": store.lease_holders(),
+                "lease_holders": queries.lease_holders(),
                 "recent_alerts": [
                     {"ts_ms": a.get("recv_ts"), "market": a.get("market"),
                      "payload": a.get("payload")}
@@ -219,12 +243,12 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
                 int(config.execution.snapshot_interval_seconds) * 3000, 60_000
             )
             positions, positions_state = _current_positions(
-                store, now_ms, stale_after_ms=stale_after_ms
+                queries, now_ms, stale_after_ms=stale_after_ms
             )
             if positions:
                 from ..reporting.pnl import PnlAggregator
 
-                summary = PnlAggregator(store).for_all_runs()
+                summary = PnlAggregator(queries).for_all_runs()
                 by_symbol = {item.symbol: item.unrealized_pnl for item in summary.per_pair}
                 for pos in positions:
                     if pos["symbol"] in by_symbol:
@@ -238,17 +262,17 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
 
         # 订单/成交块（最近 N 条，倒序）
         try:
-            payload["orders"] = store.orders(limit=_ORDER_LIMIT)
+            payload["orders"] = queries.orders(limit=_ORDER_LIMIT)
         except Exception as exc:  # noqa: BLE001
             payload["orders"] = [{"error": str(exc)}]
         try:
-            payload["fills"] = store.fills(limit=_FILL_LIMIT)
+            payload["fills"] = queries.fills(limit=_FILL_LIMIT)
         except Exception as exc:  # noqa: BLE001
             payload["fills"] = [{"error": str(exc)}]
 
         # PnL 块（T4：默认跨 run，口径标签在 pnl 字典内）
         try:
-            payload["pnl"] = _pnl_block(store)
+            payload["pnl"] = _pnl_block(queries)
         except Exception as exc:  # noqa: BLE001
             payload["pnl"] = {"error": str(exc)}
 
@@ -279,7 +303,9 @@ def build_payload(config: Config, state_provider: Callable[[], dict] | None = No
         except Exception:  # noqa: BLE001
             payload["freshness"] = {"positions_state": payload["positions_state"]}
     finally:
-        store.close()
+        with contextlib.suppress(Exception):
+            if store is not None and hasattr(store, "close"):
+                store.close()
 
     return payload
 

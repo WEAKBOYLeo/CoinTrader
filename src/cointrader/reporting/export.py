@@ -28,6 +28,7 @@ from typing import Any
 
 from ..config import Config
 from ..execution.store import StateStore
+from ..ledger import LedgerQueryService
 from .pnl import PnlAggregator
 
 __all__ = ["ManifestResult", "REPORT_PROMPT", "export_report", "scan_for_secrets"]
@@ -111,7 +112,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _table_rows(store: StateStore, method: str, **kwargs: Any) -> list[dict[str, Any]]:
+def _table_rows(store: Any, method: str, **kwargs: Any) -> list[dict[str, Any]]:
     return list(getattr(store, method)(**kwargs))
 
 
@@ -196,7 +197,7 @@ def _funding_authority_summary(store: Any) -> dict[str, Any]:
 
 
 def export_report(
-    store: StateStore,
+    store: LedgerQueryService | StateStore,
     config: Config,
     *,
     run_id: str,

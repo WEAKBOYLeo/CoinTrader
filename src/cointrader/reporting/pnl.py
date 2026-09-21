@@ -30,8 +30,6 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from ..execution.store import StateStore
-
 __all__ = ["CALC_VERSION", "PairPnl", "PnlSummary", "PnlAggregator"]
 
 CALC_VERSION = "pnl-v1"
@@ -144,7 +142,9 @@ class PnlSummary:
 class PnlAggregator:
     """从账本（fills / funding_cashflows / snapshots / pairs）计算 PnL。"""
 
-    def __init__(self, store: StateStore, now_fn=None) -> None:
+    def __init__(self, store: Any, now_fn=None) -> None:
+        """store: StateStore（生产，含归集写路径）或 LedgerQueryService
+        （只读 read model，如 WebUI/report；只需读方法结构匹配）。"""
         self.store = store
         self._now = now_fn or time.time
 

@@ -131,3 +131,17 @@ class SafetyStateMachine:
             source=command.source,
         )
         return self._state
+
+    def shutdown(self, *, reason: str, now_ms: int) -> SafetyState:
+        """进程优雅停机（T4）：停机后状态机不再参与迁移。
+
+        停机是进程级动作，不走控制命令通道；任何状态都可停机
+        （STOPPED 幂等）。RECOVERY/HALTED 停机后不会自动降级为 RUNNING
+        —— 进程退出后新进程从 RECOVERY 重新起步（启动预检+对账通过才 RUNNING）。
+        """
+        if self._state.state is SafetyStateKind.STOPPED:
+            return self._state
+        self._state = SafetyState(
+            SafetyStateKind.STOPPED, reason=reason, changed_at_ms=now_ms, source="system"
+        )
+        return self._state

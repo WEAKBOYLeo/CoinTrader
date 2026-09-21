@@ -198,8 +198,7 @@ class TestRecoveryAutoClear:
         svc = env["svc"]
         svc._now = lambda: NOW  # noqa: SLF001
         svc.attach_streams([_FakeStream("spot"), _FakeStream("perp")])
-        svc._state = ServiceState.RECOVERY  # noqa: SLF001
-        svc._recovery_reason = "用户流不新鲜（测试）"  # noqa: SLF001
+        svc.enter_recovery("用户流不新鲜（测试）")  # T4：经控制面进 RECOVERY
         svc._last_reconcile_ms = 0  # noqa: SLF001 强制触发 recovery_check
 
         r = svc.run_once()
@@ -213,8 +212,7 @@ class TestRecoveryAutoClear:
         svc = env["svc"]
         svc._now = lambda: NOW  # noqa: SLF001
         svc.attach_streams([_FakeStream("spot"), _FakeStream("perp")])
-        svc._state = ServiceState.RECOVERY  # noqa: SLF001
-        svc._recovery_reason = "用户流不新鲜（测试）"  # noqa: SLF001
+        svc.enter_recovery("用户流不新鲜（测试）")  # T4：经控制面进 RECOVERY
         svc._last_reconcile_ms = 0  # noqa: SLF001
 
         from cointrader.execution.models import ReconciliationResult

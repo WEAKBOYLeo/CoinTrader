@@ -709,13 +709,15 @@ def _parse_since_ms(value: str | None, *, default_hours: float = 24.0) -> int:
 
 
 def _open_live_store(config: Config):
-    """只读打开账本（只调用 SELECT 方法）。"""
+    """只读打开账本查询端口（T4.4：LedgerQueryService 是唯一查询端口；
+    只暴露只读方法 + close，不暴露任何写/交易接口）。"""
     from .execution.store import StateStore
+    from .ledger import LedgerQueryService
 
     db_path = config.resolved_path(config.execution.state_db)
     if not db_path.exists():
         raise ConfigError(f"状态账本不存在: {db_path}（先运行 live run）")
-    return StateStore(db_path)
+    return LedgerQueryService(StateStore(db_path))
 
 
 def _fetch_live_quotes(config: Config, symbols: list[str]) -> dict:

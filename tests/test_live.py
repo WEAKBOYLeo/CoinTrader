@@ -214,6 +214,13 @@ class TestStartup:
         assert report.reconciliation_consistent is True
         assert report.symbols == ("BTCUSDT",)
         assert s_spot.started and s_perp.started, "对账通过后才启动用户流"
+        # T4.3：启动顺序 trace（application.lifecycle 固化阶段全绿）
+        from cointrader.application.lifecycle import STARTUP_STAGES
+
+        trace = report.extra.get("startup_trace")
+        assert trace is not None, "启动 trace 必须写入 report.extra（T4 证据）"
+        assert [t["stage"] for t in trace] == list(STARTUP_STAGES)
+        assert all(t["ok"] for t in trace)
 
     def test_dynamic_pool_prunes_untrading_and_unruleable_symbols(self, tmp_path) -> None:
         """动态池：无规则 symbol 被剔除，不阻断启动（§7.1 第 7 条动态模式）。"""

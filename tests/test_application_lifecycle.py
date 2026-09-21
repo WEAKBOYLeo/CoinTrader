@@ -160,7 +160,7 @@ class TestLedgerQueryService:
         svc = _env(tmp_path)["svc"]
         q = LedgerQueryService(svc.store)
         with pytest.raises(ValueError):
-            q.orders(())
+            q.orders_in_states(())
 
 
 class _FakeSync:

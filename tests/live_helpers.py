@@ -252,7 +252,8 @@ class FakeGate:
         return _ok_recon()
 
     def recover(self, reconciliation_ok: bool, preflight_ok: bool) -> None:
-        pass
+        if reconciliation_ok and preflight_ok:
+            self.state = HaltState.NORMAL
 
     def halt(self, reason: str) -> None:
         self.state = HaltState.HALT_NEW_RISK
@@ -427,10 +428,8 @@ def make_service(tmp_path: Path, data: FakeStrategyData, *,
         quote_fetcher=lambda _sym: make_quote(),
         on_alert=lambda kind, msg: None,
     )
-    # 测试直接驱动 run_once：跳过 start() 的完整预检，置为 RUNNING
-    from cointrader.live.service import ServiceState
-
-    svc._state = ServiceState.RUNNING  # noqa: SLF001
+    # 测试直接驱动 run_once：跳过 start() 的完整预检，经控制面回 RUNNING（T4）
+    svc.resume_after_checks("测试环境启动预检（跳过完整 startup）", source="test")
     svc.run_id = "run-default"
     return {"svc": svc, "spot": spot, "futures": futures, "executor": executor,
             "store": store, "config": cfg, "reconciler": reconciler}

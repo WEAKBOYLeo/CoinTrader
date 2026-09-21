@@ -51,6 +51,85 @@ class LedgerPort(Protocol):
 
     def get_pair(self, pair_execution_id: str) -> dict[str, Any] | None: ...
 
+    # -- T4.4：WebUI/CLI/reporting 查询面（全部只读；StateStore 天然满足） --
+
+    def orders(
+        self,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        symbol: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
+    def fills(
+        self,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        symbol: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
+    def funding_cashflows(
+        self,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        symbol: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
+    def position_snapshots(
+        self,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        symbol: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
+    def account_snapshots(
+        self,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
+    def reconciliation_runs(
+        self, *, since_ms: int | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]: ...
+
+    def exchange_events(
+        self,
+        *,
+        since_ms: int | None = None,
+        market: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
+    def lease_holders(self) -> list[dict[str, Any]]: ...
+
+    def position_opened_ms(self, symbol: str) -> int | None: ...
+
+    def scan_epochs(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
+
+    def sync_cursors(self, *, limit: int = 1000) -> list[dict[str, Any]]: ...
+
+    def schema_version(self) -> int: ...
+
+    def orders_for_pair(self, pair_execution_id: str) -> list[dict[str, Any]]: ...
+
+    def pair_executions(
+        self,
+        *,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        symbol: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
 
 class PipelineLedgerPort(Protocol):
     """pipeline 持久化写侧：append + 幂等（实现落 ``execution.store``）。

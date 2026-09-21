@@ -69,16 +69,18 @@ class ServiceRunner:
             except StoreError as exc:
                 logger.warning("单实例锁刷新失败（后续写账本会自然暴露）: %s", exc)
 
-        # 风控闸门状态同步
+        # 风控闸门状态同步（T4：经 ControlPublisher 进入安全状态机，只加严）
         gate_state = svc.gate.state
         if gate_state is not HaltState.NORMAL and svc._state is not ServiceState.RECOVERY:
-            svc._state = ServiceState.HALTED
+            svc.apply_gate_state()
             svc._persist_runtime_state()
             svc._on_alert("GATE_HALT", f"风控闸门状态 {gate_state.value}，禁止开新仓")
             return {"state": "HALTED"}
         if svc._state is ServiceState.HALTED and gate_state is HaltState.NORMAL:
-            # 闸门恢复（recover 已含对账+预检证明）且用户流仍新鲜 → 回到 RUNNING
-            svc._state = ServiceState.RUNNING
+            # 闸门恢复（recover 已含对账+预检证明）且用户流仍新鲜 → 回 RUNNING。
+            # 状态机在 CLOSE_ONLY 时 service 态 = HALTED；恢复 = 显式两步
+            # （CLOSE_ONLY → RECOVERY → RESUME_AFTER_CHECKS，由 resume 完成）。
+            svc.resume_after_checks("闸门恢复（recover 已含对账+预检证明）", source="gate_recover")
             logger.warning("【闸门恢复】回到 RUNNING")
 
         # 用户流新鲜度（§3.4：断线/过期 = 状态不可信）
@@ -129,7 +131,9 @@ class ServiceRunner:
                 return {"state": "RECOVERY", "reason": svc._recovery_reason}
             svc._reconcile_ok = True
             svc._recovery_reason = ""
-            svc._state = ServiceState.RUNNING
+            svc.resume_after_checks(
+                "用户流全部新鲜 + 对账通过 + 闸门 NORMAL", source="recovery_check"
+            )
             svc._refresh_held()
             svc._persist_runtime_state()
             logger.warning("【RECOVERY 解除】用户流全部新鲜 + 对账通过 + 闸门 NORMAL，回到 RUNNING")

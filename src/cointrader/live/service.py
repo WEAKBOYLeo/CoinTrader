@@ -24,7 +24,13 @@ from typing import Any
 
 from ..config import Config
 from ..domain.account import AccountSnapshot
-from ..domain.control import SafetyState
+from ..domain.common import InvalidDomainValue
+from ..domain.control import (
+    CommandKind,
+    ControlCommand,
+    SafetyState,
+    SafetyStateKind,
+)
 from ..domain.market import DataQuality, MarketSnapshot
 from ..domain.portfolio import PortfolioView
 from ..domain.strategy import StrategyProposal
@@ -42,8 +48,10 @@ from ..execution.store import LeaseConflict, StateStore, StoreError
 from ..execution.sync import ExchangeStateSynchronizer, SyncCaptureError
 from ..execution.user_stream import PollingUserStream, UserStream
 from ..market_data.service import MarketDataService
+from ..observability.control import ControlPublisher
 from ..portfolio.planner import PortfolioPlanner
 from ..reporting.pnl import PnlAggregator
+from ..risk.state_machine import SafetyStateMachine
 from ..strategy.adapter import decisions_to_proposal
 from .account_state import AccountStateBuilder, AccountStateError, AccountStateResult
 from .market_sync import MarketDataSynchronizer
@@ -93,6 +101,20 @@ class ServiceState(str, Enum):
     RECOVERY = "RECOVERY"
     HALTED = "HALTED"
     STOPPED = "STOPPED"
+
+
+#: T4：安全状态机（owner）→ 旧 ServiceState 兼容映射。旧状态不再独立决定
+#: ``can_open``，只用于旧 API/日志的展示兼容。
+_SAFETY_TO_SERVICE: dict[SafetyStateKind, ServiceState] = {
+    SafetyStateKind.STARTING: ServiceState.STARTING,
+    SafetyStateKind.RUNNING: ServiceState.RUNNING,
+    SafetyStateKind.DEGRADED: ServiceState.RUNNING,
+    SafetyStateKind.RECOVERY: ServiceState.RECOVERY,
+    SafetyStateKind.CLOSE_ONLY: ServiceState.HALTED,
+    SafetyStateKind.HALTED: ServiceState.HALTED,
+    SafetyStateKind.EMERGENCY_FLATTEN: ServiceState.HALTED,
+    SafetyStateKind.STOPPED: ServiceState.STOPPED,
+}
 
 
 @dataclass(slots=True)
@@ -188,7 +210,19 @@ class LiveService:
         self._risk_state_fn = risk_state_fn or self._risk_state_from_account
         self._signal_provider = signal_provider or (lambda: [])
         self._now = now_fn
-        self._state = ServiceState.STARTING
+        # T4：安全状态机 = 生产安全状态唯一 owner（fail closed：初始 RECOVERY，
+        # 启动预检+对账通过才 RUNNING）；所有 watchdog/用户流/对账/限流/DB
+        # 失败/人工命令经 ControlPublisher 进入状态机。
+        self._safety_sm = SafetyStateMachine(
+            SafetyState(
+                SafetyStateKind.RECOVERY,
+                reason="初始化：等待启动预检+对账通过（fail closed）",
+                changed_at_ms=0,
+                source="system",
+            )
+        )
+        self._control = ControlPublisher(subscribers=(self._apply_control_command,))
+        self._state = ServiceState.RECOVERY
         self._recovery_reason = ""
         self._last_reconcile_ms = 0
         self._started = False
@@ -204,21 +238,93 @@ class LiveService:
 
     @property
     def state(self) -> ServiceState:
+        """兼容映射（T4）：安全状态机是 owner；闸门非 NORMAL 时叠加 HALTED
+        展示（下一 tick 经 ControlPublisher 同步进状态机）。"""
         if self.gate.state is not HaltState.NORMAL and self._state is ServiceState.RUNNING:
             return ServiceState.HALTED
         return self._state
 
+    # -- 控制面（T4：SafetyStateMachine 唯一写入者） ------------------------
+
+    def _apply_control_command(self, cmd: ControlCommand) -> None:
+        """ControlPublisher 订阅者：应用命令到状态机并同步兼容状态。"""
+        try:
+            self._safety_sm.apply(cmd, now_ms=cmd.issued_at_ms)
+        except InvalidDomainValue as exc:
+            logger.warning("控制命令被状态机拒绝（保持原状态）: %s", exc)
+            return
+        self._sync_service_state()
+
+    def _sync_service_state(self) -> None:
+        """安全状态机 → 旧 ServiceState（只读兼容投影，不再反向写入状态机）。"""
+        mapped = _SAFETY_TO_SERVICE[self._safety_sm.state.state]
+        if mapped is not self._state:
+            self._state = mapped
+            self._persist_runtime_state()
+
+    def _publish_recovery(self, reason: str, *, source: str = "service") -> None:
+        self._control.recovery(reason=reason or "未指定原因（fail closed）", source=source)
+
     def enter_recovery(self, reason: str) -> None:
-        """进入 RECOVERY：禁止开新仓。幂等。"""
-        if self._state is ServiceState.RECOVERY:
+        """进入 RECOVERY：禁止开新仓。幂等；经 ControlPublisher → 状态机。"""
+        if self._safety_sm.state.state is SafetyStateKind.STOPPED:
             return
-        if self._state is ServiceState.STOPPED:
-            return
-        self._state = ServiceState.RECOVERY
         self._recovery_reason = reason
+        if self._safety_sm.state.state is not SafetyStateKind.RECOVERY:
+            self._publish_recovery(reason)
         self._on_alert("RECOVERY", reason)
         self._persist_runtime_state()
         logger.error("【进入 RECOVERY】%s（禁止开新仓，等待对账通过后恢复）", reason)
+
+    def resume_after_checks(self, reason: str, *, source: str = "service") -> None:
+        """显式恢复：RECOVERY →（必要时两步）→ RUNNING。
+
+        放宽必须走显式 RECOVERY → RESUME_AFTER_CHECKS（领域规则）；
+        非 RECOVERY 态先经 RECOVERY 再 RESUME（CLOSE_ONLY/HALTED 回 RUNNING
+        同样先入 RECOVERY）。STOPPED 不恢复。
+        """
+        current = self._safety_sm.state.state
+        if current is SafetyStateKind.STOPPED:
+            return
+        if current is not SafetyStateKind.RECOVERY:
+            self._control.recovery(
+                reason=reason or "恢复前确认停机已解除", source=source
+            )
+        self._control.resume_after_checks(reason=reason or "预检+对账通过", source=source)
+        self._recovery_reason = ""
+
+    def apply_gate_state(self) -> None:
+        """风控闸门（含 KILL_SWITCH 文件）→ 控制面命令（加严方向）。
+
+        只加严不放宽：闸门恢复仍由显式 ``recover()`` + ``resume_after_checks``
+        完成。EMERGENCY_FLATTEN 只可能由人工触发（领域层强制 source=manual）。
+        """
+        kind = self._safety_sm.state.state
+        if kind is SafetyStateKind.STOPPED or kind is SafetyStateKind.EMERGENCY_FLATTEN:
+            return
+        if self.gate.state is HaltState.NORMAL:
+            return
+        now_ms = int(self._now() * 1000)
+        if self.gate.state is HaltState.EMERGENCY_FLATTEN:
+            self._control.publish(
+                CommandKind.EMERGENCY_FLATTEN,
+                reason=getattr(self.gate, "halt_reason", "") or "emergency flatten",
+                source="manual",
+                now_ms=now_ms,
+            )
+        else:
+            if kind is SafetyStateKind.CLOSE_ONLY or kind is SafetyStateKind.RECOVERY:
+                return  # 已加严/已恢复中，不重复发布
+            self._control.halt_new_risk(
+                reason=getattr(self.gate, "halt_reason", "") or f"gate {self.gate.state.value}",
+                source="risk_gate",
+                now_ms=now_ms,
+            )
+
+    @property
+    def safety_state(self) -> SafetyState:
+        """生产安全状态（owner：状态机；旧 gate/_state 只做兼容投影）。"""
+        return self._safety_sm.state
 
     @property
     def _market_data_ready(self) -> bool:
@@ -229,9 +335,12 @@ class LiveService:
 
     @property
     def can_open(self) -> bool:
-        """开仓权限 = 全部闸门通过（实施计划书 v2.0 T3）：
-        state==RUNNING && streams 新鲜 && 账户完整 && 账本同步 && 对账 &&
-        epoch READY && 风控闸门 NORMAL。任一 false 禁止新增风险。"""
+        """开仓权限 = 安全状态机允许新增风险 + 全部事实闸门通过（T4）：
+        状态机 RUNNING && state==RUNNING && streams 新鲜 && 账户完整 &&
+        账本同步 && 对账 && epoch READY && 风控闸门 NORMAL。
+        任一 false 禁止新增风险。旧 ServiceState 不再独立决定开仓。"""
+        if not self._safety_sm.state.allows_new_risk:
+            return False
         if self._state is not ServiceState.RUNNING:
             return False
         if self.gate.state is not HaltState.NORMAL:
@@ -328,6 +437,9 @@ class LiveService:
             "rate_limits": rate_limits,
             "market_data": market_data,
             "freshness": freshness,
+            # T4：安全状态机（owner）+ 控制命令审计（状态迁移可追溯）
+            "safety": self._safety_sm.state.to_dict(),
+            "control_events": [c.to_dict() for c in self._control.recent[-20:]],
             "code_revision": self.code_revision,
             "metrics": self.metrics.snapshot(),
         }
@@ -716,216 +828,251 @@ class LiveService:
     # -- 启动（§8.1） --------------------------------------------------------
 
     def startup(self) -> StartupReport:
-        """按 §8.1 顺序执行启动预检。失败抛异常（启动时崩溃是特性）。"""
-        report = StartupReport(mode=self.mode)
+        """按 §8.1 顺序执行启动预检（T4.3：顺序固化在
+        ``application.lifecycle.run_startup``，本方法保留兼容 facade）。
 
-        # 6. 单实例锁（先取锁，防止对账期间另一进程写账本）
+        硬失败（锁冲突/时钟超阈/规则不符/流未新鲜/账本硬错误）抛异常
+        （启动时崩溃是特性）；软闸门（对账/账户/事实同步/市场 READY）
+        失败 → 默认 RECOVERY（禁止开仓，主循环闸门全绿后自动回 RUNNING）。
+        """
+        from ..application.lifecycle import run_startup
+
+        return run_startup(self)
+
+    # -- T4.3：启动阶段（顺序由 application.lifecycle 固化） --------------
+
+    def _stage_mode(self) -> str:
+        """1. config→mode：execution.mode 决定 SHADOW/paper/live。"""
+        if not self.mode:
+            raise LiveGateBlocked("execution.mode 未配置，拒绝启动")
+        return self.mode
+
+    def _stage_server_time(self, report: StartupReport) -> str:
+        """2. 校准 server time（§3.1/-1021 防线；偏移超阈 = fatal）。"""
+        report.time_offset_spot_ms = int(self.spot.calibrate())
+        report.time_offset_perp_ms = int(self.futures.calibrate())
+        limit = self.config.execution.server_time_offset_limit_ms
+        for label, offset in (("spot", report.time_offset_spot_ms), ("perp", report.time_offset_perp_ms)):
+            if abs(offset) > limit:
+                raise ClockError(
+                    f"{label} server time 偏移 {offset}ms 超过阈值 ±{limit}ms。"
+                    "停止交易，重新同步系统 NTP（-1021 防线，§3.5）。"
+                )
+        return f"offset spot={report.time_offset_spot_ms}ms perp={report.time_offset_perp_ms}ms"
+
+    def _stage_rules(self, report: StartupReport) -> str:
+        """3. 规则与杠杆/保证金预检（§3.2 / 开发文档 §7.6，fatal）。"""
+        spot_rules = self.spot.load_rules()
+        perp_rules = self.futures.load_rules()
+        common = sorted(set(spot_rules) & set(perp_rules))
+        if not common:
+            raise LiveGateBlocked("Spot 与 Futures 无共同可交易 symbol，拒绝启动")
+        want_lev = self.config.execution.leverage
+        want_margin = self.config.execution.margin_type
+        # 动态候选池：先构建初始池，剔除不可开仓 symbol（无规则/非 TRADING/
+        # 最小名义额高于 canary）——单个 pool symbol 不健康不应阻断整个服务；
+        # 杠杆/保证金推迟到开仓时按需验证。
+        dynamic_pool = self.strategy is not None and self.strategy.dynamic_pool
+        if dynamic_pool and self.strategy is not None:
+            self.strategy.refresh_universe()
+            if self._pair_exclusion_fn is not None:
+                allowed = {
+                    s for s in self.strategy.candidate_symbols
+                    if self._pair_exclusion_fn(s) is None
+                }
+            else:
+                canary = Decimal(str(self.config.execution.canary_notional))
+                allowed = set()
+                for symbol in self.strategy.candidate_symbols:
+                    spot_rule = spot_rules.get(symbol)
+                    perp_rule = perp_rules.get(symbol)
+                    if spot_rule is None or perp_rule is None:
+                        continue
+                    healthy = True
+                    for rule in (spot_rule, perp_rule):
+                        status = getattr(rule, "status", "")
+                        if status and status != "TRADING":
+                            healthy = False
+                            break
+                        min_notional = getattr(rule, "min_notional", None)
+                        if min_notional is not None and canary < Decimal(str(min_notional)):
+                            healthy = False
+                            break
+                    if healthy:
+                        allowed.add(symbol)
+            pruned = self.strategy.prune_universe(allowed)
+            report.symbols = tuple(self.strategy.candidate_symbols)
+            logger.info(
+                "【动态候选池】启动初始池 %d 个 symbol（剔除不可开仓 %d 个）；"
+                "杠杆/保证金开仓时按需验证",
+                len(report.symbols), pruned,
+            )
+        else:
+            report.symbols = tuple(common)
+        symbol_detail: dict[str, Any] = {}
+        for symbol in report.symbols:
+            if symbol not in spot_rules:
+                raise LiveGateBlocked(f"启动预检失败：{symbol} 缺少 Spot 规则")
+            if symbol not in perp_rules:
+                raise LiveGateBlocked(f"启动预检失败：{symbol} 缺少 Futures 规则")
+            info: dict[str, Any] = {"symbol": symbol}
+            for label, rule in (("spot", spot_rules[symbol]), ("perp", perp_rules[symbol])):
+                status = getattr(rule, "status", "")
+                if status and status != "TRADING":
+                    raise LiveGateBlocked(
+                        f"启动预检失败：{symbol} {label} 状态 {status} 非 TRADING"
+                    )
+                min_notional = getattr(rule, "min_notional", None)
+                info[f"{label}_min_notional"] = str(min_notional) if min_notional is not None else None
+                canary = Decimal(str(self.config.execution.canary_notional))
+                if min_notional is not None and canary < Decimal(str(min_notional)):
+                    raise LiveGateBlocked(
+                        f"启动预检失败：{symbol} {label} 最小名义额 {min_notional} "
+                        f"高于 canary_notional {canary}，无法合法开仓"
+                    )
+            if dynamic_pool:
+                # 动态池：开仓前 _check_leverage_margin 逐个验证（首次开仓该 symbol 时）
+                info["leverage"] = want_lev
+                info["margin_type"] = want_margin
+                info["leverage_read_available"] = False
+                info["leverage_checked_at"] = "on_open"
+            else:
+                lev, margin, read_available = self._check_leverage_margin(symbol, want_lev, want_margin)
+                info["leverage"] = lev
+                info["margin_type"] = margin
+                info["leverage_read_available"] = read_available
+                report.leverage = lev
+                report.margin_type = margin
+                if (lev, margin) != (want_lev, want_margin):
+                    raise LiveGateBlocked(
+                        f"杠杆/保证金模式不符：{symbol} 当前 ({lev}, {margin})，"
+                        f"期望 ({want_lev}, {want_margin})。启动预检失败（§3.2），拒绝启动。"
+                    )
+            symbol_detail[symbol] = info
+        report.extra["symbols"] = symbol_detail
+        return f"{len(report.symbols)} symbols"
+
+    def _stage_lease(self) -> str:
+        """4. 单实例锁 + 中断会话补记（fatal）。锁在 capture/对账前取得，
+        防止对账期间另一进程写账本。"""
         try:
             lease = self.store.acquire_lease(self.lease_name)
         except LeaseConflict as exc:
             self._on_alert("LEASE_CONFLICT", str(exc))
             raise LiveGateBlocked(str(exc)) from exc
         self.lease_holder = lease.holder
+        # 重启恢复（§断点重连）：把上次非优雅退出（kill -9/断电）遗留的
+        # RUNNING/RECOVERY 会话补记为 INTERRUPTED。标记失败（StoreError）视为
+        # 账本硬错误 → fatal。
+        interrupted = self.store.mark_interrupted_sessions(now_ms=int(self._now() * 1000))
+        if interrupted > 0:
+            logger.info("【重启恢复】已标记 %d 个中断会话", interrupted)
+        return lease.holder
 
+    def _stage_capture(self, ctx: Any) -> str:
+        """5. capture 交易所快照束（soft：失败进闸门 → 默认 RECOVERY）。"""
+        if self.exch_sync is None:
+            return "no-exch-sync"
         try:
-            # 重启恢复（§断点重连）：把上次非优雅退出（kill -9/断电）遗留的
-            # RUNNING/RECOVERY 会话补记为 INTERRUPTED。标记失败（StoreError）视为
-            # 账本硬错误，走下方 except 路径（释放锁、关流）拒绝启动。
-            interrupted = self.store.mark_interrupted_sessions(now_ms=int(self._now() * 1000))
-            if interrupted > 0:
-                logger.info("【重启恢复】已标记 %d 个中断会话", interrupted)
+            bundle = self.exch_sync.capture()
+        except SyncCaptureError as exc:
+            ctx.gates.append(f"capture 失败: {exc}")  # type: ignore[attr-defined]
+            return "capture-failed"
+        ctx.bundle = bundle  # type: ignore[attr-defined]
+        return "captured"
 
-            # 4. 校准 server time（§3.1/-1021 防线）
-            report.time_offset_spot_ms = int(self.spot.calibrate())
-            report.time_offset_perp_ms = int(self.futures.calibrate())
-            limit = self.config.execution.server_time_offset_limit_ms
-            for label, offset in (("spot", report.time_offset_spot_ms), ("perp", report.time_offset_perp_ms)):
-                if abs(offset) > limit:
-                    raise ClockError(
-                        f"{label} server time 偏移 {offset}ms 超过阈值 ±{limit}ms。"
-                        "停止交易，重新同步系统 NTP（-1021 防线，§3.5）。"
-                    )
+    def _stage_facts_sync(self, ctx: Any) -> str:
+        """6. facts 同步（fills + funding income，游标分页幂等；soft）。"""
+        if self.exch_sync is None or ctx.bundle is None:  # type: ignore[attr-defined]
+            return "skip"
+        symbols = self._ledger_sync_symbols()
+        fill_results = self.exch_sync.sync_fills(symbols)
+        income_results = self.exch_sync.sync_funding_income(symbols)
+        bad = [
+            f"{r.market}/{r.stream}/{r.symbol}: {r.error or '不完整'}"
+            for r in (*fill_results, *income_results)
+            if r.error or not r.complete
+        ]
+        self._ledger_sync_ok = not bad
+        self._ledger_sync_error = "; ".join(bad[:3])
+        if bad:
+            ctx.gates.append(f"事实同步未完成: {'; '.join(bad[:3])}")  # type: ignore[attr-defined]
+            return "partial"
+        return "ok"
 
-            # 5. 规则与杠杆/保证金预检（§3.2 / 开发文档 §7.6：
-            #    对**所有**允许交易的目标 symbol 逐个检查，不只检查第一个）
-            spot_rules = self.spot.load_rules()
-            perp_rules = self.futures.load_rules()
-            common = sorted(set(spot_rules) & set(perp_rules))
-            if not common:
-                raise LiveGateBlocked("Spot 与 Futures 无共同可交易 symbol，拒绝启动")
-            want_lev = self.config.execution.leverage
-            want_margin = self.config.execution.margin_type
-            # 动态候选池：先构建初始池，剔除不可开仓 symbol（无规则/非 TRADING/
-            # 最小名义额高于 canary）——单个 pool symbol 不健康不应阻断整个服务；
-            # 杠杆/保证金推迟到开仓时按需验证（池可能上百个，启动时逐个读/写不现实）。
-            dynamic_pool = self.strategy is not None and self.strategy.dynamic_pool
-            if dynamic_pool and self.strategy is not None:
-                self.strategy.refresh_universe()
-                if self._pair_exclusion_fn is not None:
-                    allowed = {
-                        s for s in self.strategy.candidate_symbols
-                        if self._pair_exclusion_fn(s) is None
-                    }
-                else:
-                    canary = Decimal(str(self.config.execution.canary_notional))
-                    allowed = set()
-                    for symbol in self.strategy.candidate_symbols:
-                        spot_rule = spot_rules.get(symbol)
-                        perp_rule = perp_rules.get(symbol)
-                        if spot_rule is None or perp_rule is None:
-                            continue
-                        healthy = True
-                        for rule in (spot_rule, perp_rule):
-                            status = getattr(rule, "status", "")
-                            if status and status != "TRADING":
-                                healthy = False
-                                break
-                            min_notional = getattr(rule, "min_notional", None)
-                            if min_notional is not None and canary < Decimal(str(min_notional)):
-                                healthy = False
-                                break
-                        if healthy:
-                            allowed.add(symbol)
-                pruned = self.strategy.prune_universe(allowed)
-                report.symbols = tuple(self.strategy.candidate_symbols)
-                logger.info(
-                    "【动态候选池】启动初始池 %d 个 symbol（剔除不可开仓 %d 个）；"
-                    "杠杆/保证金开仓时按需验证",
-                    len(report.symbols), pruned,
+    def _stage_reconcile(self, ctx: Any) -> str:
+        """7. 启动对账（消费同一 bundle；soft：不一致 → 闸门）。"""
+        result = self.reconciler.run(reason="startup", snapshot=ctx.bundle)  # type: ignore[arg-type]
+        self._last_reconcile_ms = int(self._now() * 1000)
+        ctx.report.reconciliation_consistent = result.consistent  # type: ignore[attr-defined]
+        ctx.report.reconciliation_mismatches = result.mismatches  # type: ignore[attr-defined]
+        ctx.reconcile_result = result  # type: ignore[attr-defined]
+        return f"consistent={result.consistent}"
+
+    def _stage_streams(self) -> str:
+        """8. 用户数据流（全部达到新鲜前拒绝启动，fatal 超时）。"""
+        for stream in self.streams:
+            stream.start()
+        fresh_deadline = self._now() + self.fresh_wait_seconds
+        while any(not s.is_fresh for s in self.streams):
+            if self._now() >= fresh_deadline:
+                raise LiveGateBlocked(
+                    f"用户流 {self.fresh_wait_seconds:.0f} 秒内未达新鲜状态，拒绝启动"
                 )
-            else:
-                report.symbols = tuple(common)
-            symbol_detail: dict[str, Any] = {}
-            for symbol in report.symbols:
-                if symbol not in spot_rules:
-                    raise LiveGateBlocked(f"启动预检失败：{symbol} 缺少 Spot 规则")
-                if symbol not in perp_rules:
-                    raise LiveGateBlocked(f"启动预检失败：{symbol} 缺少 Futures 规则")
-                info: dict[str, Any] = {"symbol": symbol}
-                for label, rule in (("spot", spot_rules[symbol]), ("perp", perp_rules[symbol])):
-                    status = getattr(rule, "status", "")
-                    if status and status != "TRADING":
-                        raise LiveGateBlocked(
-                            f"启动预检失败：{symbol} {label} 状态 {status} 非 TRADING"
-                        )
-                    min_notional = getattr(rule, "min_notional", None)
-                    info[f"{label}_min_notional"] = str(min_notional) if min_notional is not None else None
-                    canary = Decimal(str(self.config.execution.canary_notional))
-                    if min_notional is not None and canary < Decimal(str(min_notional)):
-                        raise LiveGateBlocked(
-                            f"启动预检失败：{symbol} {label} 最小名义额 {min_notional} "
-                            f"高于 canary_notional {canary}，无法合法开仓"
-                        )
-                if dynamic_pool:
-                    # 动态池：开仓前 _check_leverage_margin 逐个验证（首次开仓该 symbol 时）
-                    info["leverage"] = want_lev
-                    info["margin_type"] = want_margin
-                    info["leverage_read_available"] = False
-                    info["leverage_checked_at"] = "on_open"
-                else:
-                    lev, margin, read_available = self._check_leverage_margin(symbol, want_lev, want_margin)
-                    info["leverage"] = lev
-                    info["margin_type"] = margin
-                    info["leverage_read_available"] = read_available
-                    report.leverage = lev
-                    report.margin_type = margin
-                    if (lev, margin) != (want_lev, want_margin):
-                        raise LiveGateBlocked(
-                            f"杠杆/保证金模式不符：{symbol} 当前 ({lev}, {margin})，"
-                            f"期望 ({want_lev}, {want_margin})。启动预检失败（§3.2），拒绝启动。"
-                        )
-                symbol_detail[symbol] = info
-            report.extra["symbols"] = symbol_detail
+            time.sleep(0.05)
+        return f"{len(self.streams)} streams fresh"
 
-            # 7. 启动对账 + 交易所事实同步（T3：先同步事实，再对账，再启动流）
-            #    capture 一次交易所快照束；fills 与实际 funding income 按游标
-            #    分页回补（幂等）；Reconciler 消费同一 bundle，不重复拉
-            #    账户/仓位/开放订单 API。
-            bundle: Any | None = None
-            startup_gates: list[str] = []
-            if self.exch_sync is not None:
-                try:
-                    bundle = self.exch_sync.capture()
-                except SyncCaptureError as exc:
-                    startup_gates.append(f"capture 失败: {exc}")
-                if bundle is not None:
-                    symbols = self._ledger_sync_symbols()
-                    fill_results = self.exch_sync.sync_fills(symbols)
-                    income_results = self.exch_sync.sync_funding_income(symbols)
-                    bad = [
-                        f"{r.market}/{r.stream}/{r.symbol}: {r.error or '不完整'}"
-                        for r in (*fill_results, *income_results)
-                        if r.error or not r.complete
-                    ]
-                    self._ledger_sync_ok = not bad
-                    self._ledger_sync_error = "; ".join(bad[:3])
-                    if bad:
-                        startup_gates.append(f"事实同步未完成: {'; '.join(bad[:3])}")
-            result = self.reconciler.run(reason="startup", snapshot=bundle)
-            self._last_reconcile_ms = int(self._now() * 1000)
-            report.reconciliation_consistent = result.consistent
-            report.reconciliation_mismatches = result.mismatches
+    def _stage_session(self) -> str:
+        """9. run_session（§6.1 关联链起点）+ heartbeat（DB 写失败 = fatal）。"""
+        self._started = True
+        self._ensure_run_session()
+        if self.run_id:
+            try:
+                self.store.update_run_heartbeat(self.run_id, now_ms=int(self._now() * 1000))
+            except StoreError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.warning("启动 heartbeat 写入失败", exc_info=True)
+        return self.run_id or "no-run-id"
 
-            # 8. 用户数据流（全部通过后才启动）
-            for stream in self.streams:
-                stream.start()
-            # 等待全部流达到新鲜状态再进入主循环：
-            # poll 模式首轮 REST 查询 <2s；stream 模式需首次连接成功。
-            # 避免主循环第一轮因「尚未可观测」误入 RECOVERY（且 RECOVERY 不自动解除）。
-            fresh_deadline = self._now() + self.fresh_wait_seconds
-            while any(not s.is_fresh for s in self.streams):
-                if self._now() >= fresh_deadline:
-                    raise LiveGateBlocked(
-                        f"用户流 {self.fresh_wait_seconds:.0f} 秒内未达新鲜状态，拒绝启动"
-                    )
-                time.sleep(0.05)
+    def _stage_account(self, ctx: Any) -> str:
+        """10. 首次账户快照（消费同一 bundle；soft：失败 → 开仓被拒）。"""
+        if self.account_builder is None:
+            return "no-account-builder"
+        try:
+            self._refresh_account_state(source="startup", bundle=ctx.bundle)  # type: ignore[arg-type]
+        except AccountStateError as exc:
+            self.store.record_risk_decision("ACCOUNT_STATE", False, str(exc))
+            self._on_alert("ACCOUNT_STATE_UNKNOWN", str(exc))
+            return "failed"
+        return "ok"
 
-            self._started = True
-
-            # 启动 run_session（§6.1 关联链起点）+ 脱敏配置摘要
-            self._ensure_run_session()
-            if self.run_id:
-                try:
-                    self.store.update_run_heartbeat(self.run_id, now_ms=int(self._now() * 1000))
-                except StoreError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    logger.warning("启动 heartbeat 写入失败", exc_info=True)
-
-            # 首次账户快照（消费同一 bundle；失败不拒绝启动，但开仓被拒）
-            if self.account_builder is not None:
-                try:
-                    self._refresh_account_state(source="startup", bundle=bundle)
-                except AccountStateError as exc:
-                    self.store.record_risk_decision("ACCOUNT_STATE", False, str(exc))
-                    self._on_alert("ACCOUNT_STATE_UNKNOWN", str(exc))
-
-            # 启动闸门（T3）：任一 false → RECOVERING（禁止开仓），
-            # 主循环闸门全绿后自动回 RUNNING。
-            if not result.can_open:
-                startup_gates.append(f"启动对账不一致: {list(result.mismatches)}")
-            acct = self._account_result
-            if self.account_builder is not None and (
-                acct is None or not self._account_fresh(int(self._now() * 1000)) or not acct.complete
-            ):
-                startup_gates.append("账户快照缺失/不完整（资金未知，禁止新增风险）")
-            if self.gate.state is not HaltState.NORMAL:
-                startup_gates.append(f"风控闸门 {self.gate.state.value}")
-            if startup_gates:
-                self.enter_recovery("; ".join(startup_gates))
-            else:
-                self._state = ServiceState.RUNNING
-                self._persist_runtime_state()
-                logger.info(
-                    "【实盘服务启动完成】mode=%s run_id=%s symbols=%s offset=%d/%dms",
-                    self.mode, self.run_id, list(report.symbols),
-                    report.time_offset_spot_ms, report.time_offset_perp_ms,
-                )
-        except Exception:
-            # 启动失败：释放锁、关流，不留半成品
-            self._teardown()
-            raise
-        return report
+    def _stage_final_gates(self, ctx: Any) -> str:
+        """11. 启动闸门（T4）：对账/账户完整/市场 READY/风控闸门全绿 →
+        RESUME_AFTER_CHECKS → RUNNING；任一 false → 默认 RECOVERY。"""
+        result = ctx.reconcile_result  # type: ignore[attr-defined]
+        if result is not None and not result.can_open:
+            ctx.gates.append(f"启动对账不一致: {list(result.mismatches)}")  # type: ignore[attr-defined]
+        acct = self._account_result
+        if self.account_builder is not None and (
+            acct is None or not self._account_fresh(int(self._now() * 1000)) or not acct.complete
+        ):
+            ctx.gates.append("账户快照缺失/不完整（资金未知，禁止新增风险）")  # type: ignore[attr-defined]
+        if not self._market_data_ready:
+            ctx.gates.append("市场数据 epoch 未 READY（选币闸门）")  # type: ignore[attr-defined]
+        if self.gate.state is not HaltState.NORMAL:
+            ctx.gates.append(f"风控闸门 {self.gate.state.value}")  # type: ignore[attr-defined]
+        if ctx.gates:  # type: ignore[attr-defined]
+            self.enter_recovery("; ".join(ctx.gates))  # type: ignore[arg-type]
+            return "recovery"
+        self.resume_after_checks("启动预检+对账通过", source="startup")
+        logger.info(
+            "【实盘服务启动完成】mode=%s run_id=%s symbols=%s offset=%d/%dms",
+            self.mode, self.run_id, list(ctx.report.symbols),  # type: ignore[attr-defined]
+            ctx.report.time_offset_spot_ms,  # type: ignore[attr-defined]
+            ctx.report.time_offset_perp_ms,  # type: ignore[attr-defined]
+        )
+        return "running"
 
     # -- 主循环 --------------------------------------------------------------
 
@@ -996,14 +1143,8 @@ class LiveService:
         return obj
 
     def _safety_state(self, now_ms: int) -> SafetyState:
-        """T3：风控闸门状态 → 领域 SafetyState（只读投影，不改变闸门）。"""
-        from ..risk.adapter import _TO_SAFETY
-
-        return SafetyState(
-            _TO_SAFETY[self.gate.state],
-            reason=f"gate:{self.gate.state.value}",
-            changed_at_ms=now_ms,
-        )
+        """T4：生产安全状态（owner：SafetyStateMachine）；风险内核据此审批。"""
+        return self._safety_sm.state
 
     def _account_snapshot(self, now_ms: int) -> AccountSnapshot:
         """T3：账户状态 → 领域 AccountSnapshot（不完整/过期 → complete=False，fail closed）。"""
@@ -1193,6 +1334,7 @@ class LiveService:
 
         RECOVERY 不自动解除（§7.3）：重启后必须重新预检 + 对账。
         """
+        self._safety_sm.shutdown(reason="graceful_stop", now_ms=int(self._now() * 1000))
         self._state = ServiceState.STOPPED
         if self.synchronizer is not None:
             try:
