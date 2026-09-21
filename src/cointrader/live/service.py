@@ -23,6 +23,8 @@ from enum import Enum
 from typing import Any
 
 from ..config import Config
+from ..domain.account import AccountSnapshot
+from ..domain.control import SafetyState
 from ..domain.market import DataQuality, MarketSnapshot
 from ..domain.portfolio import PortfolioView
 from ..domain.strategy import StrategyProposal
@@ -966,16 +968,174 @@ class LiveService:
             self.__dict__["_pipeline_obj"] = obj
         return obj
 
+    @property
+    def _risk_kernel(self):
+        """T3：同步风险内核（RiskRulesAdapter 复用 legacy RiskManager 数值规则）。"""
+        obj = self.__dict__.get("_risk_kernel_obj")
+        if obj is None:
+            from ..risk.adapter import RiskRulesAdapter
+            from ..risk.kernel import RiskKernel
+
+            obj = RiskKernel(self.config, rules=RiskRulesAdapter(RiskManager(self.config.risk)))
+            self.__dict__["_risk_kernel_obj"] = obj
+        return obj
+
+    @property
+    def _order_planner(self):
+        """T3：OrderPlanner（ApprovedIntent → ExecutionPlan）。"""
+        obj = self.__dict__.get("_order_planner_obj")
+        if obj is None:
+            from ..execution.planner import OrderPlanner
+
+            obj = OrderPlanner(
+                strategy_version=(
+                    self.strategy.strategy_version if self.strategy is not None else "funding_carry-1.0"
+                )
+            )
+            self.__dict__["_order_planner_obj"] = obj
+        return obj
+
+    def _safety_state(self, now_ms: int) -> SafetyState:
+        """T3：风控闸门状态 → 领域 SafetyState（只读投影，不改变闸门）。"""
+        from ..risk.adapter import _TO_SAFETY
+
+        return SafetyState(
+            _TO_SAFETY[self.gate.state],
+            reason=f"gate:{self.gate.state.value}",
+            changed_at_ms=now_ms,
+        )
+
+    def _account_snapshot(self, now_ms: int) -> AccountSnapshot:
+        """T3：账户状态 → 领域 AccountSnapshot（不完整/过期 → complete=False，fail closed）。"""
+        res = self._account_result
+        if res is None or not self._account_fresh(now_ms):
+            return AccountSnapshot(
+                snapshot_id="unknown",
+                capture_start_ms=now_ms,
+                capture_end_ms=now_ms,
+                complete=False,
+                equity=Decimal("0"),
+                available=Decimal("0"),
+            )
+        return AccountSnapshot(
+            snapshot_id=res.snapshot_id or f"acct-{res.ts_ms}",
+            capture_start_ms=res.ts_ms,
+            capture_end_ms=res.ts_ms,
+            complete=res.complete,
+            equity=res.total_equity,
+            available=res.spot_available + res.futures_available,
+        )
+
+    def _market_snapshot_for(self, symbol: str, now_ms: int) -> MarketSnapshot:
+        """单 symbol 市场事实（T3：新增风险审批用）。
+
+        报价缺失/过期/未来时间 → INCOMPLETE（风险层禁止新增风险）；
+        不伪造价格。
+        """
+        from ..domain.market import InstrumentQuote, MarketKind
+
+        try:
+            quote = self._quote_fetcher(symbol)
+        except Exception:  # noqa: BLE001 - 报价获取失败 = 市场事实不可信
+            quote = None
+        if (
+            quote is None
+            or quote.ts_ms > now_ms
+            or quote.spot_price is None
+            or quote.perp_price is None
+        ):
+            return MarketSnapshot(
+                snapshot_id=f"no-quote-{symbol}",
+                generated_at_ms=now_ms,
+                decision_cutoff_ms=0,
+                quality=DataQuality.INCOMPLETE,
+                quotes=(),
+            )
+        return MarketSnapshot(
+            snapshot_id=f"quote-{symbol}-{quote.ts_ms}",
+            generated_at_ms=now_ms,
+            decision_cutoff_ms=quote.ts_ms,
+            quality=DataQuality.FRESH,
+            quotes=(
+                InstrumentQuote(
+                    symbol=symbol,
+                    market=MarketKind.SPOT,
+                    price=quote.spot_price,
+                    funding_rate_8h=None,
+                    funding_cutoff_ms=None,
+                    quote_time_ms=quote.ts_ms,
+                ),
+                InstrumentQuote(
+                    symbol=symbol,
+                    market=MarketKind.FUTURES,
+                    price=quote.perp_price,
+                    funding_rate_8h=None,
+                    funding_cutoff_ms=None,
+                    quote_time_ms=quote.ts_ms,
+                ),
+            ),
+        )
+
     def _market_snapshot(self, now_ms: int) -> MarketSnapshot:
-        """当前市场事实（scan epoch READY → FRESH；无 synchronizer → INCOMPLETE）。"""
+        """当前市场事实横截面。
+
+        - 动态候选池：synchronizer 的 READY scan epoch → ``MarketDataService``
+          （FRESH/STALE/…由 epoch 状态决定）。
+        - 固定池（无 synchronizer）：以本轮刚拉取的报价构造 FRESH 快照；
+          任一报价缺失/未来时间（无前瞻）→ INCOMPLETE（fail closed，
+          风险层据此禁止新增风险）。
+        """
         if self.synchronizer is not None:
             return MarketDataService(self.synchronizer, now_fn=self._now).snapshot()
+        from ..domain.market import InstrumentQuote, MarketKind
+
+        try:
+            quotes = self._fetch_quotes()
+        except Exception:  # noqa: BLE001 - 报价拉取失败 = 市场事实不可信
+            quotes = {}
+        if not quotes:
+            return MarketSnapshot(
+                snapshot_id="no-quotes",
+                generated_at_ms=now_ms,
+                decision_cutoff_ms=0,
+                quality=DataQuality.INCOMPLETE,
+                quotes=(),
+            )
+        instrument_quotes: list[InstrumentQuote] = []
+        bad = False
+        for symbol in sorted(quotes):
+            q = quotes[symbol]
+            if q is None or q.ts_ms > now_ms or q.spot_price is None or q.perp_price is None:
+                bad = True  # 缺失/未来报价：不伪造价格
+                continue
+            instrument_quotes.append(
+                InstrumentQuote(
+                    symbol=symbol,
+                    market=MarketKind.SPOT,
+                    price=q.spot_price,
+                    funding_rate_8h=None,
+                    funding_cutoff_ms=None,
+                    quote_time_ms=q.ts_ms,
+                )
+            )
+            instrument_quotes.append(
+                InstrumentQuote(
+                    symbol=symbol,
+                    market=MarketKind.FUTURES,
+                    price=q.perp_price,
+                    funding_rate_8h=None,
+                    funding_cutoff_ms=None,
+                    quote_time_ms=q.ts_ms,
+                )
+            )
+        quality = DataQuality.FRESH if (instrument_quotes and not bad) else DataQuality.INCOMPLETE
+        cutoff = min(q.ts_ms for q in quotes.values() if q is not None and q.ts_ms <= now_ms) if instrument_quotes else 0
         return MarketSnapshot(
-            snapshot_id="no-epoch",
+            snapshot_id=f"quotes-{now_ms}",
             generated_at_ms=now_ms,
-            decision_cutoff_ms=0,
-            quality=DataQuality.INCOMPLETE,
-            quotes=(),
+            decision_cutoff_ms=cutoff,
+            quality=quality,
+            quotes=tuple(instrument_quotes),
         )
 
     def _portfolio_view(self, now_ms: int) -> PortfolioView:

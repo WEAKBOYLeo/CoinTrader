@@ -294,3 +294,60 @@ class TestRiskKernelHasNoFloatArithmetic:
         assert re.search(
             r"def check_order\(self,\s*symbol: str,\s*notional: Decimal", kernel
         ), "RiskRulesPort.check_order 金额参数必须为 Decimal"
+
+
+# ---------------------------------------------------------------------------
+# T3：生产 raw 开/平仓入口禁用（AC-06）
+# ---------------------------------------------------------------------------
+
+RAW_ENTRY_METHODS = frozenset({"open_pair", "close_pair"})
+
+
+def _raw_call_violations(files: list[Path], src_root: Path) -> list[str]:
+    """收集 production 文件里对 raw ``open_pair``/``close_pair`` 的调用点。
+
+    计划化唯一入口 ``open_pair_from_plan`` 不命中（属性名精确匹配）。
+    定义（FunctionDef）与测试 helper 不在扫描范围。
+    """
+    violations: list[str] = []
+    for path in files:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError) as exc:
+            violations.append(f"{path.relative_to(src_root)}: 无法解析: {exc}")
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+                if name in RAW_ENTRY_METHODS:
+                    rel = path.relative_to(src_root.parent)
+                    violations.append(
+                        f"{rel}:{node.lineno}: 调用 raw {name}(...) —— 生产路径必须走 "
+                        f"open_pair_from_plan(ExecutionPlan)"
+                    )
+    return violations
+
+
+class TestNoRawPairEntryInProduction:
+    """T3.6：application/、live/、CLI 不得调用 raw ``open_pair``/``close_pair``。
+
+    计划化唯一执行入口：``PairExecutor.open_pair_from_plan(plan)``（内部
+    adapter 委托保留 partial fill / UNKNOWN / 补偿逻辑）。raw 方法只允许
+    在标记为 legacy 的测试 helper（tests/live_helpers.py 的 FakeExecutor）
+    与 PairExecutor 自身 adapter 内使用。
+    """
+
+    def test_no_raw_open_close_pair_calls(self, src_root: Path) -> None:
+        files: list[Path] = []
+        for sub in ("application", "live"):
+            pkg = src_root / sub
+            if pkg.is_dir():
+                files.extend(_python_files(pkg))
+        cli = src_root / "cli.py"
+        if cli.is_file():
+            files.append(cli)
+        assert files, "扫描目标缺失（application/、live/、cli.py 均应存在）"
+        violations = _raw_call_violations(files, src_root)
+        assert violations == [], (
+            "生产调用图存在 raw 开/平仓直调（T3 禁用）:\n" + "\n".join(violations)
+        )

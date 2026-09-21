@@ -358,6 +358,7 @@ class PairExecutor:
         quote_ts_ms: int,
         state: RiskState,
         reason: str = "",
+        run_id: str = "",
     ) -> PairExecution:
         """T4 adapter 入口：消费只读 ``ExecutionPlan``（T3，AC-06）。
 
@@ -379,19 +380,23 @@ class PairExecutor:
             return self.close_pair(
                 symbol,
                 reason=reason or f"plan:{plan.plan_id}",
+                run_id=run_id,
                 signal_decision_id=plan.approved_intent.decision_id,
                 decision_ts_ms=plan.approved_intent.decided_at_ms,
             )
         spot_order = next(
             (o for o in plan.orders if o.market is MarketKind.SPOT), None
         )
-        if spot_order is None:
-            raise PairPrecheckFailed(f"执行计划缺少现货腿: {plan.plan_id}")
+        perp_order = next(
+            (o for o in plan.orders if o.market is MarketKind.FUTURES), None
+        )
+        if spot_order is None or perp_order is None:
+            raise PairPrecheckFailed(
+                f"执行计划缺少现货腿/永续腿（开仓必须两腿齐全）: {plan.plan_id}"
+            )
         target_notional = spot_order.quantity * spot_price
         plan_cids = {
-            "perp": next(
-                (o.client_order_id for o in plan.orders if o.market is MarketKind.FUTURES), ""
-            ),
+            "perp": perp_order.client_order_id,
             "spot": spot_order.client_order_id,
         }
         return self.open_pair(
@@ -402,6 +407,7 @@ class PairExecutor:
             quote_ts_ms=quote_ts_ms,
             state=state,
             reason=reason or f"plan:{plan.plan_id}",
+            run_id=run_id,
             signal_decision_id=plan.approved_intent.decision_id,
             decision_ts_ms=plan.approved_intent.decided_at_ms,
             plan_client_order_ids=plan_cids,

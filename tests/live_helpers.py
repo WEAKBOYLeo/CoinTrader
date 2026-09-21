@@ -24,6 +24,7 @@ from cointrader.config import (
     StrategyConfig,
 )
 from cointrader.execution.models import PairExecution, ReconciliationResult
+from cointrader.execution.pair_executor import PairPrecheckFailed
 from cointrader.execution.risk_gate import HaltState
 from cointrader.execution.rules import SymbolRules
 from cointrader.execution.store import StateStore
@@ -153,6 +154,29 @@ def make_symbol_rules(market: str) -> SymbolRules:
         step_size=Decimal("0.001"),
         min_notional=Decimal("1"),
     )
+
+
+def seed_current_positions(
+    store: StateStore,
+    symbol: str,
+    spot_qty: str,
+    perp_qty: str,
+    *,
+    price: str = "100",
+    ts_ms: int | None = None,
+) -> None:
+    """注入 current positions 投影行（生产由对账/同步路径更新；测试显式注入）。
+
+    计划 4.0 T3：平仓 intent 由 view（ledger current projection）差异产生，
+    测试需显式提供持仓事实。
+    """
+    ts = ts_ms if ts_ms is not None else int(NOW * 1000)
+    with store._lock:
+        store._conn.execute(
+            "INSERT OR REPLACE INTO current_positions (symbol, spot_qty, perp_qty,"
+            " spot_price, perp_price, observed_at_ms, source) VALUES (?,?,?,?,?,?,?)",
+            (symbol, spot_qty, perp_qty, price, price, ts, "test-seed"),
+        )
 
 
 class FakeServiceAdapter:
@@ -305,6 +329,49 @@ class FakeExecutor:
         self.store.upsert_pair(pair)
         self.close_calls.append(dict(symbol=symbol, reason=reason, run_id=run_id))
         return pair
+
+    def open_pair_from_plan(
+        self,
+        plan: Any,
+        *,
+        spot_price: Decimal,
+        perp_price: Decimal,
+        quote_ts_ms: int,
+        state: Any,
+        reason: str = "",
+        run_id: str = "",
+        **kw: Any,
+    ) -> PairExecution:
+        """计划化执行入口的 fake（与真 PairExecutor 同构：平仓全 reduce_only
+        → close_pair；开仓目标名义额 = 现货腿数量 × 现报价）。"""
+        from cointrader.domain.market import MarketKind
+
+        now_ms = int(NOW * 1000)
+        if plan.is_expired(now_ms):
+            raise PairPrecheckFailed(f"执行计划已过期: {plan.plan_id}")
+        approved = plan.approved_intent
+        symbol = approved.intent.symbol
+        if approved.is_closing:
+            return self.close_pair(
+                symbol,
+                reason=reason or f"plan:{plan.plan_id}",
+                run_id=run_id,
+                signal_decision_id=approved.decision_id,
+                decision_ts_ms=approved.decided_at_ms,
+            )
+        spot_order = next(o for o in plan.orders if o.market is MarketKind.SPOT)
+        return self.open_pair(
+            symbol,
+            spot_order.quantity * spot_price,
+            spot_price=spot_price,
+            perp_price=perp_price,
+            quote_ts_ms=quote_ts_ms,
+            state=state,
+            reason=reason or f"plan:{plan.plan_id}",
+            run_id=run_id,
+            signal_decision_id=approved.decision_id,
+            decision_ts_ms=approved.decided_at_ms,
+        )
 
     def reconcile(self) -> None:
         pass

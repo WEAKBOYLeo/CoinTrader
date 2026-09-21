@@ -334,10 +334,15 @@ class AccountStateBuilder:
                 if base == "USDT" or qty <= 0:
                     continue
                 seen_bases.add(base)
+                # 名义额估值价格（T3：CLOSE intent 差异需要非零名义额；
+                # 无新鲜报价 → NULL → 投影名义额 0，fail closed 等下一轮）
+                price = asset_prices.get(base)
                 positions_rows.append({
                     "symbol": f"{base}USDT",
                     "spot_qty": qty,
                     "perp_qty": perp_by_symbol.get(f"{base}USDT", Decimal("0")),
+                    "spot_price": price,
+                    "perp_price": price,
                 })
             for symbol, qty in sorted(perp_by_symbol.items()):
                 if qty == 0:
@@ -350,6 +355,8 @@ class AccountStateBuilder:
                     "symbol": symbol,
                     "spot_qty": Decimal("0"),
                     "perp_qty": qty,
+                    "spot_price": None,
+                    "perp_price": asset_prices.get(base),
                 })
             self.store.save_account_snapshot_group(
                 snapshot_id=snapshot_id,

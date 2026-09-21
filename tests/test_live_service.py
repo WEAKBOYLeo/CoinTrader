@@ -10,15 +10,25 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from cointrader.domain.account import AccountSnapshot
 from cointrader.live.decisions import DecisionKind
 from conftest import FakeStrategyData
-from live_helpers import NOW, NOW_MS, LiveFakeData, make_live_config, make_live_rates, make_service
+from live_helpers import (
+    NOW,
+    NOW_MS,
+    LiveFakeData,
+    make_live_config,
+    make_live_rates,
+    make_service,
+    seed_current_positions,
+)
 
 SYMBOL = "BTCUSDT"
 INTERVAL_MS = 8 * 3600 * 1000
@@ -59,20 +69,22 @@ class TestServiceCycle:
             spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
         )
 
-        # 1) 正费率 → OPEN 决策 → pipeline 落 OPEN intent（T2.4：不直接下单）
+        # 1) 正费率 → OPEN 决策 → 风险/计划链开仓一次（T3：计划化入口）
         r1 = svc.run_once()
         assert r1["state"] == "RUNNING"
-        assert env["executor"].open_calls == [], "T2 阶段 raw 开仓路径已移除"
-        assert len(r1["intents"]) == 1, f"应落一条 OPEN intent: {r1}"
+        assert [c["symbol"] for c in env["executor"].open_calls] == [SYMBOL]
+        assert len(r1["intents"]) == 1
         assert env["executor"].close_calls == []
 
-        # 2) 交易所确认持仓 → 重复信号不重复开仓/不重复 intent
+        # 2) 交易所确认持仓 → 账本 current projection（生产由对账更新）→
+        #    重复信号不重复开仓/不重复 intent
         spot.balances_map["BTC"] = Decimal("0.01")
         futures.position_amt = Decimal("-0.01")
+        seed_current_positions(env["store"], SYMBOL, "0.01", "-0.01")
         clock["t"] = NOW + 31
         r2 = svc.run_once()
         assert r2["state"] == "RUNNING"
-        assert env["executor"].open_calls == [], f"不得重复开仓: {r2}"
+        assert len(env["executor"].open_calls) == 1, f"不得重复开仓: {r2}"
         assert r2["intents"] == [], "HOLD 轮无新目标 → 无新 intent"
         assert env["executor"].close_calls == []
 
@@ -91,7 +103,7 @@ class TestServiceCycle:
         clock["t"] = NOW + 8 * 3600 + 93
         r4 = svc.run_once()
         assert r4["state"] == "RUNNING"
-        assert env["executor"].open_calls == [], f"平仓后费率仍为负，不得开新仓: {r4}"
+        assert len(env["executor"].open_calls) == 1, f"平仓后费率仍为负，不得开新仓: {r4}"
         assert r4["intents"] == []
         assert len(env["executor"].close_calls) == 1
 
@@ -120,8 +132,13 @@ class TestServiceCycle:
         r5 = svc2.run_once()
         assert r5["state"] == "RUNNING"
         assert env2["executor"].open_calls == [], "重启后费率仍为负，不得开新仓"
-        # 意图级去重（T2）：全周期只有第一条 OPEN intent（指纹幂等）
-        assert len(env2["store"].pipeline_records("portfolio_intent")) == 1
+        # 意图级去重：全周期恰好一条 OPEN intent（r1）与一条 CLOSE intent（r3）
+        actions = [
+            json.loads(x["payload_json"])["action"]
+            for x in env2["store"].pipeline_records("portfolio_intent")
+        ]
+        assert actions.count("OPEN") == 1
+        assert actions.count("CLOSE") == 1
         assert r5["intents"] == []
 
     def test_exit_failure_enters_recovery_and_no_new_risk(self, tmp_path):
@@ -134,7 +151,7 @@ class TestServiceCycle:
         data: FakeStrategyData = svc.strategy.data  # noqa: SLF001
 
         r1 = svc.run_once()
-        assert env["executor"].open_calls == [], "T2 阶段 raw 开仓路径已移除"
+        assert len(env["executor"].open_calls) == 1, "第一轮应开仓一次（计划化入口）"
         assert len(r1["intents"]) == 1
         spot.balances_map["BTC"] = Decimal("0.01")
         futures.position_amt = Decimal("-0.01")
@@ -164,7 +181,7 @@ class TestServiceCycle:
         # RECOVERY 期间再跑：不开新仓
         r3 = svc.run_once()
         assert r3["state"] in ("RECOVERY", "HALTED")
-        assert env["executor"].open_calls == [], "RECOVERY 禁止开新仓"
+        assert len(env["executor"].open_calls) == 1, "RECOVERY 禁止开新仓"
         _ = r1
 
 
@@ -172,6 +189,66 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestT3RiskGatePipeline:
+    """T3：intent → RiskDecision → plan → 计划化执行（拒绝时 broker 调用为 0）。"""
+
+    def test_incomplete_market_snapshot_blocks_new_risk(self, tmp_path):
+        """市场事实不可信（INCOMPLETE）→ CLOSE_ONLY：OPEN intent 落账、
+        RiskDecision 落账（CLOSE_ONLY），但 broker 调用 0、无执行计划。"""
+        from cointrader.domain.market import DataQuality, MarketSnapshot
+
+        env = _env(tmp_path)
+        svc = env["svc"]
+        svc.run_id = "run-riskblock"
+        bad = MarketSnapshot(
+            snapshot_id="bad",
+            generated_at_ms=0,
+            decision_cutoff_ms=0,
+            quality=DataQuality.INCOMPLETE,
+            quotes=(),
+        )
+        svc._market_snapshot_for = lambda symbol, now_ms: bad  # noqa: SLF001
+
+        r = svc.run_once()
+        assert r["state"] == "RUNNING"
+        assert len(r["intents"]) == 1, "OPEN intent 应落账（先于风险审批）"
+        assert env["executor"].open_calls == [], "市场事实不可信禁止新增风险"
+        assert env["executor"].close_calls == []
+        decisions = [
+            json.loads(x["payload_json"])
+            for x in env["store"].pipeline_records("risk_decision")
+        ]
+        assert len(decisions) == 1
+        assert decisions[0]["decision"] == "CLOSE_ONLY"
+        assert decisions[0]["symbol"] == SYMBOL
+        # 拒绝后不得创建执行计划
+        assert env["store"].pipeline_records("execution_plan") == []
+
+    def test_incomplete_account_snapshot_blocks_new_risk(self, tmp_path):
+        """账户资金未知（complete=False）→ 策略/风险两层都不得产生新增风险：
+        broker 调用 0、无执行计划（intent 是否落账取决于策略层先行拒绝）。"""
+        env = _env(tmp_path)
+        svc = env["svc"]
+        svc.run_id = "run-riskreject"
+        svc._account_snapshot = lambda now_ms: AccountSnapshot(  # noqa: SLF001
+            snapshot_id="broken",
+            capture_start_ms=now_ms,
+            capture_end_ms=now_ms,
+            complete=False,
+            equity=Decimal("0"),
+            available=Decimal("0"),
+        )
+
+        r = svc.run_once()
+        assert r["state"] == "RUNNING"
+        assert env["executor"].open_calls == [], "资金未知禁止新增风险"
+        assert env["executor"].close_calls == []
+        assert env["store"].pipeline_records("execution_plan") == []
+        # 若有 intent 落账，风险审批必须落 CLOSE_ONLY（不得 ALLOW/RESIZE）
+        for x in env["store"].pipeline_records("risk_decision"):
+            assert json.loads(x["payload_json"])["decision"] == "CLOSE_ONLY"
 
 
 class TestQuoteFetcher:

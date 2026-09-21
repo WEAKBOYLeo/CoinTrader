@@ -17,8 +17,12 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from ..domain.risk import ApprovedIntent
+from ..execution.pair_executor import PairPrecheckFailed
+from ..execution.planner import PlanError
 from ..execution.risk_gate import HaltState
 from ..execution.store import StoreError
 from ..execution.sync import SyncCaptureError
@@ -230,39 +234,11 @@ class ServiceRunner:
             svc.enter_recovery(f"signal_decision 写账本失败: {exc}")
             return {"state": "RECOVERY", "reason": svc._recovery_reason}
 
-        # 1) 退出 / 换仓（先写决策再平仓，§7.4）
-        for decision in decisions:
-            if decision.decision_kind not in (DecisionKind.EXIT, DecisionKind.REPLACE):
-                continue
-            if svc.mode == "shadow":
-                svc._on_alert(
-                    "SHADOW_EXIT",
-                    f"shadow 模式只记录退出意图: {decision.symbol} {decision.reason_code}",
-                )
-                continue
-            pair = svc.executor.close_pair(
-                decision.symbol,
-                reason=f"{decision.reason_code}: {decision.reason_text}",
-                run_id=svc.run_id,
-                signal_decision_id=decision.decision_id,
-                decision_ts_ms=decision.ts_ms,
-            )
-            if pair.status == "COMPLETE":
-                closed.append(decision.symbol)
-                svc._post_close(decision.symbol, pair)
-                if svc._state is not ServiceState.RUNNING:
-                    svc._persist_runtime_state()
-                    return {"state": svc.state.value, "reason": svc._recovery_reason}
-            else:
-                svc._on_alert("EXIT_FAILED", f"{decision.symbol}: {pair.status} {pair.error}")
-                svc.enter_recovery(f"平仓失败: {decision.symbol} {pair.status} {pair.error}")
-                svc._persist_runtime_state()
-                return {"state": svc.state.value, "reason": svc._recovery_reason}
-
-        # 2) 开仓：领域 pipeline（计划 4.0 T2）：proposal → intent（先落账 + 指纹幂等）。
-        #    raw executor.open_pair 直调路径已移除（T2.4）：新增风险必须经 T3 接通的
-        #    RiskKernel → ApprovedIntent → ExecutionPlan → submit；T2 阶段 intent
-        #    只落账，不触 broker。
+        # 1) 领域生产流水线（计划 4.0 T2/T3）：
+        #    proposal → intent（先落账 + 指纹幂等）→ RiskKernel 审批（RiskDecision
+        #    先落账）→ ApprovedIntent → ExecutionPlan（落账）→ 计划化执行入口
+        #    ``open_pair_from_plan``（开仓/平仓统一；平仓全 reduce-only）。
+        #    生产路径不存在 raw ``executor.open_pair``/``executor.close_pair`` 直调。
         view = svc._portfolio_view(now_ms)
         market_snap = svc._market_snapshot(now_ms)
         proposal = svc._build_strategy_proposal(decisions, view, market_snap, now_ms)
@@ -270,19 +246,152 @@ class ServiceRunner:
             proposal=proposal, view=view, now_ms=now_ms, run_id=svc.run_id or ""
         )
         intent_ids: list[str] = []
+        exit_reasons = {
+            d.symbol: (d.reason_code, d.reason_text) for d in decisions
+            if d.decision_kind in (DecisionKind.EXIT, DecisionKind.REPLACE)
+        }
         for intent in new_intents:
             intent_ids.append(intent.intent_id)
             svc.metrics.inc(
                 "pipeline_intent_count",
                 labels={"action": intent.action.value, "symbol": intent.symbol},
             )
+            symbol = intent.symbol
             if svc.mode == "shadow":
                 svc._on_alert(
                     "SHADOW_INTENT",
-                    f"shadow 模式只记录意图: {intent.symbol} {intent.action.value} "
+                    f"shadow 模式只记录意图: {symbol} {intent.action.value} "
                     f"spot={format(intent.target_spot_notional, 'f')} "
                     f"perp={format(intent.target_perp_notional, 'f')}",
                 )
+                continue
+
+            # -- 风险审批（先写 RiskDecision，fail closed） --
+            try:
+                decision = svc._risk_kernel.approve(
+                    intent,
+                    now_ms=now_ms,
+                    safety=svc._safety_state(now_ms),
+                    market=None if intent.is_closing else svc._market_snapshot_for(
+                        symbol, now_ms
+                    ),
+                    account=None if intent.is_closing else svc._account_snapshot(now_ms),
+                    risk_state=svc._risk_state_fn(),
+                )
+            except Exception as exc:  # noqa: BLE001 - 审批异常不得当通过
+                svc._on_alert("RISK_ERROR", f"风险审批异常: {symbol}: {exc}")
+                skipped.append(f"{symbol}: 风险审批异常")
+                continue
+            decision_payload = dict(decision.to_dict())
+            decision_payload["run_id"] = svc.run_id or ""
+            svc.store.append_risk_decision(decision_payload)
+            if not decision.allows_execution:
+                skipped.append(f"{symbol}: 风险 {decision.decision.value}: {decision.reason}")
+                svc._on_alert(
+                    "RISK_BLOCKED",
+                    f"风险审批未放行: {symbol} {decision.decision.value} {decision.reason}",
+                )
+                continue
+            try:
+                approved = ApprovedIntent.from_decision(intent, decision, now_ms=now_ms)
+            except Exception as exc:  # noqa: BLE001 - 审批证据异常不得进入执行
+                svc._on_alert("RISK_ERROR", f"ApprovedIntent 构造失败: {symbol}: {exc}")
+                skipped.append(f"{symbol}: 审批证据无效")
+                continue
+
+            # -- 执行计划（执行前重新获取新鲜报价；平仓取交易所实际持仓量） --
+            quote = svc._quote_fetcher(symbol)
+            if quote is None:
+                skipped.append(f"{symbol}: 提交前报价获取失败")
+                continue
+            close_spot_qty: Decimal | None = None
+            close_perp_qty: Decimal | None = None
+            if intent.is_closing:
+                try:
+                    close_spot_qty = svc.spot.balances().get(
+                        symbol.replace("USDT", ""), Decimal("0")
+                    )
+                    close_perp_qty = abs(svc.futures.position_qty(symbol))
+                except Exception as exc:  # noqa: BLE001
+                    svc.enter_recovery(f"平仓前持仓查询失败: {symbol}: {exc}")
+                    svc._persist_runtime_state()
+                    return {"state": svc.state.value, "reason": svc._recovery_reason}
+                if close_spot_qty <= 0 and close_perp_qty <= 0:
+                    # 交易所无实际持仓：无可平，跳过（不造 plan）
+                    skipped.append(f"{symbol}: 无实际持仓，跳过平仓")
+                    continue
+            try:
+                plan = svc._order_planner.plan(
+                    approved,
+                    spot_price=quote.spot_price,
+                    perp_price=quote.perp_price,
+                    spot_rules=svc.spot.rule(symbol),
+                    perp_rules=svc.futures.rule(symbol),
+                    close_spot_qty=close_spot_qty,
+                    close_perp_qty=close_perp_qty,
+                    now_ms=int(svc._now() * 1000),
+                    plan_id=f"plan-{intent.intent_id}",
+                )
+            except PlanError as exc:
+                skipped.append(f"{symbol}: 规划失败: {exc}")
+                svc._on_alert("PLAN_FAILED", f"{symbol}: {exc}")
+                continue
+            plan_payload = dict(plan.to_dict())
+            plan_payload["run_id"] = svc.run_id or ""
+            svc.store.append_execution_plan(plan_payload)
+
+            # 杠杆/保证金：固定池启动预检已验证；动态池 symbol 首次开仓时验证一次
+            if not intent.is_closing and symbol not in svc._leverage_checked:
+                lev, margin, _read = svc._check_leverage_margin(
+                    symbol, svc.config.execution.leverage, svc.config.execution.margin_type
+                )
+                if (lev, margin) != (svc.config.execution.leverage, svc.config.execution.margin_type):
+                    skipped.append(f"{symbol}: 杠杆/保证金 ({lev}, {margin}) 与配置不符，放弃开仓")
+                    svc._on_alert(
+                        "OPEN_FAILED", f"{symbol} 杠杆/保证金模式不符: ({lev}, {margin})"
+                    )
+                    continue
+                svc._leverage_checked.add(symbol)
+
+            # -- 计划化执行（开仓/平仓统一入口；raw open_pair/close_pair 已禁用） --
+            try:
+                if intent.is_closing:
+                    code, text = exit_reasons.get(symbol, ("PLAN_CLOSE", ""))
+                    close_reason = f"{code}: {text}".rstrip(": ")
+                else:
+                    close_reason = f"{intent.action.value}:{symbol}"
+                pair = svc.executor.open_pair_from_plan(
+                    plan,
+                    spot_price=quote.spot_price,
+                    perp_price=quote.perp_price,
+                    quote_ts_ms=quote.ts_ms,
+                    state=svc._risk_state_fn(),
+                    reason=close_reason,
+                    run_id=svc.run_id or "",
+                )
+            except PairPrecheckFailed as exc:
+                skipped.append(f"{symbol}: 计划预检失败: {exc}")
+                svc._on_alert("PLAN_PRECHECK_FAILED", f"{symbol}: {exc}")
+                continue
+            svc.metrics.inc("strategy_signal_count", labels={"symbol": symbol})
+            if intent.is_closing:
+                if pair.status == "COMPLETE":
+                    closed.append(symbol)
+                    svc._post_close(symbol, pair)
+                    if svc._state is not ServiceState.RUNNING:
+                        svc._persist_runtime_state()
+                        return {"state": svc.state.value, "reason": svc._recovery_reason}
+                else:
+                    svc._on_alert("EXIT_FAILED", f"{symbol}: {pair.status} {pair.error}")
+                    svc.enter_recovery(f"平仓失败: {symbol} {pair.status} {pair.error}")
+                    svc._persist_runtime_state()
+                    return {"state": svc.state.value, "reason": svc._recovery_reason}
+            elif pair.status == "COMPLETE":
+                opened.append(symbol)
+            else:
+                skipped.append(f"{symbol}: {pair.status} {pair.error}")
+                svc._on_alert("OPEN_FAILED", f"{symbol}: {pair.status} {pair.error}")
+
         svc._persist_runtime_state()
         return {
             "state": "RUNNING",
