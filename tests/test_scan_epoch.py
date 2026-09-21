@@ -216,7 +216,7 @@ class TestEpochCompleteness:
         data.set_rates(
             "LAGUSDT",
             make_rate_series(
-                # 最后结算距 cutoff 20h > 2×8h 间隔 = 真实结算滞后
+                # 最后结算距 cutoff 20h > 3×8h 间隔 = 真实结算滞后
                 # （若只慢 30 分钟，那是 cutoff 整点结算尚未入 API，不算滞后）
                 20, RATE_OK, end_ms=NOW_MS - 20 * 60 * 60 * 1000
             ),
@@ -543,4 +543,34 @@ class TestEightHourNormalization:
         epoch = sync.latest_ready()
         assert epoch is not None and epoch.status is ScanEpochStatus.READY
         assert "DYNUSDT" not in epoch.failed
+
+    def test_4h_declared_worst_case_not_lag(self, tmp_path) -> None:
+        """4h 声明周期币最坏时刻（末结算 04:00、下一笔 16:00、cutoff 06:00）
+        滞后 2×4h+ε < 3×4h → 不判滞后。回归：阈值 2× 时 live 实测 4h 币误判。"""
+        clock = {"t": NOW}
+        cutoff_ms = int(clock["t"] * 1000)
+        h = 3600 * 1000
+        base = (cutoff_ms // h) * h
+        # 结算在 4h 网格，末条 = base - 8h（下笔 base 在 4h 网格上，距 cutoff 近）
+        recs = [(base - (34 - i * 4) * h, Decimal("0.001"), Decimal("1")) for i in range(20)]
+        # 强制末条距 cutoff 恰 8h+ε 场景：删去 base 附近的结算
+        recs = [r for r in recs if r[0] <= base - 8 * h - 1]
+        assert (cutoff_ms - recs[-1][0]) > 2 * 4 * h  # 2× 阈值会误判
+        data = EpochFakeData(
+            {"FOURUSDT": recs},
+            universe=("FOURUSDT",),
+            interval_hours={"FOURUSDT": 4},
+            volumes_24h={"FOURUSDT": 50e6},
+            now_ms=NOW_MS,
+        )
+        data.funding_interval_hours = lambda symbol: 4  # type: ignore[method-assign]
+        cfg = _cfg()
+        sync = MarketDataSynchronizer(
+            config=cfg, data=data,
+            server_time_fn=lambda: cutoff_ms, now_fn=lambda: clock["t"],
+        )
+        sync.build_once()
+        epoch = sync.latest_ready()
+        assert epoch is not None and epoch.status is ScanEpochStatus.READY
+        assert "FOURUSDT" not in epoch.failed
 

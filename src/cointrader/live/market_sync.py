@@ -545,9 +545,11 @@ class MarketDataSynchronizer:
                 raise ValueError("无已可见的 8h 结算桶")
             if timestamps[-1] > cutoff:  # 防御：上面已过滤，正常不可达
                 raise ValueError(f"funding 桶 {timestamps[-1]} 晚于 cutoff {cutoff}")
-            # 不变量 3：真实结算滞后 = cutoff 距最后一条到账结算超过 2 个结算
-            # 间隔（8h 币 >16h、4h 币 >8h、1h 币 >2h）。间隔取 fundingInfo
-            # 声明值（动态周期币历史混合间隔，最小间隔推断会误判）；不能用
+            # 不变量 3：真实结算滞后 = cutoff 距最后一条到账结算超过 3 个结算
+            # 间隔。4h 币最坏情况（最后结算 04:00，下一笔 16:00，cutoff 在
+            # (04:00,16:00)）滞后 = 2×间隔+ε，故阈值取 3× 防误判；真滞后
+            # （>3 个间隔未出结算）仍能抓住。间隔取 fundingInfo 声明值
+            # （动态周期币历史混合间隔，最小间隔推断会误判）；不能用
             # 「cutoff 整点结算未到账」判滞后（刚发生的结算 API 可能未返回）
             declared_hours = _declared_interval_hours(self._data, symbol)
             settle_ms = (
@@ -555,9 +557,9 @@ class MarketDataSynchronizer:
                 if declared_hours is not None
                 else _infer_settle_interval_ms(raw)
             )
-            if cutoff - last_raw_ts[-1] > 2 * settle_ms:
+            if cutoff - last_raw_ts[-1] > 3 * settle_ms:
                 raise ValueError(
-                    f"最后结算 {last_raw_ts[-1]} 距 cutoff {cutoff} 超过 2 个结算间隔，结算滞后"
+                    f"最后结算 {last_raw_ts[-1]} 距 cutoff {cutoff} 超过 3 个结算间隔，结算滞后"
                 )
             # 取「闭合时间 <= cutoff 的最后一根 4h K 线」的闭合时间
             volume_end_ms = (cutoff // _KLINE_INTERVAL_MS + 1) * _KLINE_INTERVAL_MS
