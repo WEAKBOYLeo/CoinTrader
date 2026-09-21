@@ -274,7 +274,7 @@ class MarketDataSynchronizer:
             return None
         if building is not None:
             expected = len(building.expected_symbols)
-            completed = len(building.snapshots) - len(building.failed)
+            completed = max(0, len(building.snapshots) - len(building.failed))
             return DataReadiness(
                 epoch_id=building.epoch_id,
                 status=ScanEpochStatus.BUILDING,

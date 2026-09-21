@@ -78,11 +78,11 @@ _RETRYABLE_STATUS = frozenset({408, 425, 500, 502, 503, 504})
 
 #: K 线单次请求最大条数（币安硬限制，滑动窗口分页时必须遵守）
 KLINES_MAX_LIMIT = 1500
-FUNDING_MAX_LIMIT = 1000
 
-
-#: K 线单次请求最大条数（币安硬限制，滑动窗口分页时必须遵守）
-KLINES_MAX_LIMIT = 1500
+#: 资金费历史 API 名义上限 1000，但实测大 limit（>100）会被 WAF 间歇
+#: 403 拦截（2026-09-21 实测 limit=1000/500 → 403，limit=100 → 200）。
+#: 分页固定小页，总量由 limit 参数控制。
+FUNDING_PAGE_SIZE = 100
 FUNDING_MAX_LIMIT = 1000
 
 
@@ -489,13 +489,14 @@ class BinancePublicClient:
         ⚠️ 币安**只保留约 1 年的资金费历史**。更早的数据需要自己持续采集
         或从第三方获取。这个限制会影响回测的时间跨度，必须心里有数。
 
-        分页方式：``startTime`` 向前推。每页最多 1000 条。
+        分页方式：``startTime`` 向前推，每页固定 ``FUNDING_PAGE_SIZE`` 条
+        （大 limit 会被 WAF 间歇 403 拦截，不能把总量当单页 limit 发）。
 
         Args:
             symbol: 合约符号，如 ``BTCUSDT``。
             start_ms: 起始时间（毫秒，含）。
             end_ms: 结束时间（毫秒，含）。
-            limit: 单页条数上限。
+            limit: 返回总条数上限。
 
         Returns:
             按时间升序的结算记录列表，每条含 ``fundingTime`` /
@@ -508,8 +509,11 @@ class BinancePublicClient:
             cursor = start_ms
             seen_times: set[int] = set()
 
-            while True:
-                params: dict[str, Any] = {"symbol": symbol, "limit": limit}
+            while len(all_records) < limit:
+                params: dict[str, Any] = {
+                    "symbol": symbol,
+                    "limit": FUNDING_PAGE_SIZE,
+                }
                 if cursor is not None:
                     params["startTime"] = cursor
                 if end_ms is not None:
@@ -545,15 +549,15 @@ class BinancePublicClient:
                     seen_times.add(record["fundingTime"])
                 all_records.extend(fresh)
 
-                if len(page) < limit:
-                    break  # 最后一页
+                if len(all_records) >= limit or len(page) < FUNDING_PAGE_SIZE:
+                    break  # 够数或最后一页
 
                 cursor = max(r["fundingTime"] for r in fresh) + 1
                 if end_ms is not None and cursor > end_ms:
                     break
 
             all_records.sort(key=lambda r: r["fundingTime"])
-            return all_records
+            return all_records[:limit]
 
         key = make_key("funding_history", symbol, start_ms, end_ms, limit)
         # 历史资金费不会变（币安偶尔修订，但概率低），长 TTL

@@ -258,10 +258,15 @@ class RateLimitCoordinator:
                 wait_s = min(wait_s, remaining_budget)
             self._sleep(max(wait_s, 0.0))
         waited = self._clock() - start
-        if waited > 0:
+        if waited > 0.05:
             logger.info(
                 "限流等待 %.1fs 后放行（scope=%s priority=%s weight=%d critical=%s）",
                 waited, scope.value, priority.name, estimated_weight, critical,
+            )
+        else:
+            logger.debug(
+                "限流放行（scope=%s priority=%s weight=%d waited=%.3fs）",
+                scope.value, priority.name, estimated_weight, waited,
             )
         try:
             yield

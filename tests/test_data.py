@@ -835,16 +835,19 @@ class TestPagination:
     """分页逻辑 —— 分页写错会导致数据静默缺失。"""
 
     def test_funding_history_paginates(self, tmp_cache_dir: Path) -> None:
-        """超过单页上限时应持续翻页直到取完。"""
-        page_size = 3
-        total = 8
+        """多页拉取必须取全；单页 limit 固定 FUNDING_PAGE_SIZE（大 limit 会被 WAF 403）。"""
+        from cointrader.data.binance import FUNDING_PAGE_SIZE
+
+        total = 250  # 需要 3 页（100+100+50）
         base_time = 1_700_000_000_000
         step = 28_800_000
+        seen_limits: list[int] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             params = dict(request.url.params)
             start = int(params.get("startTime", 0))
-            limit = int(params.get("limit", 1000))
+            limit = int(params.get("limit", FUNDING_PAGE_SIZE))
+            seen_limits.append(limit)
             all_records: list[dict[str, str | int]] = [
                 {
                     "symbol": "BTCUSDT",
@@ -861,12 +864,14 @@ class TestPagination:
         client = BinancePublicClient(
             ApiConfig(), data_config, client=httpx.Client(transport=httpx.MockTransport(handler))
         )
-        records = client.funding_history("BTCUSDT", limit=page_size)
+        records = client.funding_history("BTCUSDT", limit=total)
 
         assert len(records) == total, f"分页应取回全部 {total} 条，实际 {len(records)} 条"
         times = [r["fundingTime"] for r in records]
         assert times == sorted(times), "结果应按时间升序"
         assert len(set(times)) == total, "不应有重复记录"
+        assert len(seen_limits) == 3, f"应分 3 页，实际 {len(seen_limits)} 次请求"
+        assert all(v == FUNDING_PAGE_SIZE for v in seen_limits), "单页 limit 必须 ≤ 100（防 WAF 403）"
         client.close()
 
     def test_pagination_terminates_on_no_progress(self, tmp_cache_dir: Path) -> None:
@@ -914,11 +919,11 @@ class TestPagination:
         client = BinancePublicClient(
             ApiConfig(), data_config, client=httpx.Client(transport=httpx.MockTransport(handler))
         )
-        records = client.funding_history("X", end_ms=3000, limit=2)
+        records = client.funding_history("X", end_ms=3000, limit=10)
 
         assert len(records) == 3
         # 取完后应停止，不应无限请求
-        assert calls["n"] <= 4, f"请求次数异常: {calls['n']}"
+        assert calls["n"] == 1, f"请求次数异常: {calls['n']}"
         client.close()
 
     def test_kline_pagination(self, tmp_cache_dir: Path) -> None:
