@@ -460,6 +460,14 @@ touch KILL_SWITCH
 rm KILL_SWITCH
 ```
 
+**删除停机文件不等于恢复交易**（3.0 起硬约束）：文件删除后闸门仍保持
+HALT_NEW_RISK，必须重新完成启动预检 + 对账并通过后才允许重新开仓
+（`RiskGate.recover(reconciliation_ok=True, preflight_ok=True)`；
+服务主循环的 RECOVERY→RUNNING 自愈路径自动执行该检查）。
+
+安全状态机另支持 `EMERGENCY_FLATTEN`（仅人工触发：只尝试撤单+平仓，
+其他一切请求拒绝）。
+
 **建议**：在真实交易时，把停机命令写好贴在终端里，需要时直接回车。
 
 ### 4.5 审计日志

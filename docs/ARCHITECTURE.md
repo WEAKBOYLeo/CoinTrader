@@ -35,6 +35,14 @@
 | `backtest/` | 读缓存、算指标 | 网络 IO、真实下单 |
 | `execution/` | 下单（**默认关闭**） | 被其他层 import |
 
+3.0 重构后新增的分层（见实施计划书 3.0）：`domain/`（纯领域契约，无 IO，
+最底层）、`strategy/` + `portfolio/`（纯计算，只依赖 domain/config）、
+`risk/`（风险内核 + 安全状态机，只依赖 config/domain 与 execution 的
+rule/gate 模块）、`ledger/` + `reconciliation/` + `observability/`（只读/
+只发布）、`application/`（唯一装配层：ServiceRunner 生命周期编排）；
+`live/` 保留兼容 facade。边界由
+`tests/test_architecture_boundaries.py` 静态强制。
+
 `execution` 层被 import 时本身不产生副作用，但任何真实下单路径都被
 `guard.py` 的闸门拦截，见 §4。
 
@@ -233,9 +241,14 @@ total_exposure <= max_total_exposure                                     # ⑤
 
 > 密钥泄露的后果是**全部资金归零**，不是"策略失效"。这一节的每一条都不是建议。
 
-### 4.3 风控闸门（`execution/risk.py`）
+### 4.3 风控闸门（`execution/risk.py` + `risk/kernel.py`）
 
-即使前两层都被绕过，风控层仍独立拒绝：
+即使前两层都被绕过，风控层仍独立拒绝。3.0 起风险判定分两层：
+`risk.kernel.RiskKernel`（同步审批，输出带逐条规则证据的 RiskDecision：
+ALLOW/RESIZE/CLOSE_ONLY/HALT/REJECT）+ `execution.risk_gate.RiskGate`
+（最终兼容闸门，开仓/减仓权限分离）；安全状态机（`risk.state_machine`）
+约束 STARTING/RUNNING/DEGRADED/RECOVERY/CLOSE_ONLY/HALTED/EMERGENCY_FLATTEN/
+STOPPED 的合法迁移，恢复必须 RECOVERY → RESUME_AFTER_CHECKS 显式两步。
 
 | 闸门 | 默认值 | 行为 |
 |---|---|---|
@@ -354,6 +367,16 @@ CoinTrader/
 │   ├── backtest/
 │   │   ├── engine.py            # 事件回测引擎（无前瞻）
 │   │   └── scenarios.py         # 破产情景分析
+│   ├── domain/                  # 领域契约（纯数据，无 IO）：快照/意图/风险决定/控制面
+│   ├── strategy/                # 纯策略层：FundingCarryEvaluator + 提案适配
+│   ├── portfolio/               # 组合规划：目标差异 diff（幂等 intent）
+│   ├── market_data/             # 市场数据端口与快照服务
+│   ├── account/                 # 账户端口与投影器（仅完整 capture 更新投影）
+│   ├── risk/                    # 风险内核 + 安全状态机 + RiskGate 适配
+│   ├── observability/           # 健康事件与控制命令发布（只发布不下单）
+│   ├── ledger/                  # 账本端口 + 只读 read model
+│   ├── reconciliation/          # 对账门面（gate 输入）
+│   ├── application/             # 应用编排（ServiceRunner 生命周期）
 │   └── execution/
 │       ├── guard.py             # 安全闸门（默认拒绝）
 │       ├── risk.py              # 风控限额

@@ -89,18 +89,31 @@ uv run cointrader scenarios
 docs/          架构设计与操作手册
 config/        唯一配置源（不含密钥）
 src/cointrader/
-  data/        只读币安公开 API（无限流+重试+缓存）
-  research/    纯计算：成本模型、绩效指标
-  backtest/    确定性回测引擎 + 破产情景分析
-  execution/   签名 REST、订单状态机、双腿执行、对账（默认禁用）
-  live/        实盘编排：启动预检、主循环、信号→意图（上层）、主循环看门狗
-  webui/       只读实时仪表盘（独立守护线程，/api/state + /healthz）
-  reporting/   报告导出
-tests/         含安全静态扫描与前瞻偏差证伪
+  domain/        领域契约（纯数据，无 IO）：快照/意图/风险决定/控制面/事件
+  strategy/      纯策略层：FundingCarryEvaluator（指标/门槛/槽位）+ 提案适配器
+  portfolio/     组合规划：目标差异 diff（幂等 intent）+ legacy 信号适配
+  market_data/   市场数据端口与快照服务（READY→FRESH 质量映射）
+  account/       账户端口与投影器（仅完整 capture 更新 current projection）
+  risk/          风险内核（RiskDecision 规则证据）+ 安全状态机 + RiskGate 适配
+  observability/ 健康事件与控制命令发布（只发布，不产生订单）
+  ledger/        账本端口 + 只读 read model（tombstone 默认隐藏）
+  reconciliation/ 对账门面（capture + facts 同步 + 对账 → gate 输入）
+  application/   应用编排（ServiceRunner：tick/恢复/心跳/看门狗/停机）
+  data/          只读币安公开 API（无限流+重试+缓存）
+  research/      纯计算：成本模型、绩效指标
+  backtest/      确定性回测引擎 + 破产情景分析
+  execution/     签名 REST、订单状态机、双腿执行、对账器、账本存储（默认禁用）
+  live/          实盘兼容 facade：启动预检、LiveService、市场同步、看门狗
+  webui/         只读实时仪表盘（独立守护线程，/api/state + /healthz）
+  reporting/     报告导出
+tests/         含安全静态扫描、前瞻偏差证伪与架构边界测试
 ```
 
-依赖方向严格单向：`data/`、`research/`、`backtest/` 不得 import `execution/`；
-只有 `live/` 可以同时调用 `data/`、`research/` 与 `execution/`（`test_safety.py` 静态验证）。
+依赖方向严格单向（`tests/test_architecture_boundaries.py` 静态验证）：
+`domain/` 无任何外部依赖；`data/`、`research/`、`backtest/` 不得 import
+`execution/`；策略侧（`strategy/`、`portfolio/`、`risk/` 内核）禁止 import
+Binance client / `data/` / 网络 IO；`risk/` 只允许依赖 config、domain 与
+execution 的 rule/gate 模块；只有 `application/` 与 `live/` 可以装配全部层。
 
 ## 实盘执行（分阶段，见 docs/开发设计文档.md）
 
