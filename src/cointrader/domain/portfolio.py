@@ -19,6 +19,7 @@ from enum import Enum
 
 from .common import (
     InvalidDomainValue,
+    parse_bool,
     parse_decimal,
     parse_enum,
     parse_int_ms,
@@ -119,6 +120,9 @@ class PortfolioIntent:
       不含 ``created_at_ms``/``correlation_id``/``causation_id``，
       因此重复输入不产生新指纹，重复 intent 可去重。
     - ``CLOSE``/平仓语义下两腿目标名义额必须为 0（由 ``__post_init__`` 保证）。
+    - ``reduces_risk`` 是可观察的减风险属性：``CLOSE`` 必须为 ``True``；
+      ``RESIZE`` 由 planner 按目标总量与当前总量比较计算；``OPEN``/``REPLACE``
+      为 ``False``（换仓的排序保证先平后开，不先扩大敞口）。
     """
 
     intent_id: str
@@ -132,6 +136,7 @@ class PortfolioIntent:
     created_at_ms: int
     correlation_id: str | None = None
     causation_id: str | None = None
+    reduces_risk: bool = False
 
     def __post_init__(self) -> None:
         if not self.intent_id:
@@ -144,6 +149,10 @@ class PortfolioIntent:
             self.target_spot_notional != 0 or self.target_perp_notional != 0
         ):
             raise InvalidDomainValue(f"CLOSE 意图的两腿目标名义额必须为 0: {self.symbol}")
+        if self.action is IntentAction.CLOSE and not self.reduces_risk:
+            raise InvalidDomainValue(
+                f"CLOSE 意图必须是减风险（reduces_risk=True 不可被清除）: {self.symbol}"
+            )
 
     @property
     def is_closing(self) -> bool:
@@ -174,14 +183,24 @@ class PortfolioIntent:
             "created_at_ms": self.created_at_ms,
             "correlation_id": self.correlation_id,
             "causation_id": self.causation_id,
+            "reduces_risk": self.reduces_risk,
             "fingerprint": self.fingerprint(),
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> PortfolioIntent:
+        action = parse_enum(IntentAction, data.get("action"), "PortfolioIntent.action")
+        # reduces_risk：旧数据无此字段时按语义推导（CLOSE 必为减风险），
+        # 保持序列化向后兼容；新数据显式解析并校验。
+        raw_reduces = data.get("reduces_risk")
+        reduces_risk = (
+            action is IntentAction.CLOSE
+            if raw_reduces is None
+            else parse_bool(raw_reduces, "PortfolioIntent.reduces_risk")
+        )
         intent = cls(
             intent_id=parse_str(data.get("intent_id"), "PortfolioIntent.intent_id"),
-            action=parse_enum(IntentAction, data.get("action"), "PortfolioIntent.action"),
+            action=action,
             symbol=parse_str(data.get("symbol"), "PortfolioIntent.symbol"),
             target_spot_notional=parse_decimal(
                 data.get("target_spot_notional"), "PortfolioIntent.target_spot_notional"
@@ -203,6 +222,7 @@ class PortfolioIntent:
             causation_id=parse_optional(
                 data.get("causation_id"), "PortfolioIntent.causation_id", parse_str
             ),
+            reduces_risk=reduces_risk,
         )
         stored = data.get("fingerprint")
         if stored is not None and stored != intent.fingerprint():

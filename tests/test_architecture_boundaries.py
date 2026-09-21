@@ -258,3 +258,39 @@ class TestWebuiHasNoBrokerOrExecutor:
             if pattern.search(content):
                 violations.append(f"{rel}: 源码文本出现 broker/transport/guard import")
         assert violations == [], "\n".join(violations)
+
+
+class TestRiskKernelHasNoFloatArithmetic:
+    """T1：风险内核金额边界全 Decimal（kernel.py 内禁止 float 金额转换）。
+
+    legacy ``RiskManager`` 的 float API 只允许在 ``risk/adapter.py`` 做
+    一次性单向边界转换（Decimal→float，返回仅 bool/str），不得进入内核。
+    """
+
+    def test_kernel_source_has_no_float_calls(self, src_root: Path) -> None:
+        import re
+
+        kernel = src_root / "risk" / "kernel.py"
+        assert kernel.is_file(), "risk/kernel.py 不存在"
+        hits = [
+            f"line {i}: {line.strip()}"
+            for i, line in enumerate(kernel.read_text(encoding="utf-8").splitlines(), 1)
+            if re.search(r"\bfloat\s*\(", line) and not line.strip().startswith("#")
+        ]
+        assert hits == [], (
+            "risk/kernel.py 出现 float 金额转换（全链路应 Decimal）:\n" + "\n".join(hits)
+        )
+
+    def test_risk_exposure_port_is_decimal_typed(self, src_root: Path) -> None:
+        import re
+
+        kernel = (src_root / "risk" / "kernel.py").read_text(encoding="utf-8")
+        assert re.search(
+            r"total_exposure:\s*Decimal", kernel
+        ), "RiskExposure.total_exposure 必须声明为 Decimal"
+        assert re.search(
+            r"symbol_exposure:\s*dict\[str,\s*Decimal\]", kernel
+        ), "RiskExposure.symbol_exposure 必须声明为 dict[str, Decimal]"
+        assert re.search(
+            r"def check_order\(self,\s*symbol: str,\s*notional: Decimal", kernel
+        ), "RiskRulesPort.check_order 金额参数必须为 Decimal"

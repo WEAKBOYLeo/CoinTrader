@@ -287,11 +287,45 @@ class TestPortfolioIntent:
 
     def test_close_intent_requires_zero_targets(self) -> None:
         with pytest.raises(InvalidDomainValue, match="CLOSE"):
-            _intent(action=IntentAction.CLOSE, target_spot_notional=DEC("1"))
+            _intent(action=IntentAction.CLOSE, target_spot_notional=DEC("1"), reduces_risk=True)
         close = _intent(
-            action=IntentAction.CLOSE, target_spot_notional=DEC("0"), target_perp_notional=DEC("0")
+            action=IntentAction.CLOSE, target_spot_notional=DEC("0"), target_perp_notional=DEC("0"), reduces_risk=True
         )
         assert close.is_closing
+
+    def test_close_intent_requires_reduces_risk(self) -> None:
+        with pytest.raises(InvalidDomainValue, match="reduces_risk"):
+            _intent(
+                action=IntentAction.CLOSE,
+                target_spot_notional=DEC("0"),
+                target_perp_notional=DEC("0"),
+                reduces_risk=False,
+            )
+
+    def test_reduces_risk_round_trip_and_legacy_compat(self) -> None:
+        intent = _intent(reduces_risk=True)
+        data = intent.to_dict()
+        restored = PortfolioIntent.from_dict(json.loads(json.dumps(data)))
+        assert restored.reduces_risk is True
+        # 旧数据（无 reduces_risk 字段）：CLOSE 按语义推导为 True，保持兼容
+        close = _intent(
+            action=IntentAction.CLOSE,
+            target_spot_notional=DEC("0"),
+            target_perp_notional=DEC("0"),
+            reduces_risk=True,
+        )
+        legacy_data = close.to_dict()
+        del legacy_data["reduces_risk"]
+        assert PortfolioIntent.from_dict(legacy_data).reduces_risk is True
+        # 旧数据非 CLOSE → 默认 False
+        legacy_data2 = _intent().to_dict()
+        del legacy_data2["reduces_risk"]
+        assert PortfolioIntent.from_dict(legacy_data2).reduces_risk is False
+        # 新数据显式 False + CLOSE → 拒绝
+        bad = close.to_dict()
+        bad["reduces_risk"] = False
+        with pytest.raises(InvalidDomainValue, match="reduces_risk"):
+            PortfolioIntent.from_dict(bad)
 
     def test_round_trip_verifies_stored_fingerprint(self) -> None:
         intent = _intent()
@@ -357,6 +391,7 @@ class TestRiskDecisionChain:
             action=IntentAction.CLOSE,
             target_spot_notional=DEC("0"),
             target_perp_notional=DEC("0"),
+            reduces_risk=True,
         )
         decision = _decision(
             requested_spot_notional=DEC("0"),
@@ -381,6 +416,71 @@ class TestRiskDecisionChain:
         restored = RiskDecision.from_dict(json.loads(json.dumps(_decision().to_dict())))
         assert restored == _decision()
         assert restored.rules[0].passed is True
+
+    # -- T1：ApprovedIntent 契约强化 -------------------------------------------
+
+    def test_is_closing_cannot_be_forged(self) -> None:
+        with pytest.raises(InvalidDomainValue, match="is_closing"):
+            ApprovedIntent(
+                intent=_intent(),
+                decision_id="d1",
+                approved_spot_notional=DEC("100"),
+                approved_perp_notional=DEC("99"),
+                decided_at_ms=1000,
+                valid_until_ms=2000,
+                is_closing=True,
+            )
+
+    def test_approved_cannot_exceed_intent_target(self) -> None:
+        with pytest.raises(InvalidDomainValue, match="收紧"):
+            ApprovedIntent(
+                intent=_intent(),
+                decision_id="d1",
+                approved_spot_notional=DEC("101"),
+                approved_perp_notional=DEC("99"),
+                decided_at_ms=1000,
+                valid_until_ms=2000,
+            )
+        with pytest.raises(InvalidDomainValue, match="收紧"):
+            ApprovedIntent(
+                intent=_intent(),
+                decision_id="d1",
+                approved_spot_notional=DEC("100"),
+                approved_perp_notional=DEC("100"),
+                decided_at_ms=1000,
+                valid_until_ms=2000,
+            )
+
+    def test_from_decision_requires_intent_snapshot(self) -> None:
+        with pytest.raises(InvalidDomainValue, match="快照"):
+            ApprovedIntent.from_decision(
+                _intent(), _decision(snapshot_ids=("other",)), now_ms=1500
+            )
+
+    def test_from_decision_rejects_causality_violation(self) -> None:
+        with pytest.raises(InvalidDomainValue, match="因果"):
+            ApprovedIntent.from_decision(
+                _intent(), _decision(decided_at_ms=999, valid_until_ms=2000), now_ms=1500
+            )
+
+    def test_from_decision_rejects_lookahead(self) -> None:
+        # 审批时点 >= 意图创建但早于决策截止 → 无前瞻被破坏
+        early_intent = _intent(created_at_ms=900)
+        with pytest.raises(InvalidDomainValue, match="无前瞻"):
+            ApprovedIntent.from_decision(
+                early_intent,
+                _decision(decided_at_ms=950, valid_until_ms=2000),
+                now_ms=1500,
+            )
+
+    def test_correlation_fields_survive_serialization(self) -> None:
+        intent = _intent(correlation_id="corr-9", causation_id="cause-9")
+        approved = ApprovedIntent.from_decision(intent, _decision(), now_ms=1500)
+        restored = ApprovedIntent.from_dict(json.loads(json.dumps(approved.to_dict())))
+        assert restored == approved
+        assert restored.intent.correlation_id == "corr-9"
+        assert restored.intent.causation_id == "cause-9"
+        assert restored.intent.fingerprint() == intent.fingerprint()
 
 
 class TestExecutionPlan:
@@ -457,6 +557,7 @@ class TestExecutionPlan:
             action=IntentAction.CLOSE,
             target_spot_notional=DEC("0"),
             target_perp_notional=DEC("0"),
+            reduces_risk=True,
         )
         decision = _decision(
             requested_spot_notional=DEC("0"),

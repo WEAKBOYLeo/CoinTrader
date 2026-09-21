@@ -18,7 +18,7 @@ from cointrader.domain.portfolio import IntentAction, PortfolioIntent
 from cointrader.domain.risk import ApprovedIntent, RiskDecisionKind
 from cointrader.execution.risk import Position, RiskManager, RiskState
 from cointrader.risk.adapter import RiskRulesAdapter
-from cointrader.risk.kernel import RiskKernel
+from cointrader.risk.kernel import RiskExposure, RiskKernel
 from live_helpers import NOW_MS, make_live_config
 
 NOW = NOW_MS
@@ -35,6 +35,7 @@ def make_intent(action: IntentAction = IntentAction.OPEN, spot: str = "100", per
         snapshot_id="snap-1",
         decision_cutoff_ms=NOW - 1000,
         created_at_ms=NOW,
+        reduces_risk=action is IntentAction.CLOSE,
     )
 
 
@@ -254,3 +255,61 @@ def test_rejected_decision_cannot_become_approved_intent(kernel):
 def test_safety_state_requires_reason():
     with pytest.raises(InvalidDomainValue):
         SafetyState(SafetyStateKind.RUNNING, reason="", changed_at_ms=NOW)
+
+
+# -- T1：全链路 Decimal 端口 + 快照一致性 ------------------------------------
+
+
+class _RecordingRules:
+    """记录端口金额类型的 fake ``RiskRulesPort``（验证内核不做 float 转换）。"""
+
+    def __init__(self, *, allow: bool = True) -> None:
+        self.allow = allow
+        self.notional_types: list[type] = []
+        self._exp = RiskExposure(Decimal("0"), {})
+
+    def preflight_all(self, state: object) -> tuple[tuple[str, bool, str], ...]:
+        return (("risk_preflight", True, "ok"),)
+
+    def check_order(self, symbol: str, notional: Decimal, state: object) -> tuple[bool, str]:
+        self.notional_types.append(type(notional))
+        return (self.allow, "ok" if self.allow else "单币种限额超限")
+
+    def exposure(self, state: object) -> RiskExposure:
+        return self._exp
+
+
+def test_kernel_passes_decimal_notional_to_rules_port():
+    rules = _RecordingRules()
+    kernel = RiskKernel(make_live_config(), rules=rules)
+    d = _approve(kernel, make_intent())
+    assert d.decision is RiskDecisionKind.ALLOW
+    assert rules.notional_types == [Decimal]
+
+
+def test_success_decision_includes_intent_snapshot_id(kernel):
+    d = _approve(kernel, make_intent())
+    # 审批必须引用意图输入快照（ApprovedIntent.from_decision 可静态校验）
+    assert "snap-1" in d.snapshot_ids
+
+
+def test_resize_path_all_decimal():
+    """RESIZE 收紧路径全 Decimal：fake 规则拒绝后，批准额 = 可用额度，
+    且端口收到的金额类型均为 Decimal（内核不做 float 转换）。"""
+    cfg = make_live_config()
+    rules = _RecordingRules(allow=False)
+    rules._exp = RiskExposure(Decimal("380"), {"BTCUSDT": Decimal("380")})
+    kernel = RiskKernel(cfg, rules=rules)
+    state = make_risk_state()
+    state.positions["BTCUSDT"] = Position(
+        symbol="BTCUSDT", spot_qty=1.9, perp_qty=1.9, spot_price=100.0, perp_price=100.0
+    )  # 当前敞口 380；单币种上限 500 → 可用 120
+    d = _approve(kernel, make_intent(), risk_state=state)
+    assert d.decision is RiskDecisionKind.RESIZE
+    assert d.approved_spot_notional + d.approved_perp_notional == Decimal("120")
+    assert rules.notional_types == [Decimal]
+    # 适配器路径：legacy float 事实 → Decimal 端口（一次性边界转换）
+    adapter = RiskRulesAdapter(RiskManager(cfg.risk))
+    port_exp = adapter.exposure(state)
+    assert isinstance(port_exp.total_exposure, Decimal)
+    assert all(isinstance(v, Decimal) for v in port_exp.symbol_exposure.values())

@@ -208,8 +208,14 @@ class ApprovedIntent:
                 "valid_until_ms 不得早于 decided_at_ms"
                 f"（{self.valid_until_ms} < {self.decided_at_ms}）"
             )
-        if self.intent.is_closing and not self.is_closing:
-            raise InvalidDomainValue("CLOSE 意图的 ApprovedIntent.is_closing 不得被清除")
+        if self.is_closing != self.intent.is_closing:
+            raise InvalidDomainValue(
+                "ApprovedIntent.is_closing 必须与意图平仓语义一致（不可被清除或伪造）"
+            )
+        if self.approved_spot_notional > self.intent.target_spot_notional:
+            raise InvalidDomainValue("批准名义额不得超过意图目标（风险只收紧不放宽）: spot")
+        if self.approved_perp_notional > self.intent.target_perp_notional:
+            raise InvalidDomainValue("批准名义额不得超过意图目标（风险只收紧不放宽）: perp")
 
     @classmethod
     def from_decision(
@@ -219,10 +225,25 @@ class ApprovedIntent:
         *,
         now_ms: int,
     ) -> ApprovedIntent:
-        """只可从有效 RiskDecision 创建：ALLOW/RESIZE、未过期、symbol 一致。"""
+        """只可从有效 RiskDecision 创建：ALLOW/RESIZE、未过期、symbol 一致，
+        且审批必须引用意图输入快照、审批时点不得早于意图创建/决策截止（因果与无前瞻）。"""
         if decision.symbol != intent.symbol:
             raise InvalidDomainValue(
                 f"审批决定与意图 symbol 不一致: {decision.symbol} != {intent.symbol}"
+            )
+        if intent.snapshot_id not in decision.snapshot_ids:
+            raise InvalidDomainValue(
+                f"审批决定缺少意图输入快照 id（输入快照不一致）: {intent.snapshot_id}"
+            )
+        if decision.decided_at_ms < intent.created_at_ms:
+            raise InvalidDomainValue(
+                "审批时点早于意图创建时点（因果链断裂）: "
+                f"decided={decision.decided_at_ms} < created={intent.created_at_ms}"
+            )
+        if decision.decided_at_ms < intent.decision_cutoff_ms:
+            raise InvalidDomainValue(
+                "审批时点早于决策截止（无前瞻被破坏）: "
+                f"decided={decision.decided_at_ms} < cutoff={intent.decision_cutoff_ms}"
             )
         if not decision.allows_execution:
             raise RiskNotApproved(

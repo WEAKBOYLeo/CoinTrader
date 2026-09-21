@@ -23,7 +23,19 @@ __all__ = [
 
 
 class MarketDataPort(Protocol):
-    """公开市场事实端口：发布 ``MarketSnapshot`` 与质量状态。"""
+    """公开市场事实端口：发布 ``MarketSnapshot`` 与质量状态。
+
+    契约（实施计划书 4.0 T1 统一）：
+
+    - ``snapshot`` 是**唯一**事实入口；quality/cutoff/freshness 不另设独立
+      端口方法，全部由 ``MarketSnapshot`` 字段承载：
+      质量 = ``quality``（FRESH 才可新增风险）；
+      cutoff = ``decision_cutoff_ms``（不得越过决定时点，无前瞻）；
+      新鲜度 = 调用方以 ``generated_at_ms``/报价 ``quote_time_ms`` 对当前
+      时钟比较得出，不得由策略自行推断。
+    - 失败/无数据不得伪造默认价格：返回带明确非 FRESH 质量的快照
+      （空 quotes = INCOMPLETE）或领域数据错误。
+    """
 
     def snapshot(self, symbols: Sequence[str] | None = None) -> MarketSnapshot:
         """当前市场事实横截面。``symbols`` 给定则只含这些 symbol。"""

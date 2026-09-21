@@ -21,7 +21,7 @@ import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import Protocol
 
 from ..config import Config
@@ -36,10 +36,14 @@ __all__ = ["RiskExposure", "RiskRulesPort", "RiskKernel"]
 
 @dataclass(frozen=True, slots=True)
 class RiskExposure:
-    """内核所需的最小敞口事实（由 execution 侧 RiskState 投影而来）。"""
+    """内核所需的最小敞口事实（由 execution 侧 RiskState 投影而来）。
 
-    total_exposure: float
-    symbol_exposure: dict[str, float]
+    金额边界一律 ``Decimal``（实施计划书 4.0 T1）：禁止 float 进入内核，
+    也禁止 float→Decimal 往返。
+    """
+
+    total_exposure: Decimal
+    symbol_exposure: dict[str, Decimal]
 
 
 class RiskRulesPort(Protocol):
@@ -47,11 +51,12 @@ class RiskRulesPort(Protocol):
 
     实现见 ``risk.adapter.RiskRulesAdapter``（包裹
     ``execution.risk.RiskManager``）。返回 ``(规则名, 是否通过, 原因)``。
+    金额边界一律 ``Decimal``。
     """
 
     def preflight_all(self, state: object) -> tuple[tuple[str, bool, str], ...]: ...
 
-    def check_order(self, symbol: str, notional: float, state: object) -> tuple[bool, str]: ...
+    def check_order(self, symbol: str, notional: Decimal, state: object) -> tuple[bool, str]: ...
 
     def exposure(self, state: object) -> RiskExposure: ...
 
@@ -206,7 +211,7 @@ class RiskKernel:
                 rules, "账户快照时间异常",
             )
         rules.append(RuleEvidence("account_complete", True, f"snapshot={account.snapshot_id}"))
-        snap_ids = (market.snapshot_id, account.snapshot_id)
+        snap_ids = (intent.snapshot_id, market.snapshot_id, account.snapshot_id)
 
         # 5) 数值风控规则（经 RiskRulesPort；限额/日亏/对冲/基差）
         if risk_state is None:
@@ -230,15 +235,18 @@ class RiskKernel:
                 rules, failed, snapshot_ids=snap_ids,
             )
 
-        ok, why = self._rules.check_order(intent.symbol, float(requested_total), risk_state)
+        ok, why = self._rules.check_order(intent.symbol, requested_total, risk_state)
         if ok:
             rules.append(RuleEvidence("risk_limits", True, why))
         else:
-            # 超限：尝试 RESIZE（批准额 = 可用额度）
+            # 超限：尝试 RESIZE（批准额 = 可用额度；ROUND_FLOOR 只收紧方向，
+            # 杜绝舍入后批准额超过请求）
             affordable = self._affordable(intent.symbol, risk_state)
             if affordable > 0:
                 scale = affordable / requested_total
-                new_spot = (requested_spot * scale).quantize(Decimal("0.01"))
+                new_spot = (requested_spot * scale).quantize(
+                    Decimal("0.01"), rounding=ROUND_FLOOR
+                )
                 new_perp = (affordable - new_spot) if requested_perp > 0 else Decimal("0")
                 if new_spot < 0 or new_perp < 0:
                     new_spot, new_perp = Decimal("0"), Decimal("0")
@@ -268,17 +276,18 @@ class RiskKernel:
         )
 
     def _affordable(self, symbol: str, risk_state: object) -> Decimal:
-        """单币种/总敞口/单笔上限内可放行的最大名义额。"""
+        """单币种/总敞口/单笔上限内可放行的最大名义额（全 Decimal）。"""
         cfg = self.config.risk
         exp = self._rules.exposure(risk_state)
         return min(
             Decimal(str(cfg.max_notional_per_order)),
             max(
-                Decimal(str(cfg.max_exposure_per_symbol)) - Decimal(str(exp.symbol_exposure.get(symbol, 0.0))),
+                Decimal(str(cfg.max_exposure_per_symbol))
+                - exp.symbol_exposure.get(symbol, Decimal("0")),
                 Decimal("0"),
             ),
             max(
-                Decimal(str(cfg.max_total_exposure)) - Decimal(str(exp.total_exposure)),
+                Decimal(str(cfg.max_total_exposure)) - exp.total_exposure,
                 Decimal("0"),
             ),
         )

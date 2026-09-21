@@ -68,6 +68,8 @@ class PortfolioPlanner:
             spot: Decimal,
             perp: Decimal,
             reason: str,
+            *,
+            reduces_risk: bool = False,
         ) -> PortfolioIntent:
             intent_id = intent_fingerprint(
                 action, symbol, spot, perp, view.snapshot_id, view.as_of_ms
@@ -84,6 +86,7 @@ class PortfolioPlanner:
                 created_at_ms=created_at_ms,
                 correlation_id=correlation_id,
                 causation_id=causation_id,
+                reduces_risk=reduces_risk,
             )
 
         # 1) 当前持仓：目标清零/缺失 → CLOSE；目标变化 → RESIZE；一致 → 无意图
@@ -102,6 +105,7 @@ class PortfolioPlanner:
                         Decimal("0"),
                         Decimal("0"),
                         f"目标组合已移除 {symbol}（当前名义额 {format(held, 'f')}）",
+                        reduces_risk=True,
                     )
                 )
             elif held == 0 and target_notional > 0 and tgt is not None:
@@ -127,6 +131,8 @@ class PortfolioPlanner:
                         f"调整 {symbol}（spot {format(pos.spot_notional, 'f')} → "
                         f"{format(tgt.spot_notional, 'f')}，perp {format(pos.perp_notional, 'f')} → "
                         f"{format(tgt.perp_notional, 'f')}）",
+                        # RESIZE 可增可减：目标总量小于当前总量才是减风险
+                        reduces_risk=target_notional < held,
                     )
                 )
             # 一致（含双方均为 0）→ 无意图：重复评估不产生重复 intent
@@ -169,6 +175,8 @@ class PortfolioPlanner:
                     created_at_ms=i.created_at_ms,
                     correlation_id=i.correlation_id,
                     causation_id=i.causation_id,
+                    # 开新腿本身是增风险；不先扩大总敞口由 CLOSE 在前排序保证
+                    reduces_risk=i.reduces_risk,
                 )
                 for i in opens
             ]

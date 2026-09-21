@@ -16,10 +16,19 @@ __all__ = ["AccountQueryPort", "UserStreamStatusPort"]
 
 
 class AccountQueryPort(Protocol):
-    """私有账户事实端口：一次 REST capture → 领域 ``AccountSnapshot``。"""
+    """私有账户事实端口：一次 REST capture → 领域 ``AccountSnapshot``；
+    另暴露最近一次完整 capture 的 current 投影（只读）。"""
 
     def capture(self) -> AccountSnapshot:
         """capture 失败不得抛裸异常后猜值；返回 ``complete=False`` 的领域错误快照。"""
+        ...
+
+    def current(self) -> AccountSnapshot | None:
+        """最近一次完整 capture 的投影；``None`` = 尚无可信状态（未知状态）。
+
+        查询层只读 current；返回 ``None``/过期时调用方必须按「未知状态」
+        处理，不得用旧值/默认值放行新风险。
+        """
         ...
 
 

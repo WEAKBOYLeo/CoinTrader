@@ -182,3 +182,80 @@ class TestDomainPortfolioEdge:
                 decision_cutoff_ms=0,
                 created_at_ms=0,
             )
+
+
+class TestReducesRiskAndExposureInvariant:
+    """T1：减风险可观察字段 + 换仓「任何时刻敞口不先扩大」前缀不变量。"""
+
+    def test_reduces_risk_flags(self) -> None:
+        planner = PortfolioPlanner()
+        # CLOSE → True；RESIZE-down → True；RESIZE-up → False；OPEN → False
+        view = _view(
+            {
+                "AAAUSDT": ("100", "100"),  # RESIZE up → 200
+                "BBBUSDT": ("100", "100"),  # RESIZE down → 50
+                "CCCUSDT": ("10", "10"),  # CLOSE
+            }
+        )
+        target = _target(
+            {
+                "AAAUSDT": ("200", "200"),
+                "BBBUSDT": ("50", "50"),
+                "DDDUSDT": ("80", "80"),  # OPEN
+            }
+        )
+        intents = planner.diff(target, view, created_at_ms=T0)
+        by_symbol = {i.symbol: i for i in intents}
+        assert by_symbol["CCCUSDT"].reduces_risk is True
+        assert by_symbol["BBBUSDT"].reduces_risk is True
+        assert by_symbol["AAAUSDT"].reduces_risk is False
+        assert by_symbol["DDDUSDT"].reduces_risk is False
+
+    def test_resize_down_only_when_target_below_held(self) -> None:
+        planner = PortfolioPlanner()
+        view = _view({"AAAUSDT": ("200", "200")})
+        up = planner.diff(
+            _target({"AAAUSDT": ("400", "400")}), view, created_at_ms=T0
+        )[0]
+        down = planner.diff(
+            _target({"AAAUSDT": ("100", "100")}), view, created_at_ms=T0
+        )[0]
+        assert up.action is IntentAction.RESIZE and up.reduces_risk is False
+        assert down.action is IntentAction.RESIZE and down.reduces_risk is True
+
+    def test_replace_prefix_never_exceeds_max_exposure(self) -> None:
+        """换仓：按 planner 输出顺序逐个应用，任何前缀的该组总敞口
+        ≤ max(旧总量, 新总量)（先平旧后开新，不先扩大）。"""
+        planner = PortfolioPlanner()
+        old_total = Decimal("300")  # AAA (100,100) + BBB (50,50)
+        new_total = Decimal("90")  # CCC (45,45)
+        view = _view({"AAAUSDT": ("100", "100"), "BBBUSDT": ("50", "50")})
+        target = _target({"CCCUSDT": ("45", "45")})
+        intents = planner.diff(target, view, created_at_ms=T0)
+        # CLOSE 全部在前，REPLACE 在后
+        assert all(i.action is IntentAction.CLOSE for i in intents[:2])
+        assert intents[2].action is IntentAction.REPLACE
+
+        exposure = {e.symbol: e.spot_notional + e.perp_notional for e in view.entries}
+        bound = max(old_total, new_total)
+        for intent in intents:
+            delta = (
+                intent.target_spot_notional + intent.target_perp_notional
+            ) - exposure.get(intent.symbol, Decimal("0"))
+            exposure[intent.symbol] = exposure.get(intent.symbol, Decimal("0")) + delta
+            assert sum(exposure.values()) <= bound, (
+                f"前缀 {intent.symbol}/{intent.action} 后敞口超过 max(旧,新)"
+            )
+
+    def test_close_intent_serialization_carries_reduces_risk(self) -> None:
+        import json
+
+        from cointrader.domain.portfolio import PortfolioIntent
+
+        planner = PortfolioPlanner()
+        view = _view({"AAAUSDT": ("100", "100")})
+        close = planner.diff(_target({}), view, created_at_ms=T0)[0]
+        assert close.reduces_risk is True
+        restored = PortfolioIntent.from_dict(json.loads(json.dumps(close.to_dict())))
+        assert restored.reduces_risk is True
+        assert restored == close

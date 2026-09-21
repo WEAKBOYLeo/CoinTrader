@@ -6,9 +6,11 @@
   （查询故障不得影响执行主循环）。
 - 事件、current projection、read model 与唯一键继续使用同一事务
   （由 StateStore 保证，本层不拆事务）。
+- ``PipelineLedgerPort``：pipeline 持久化写侧协议（append + 幂等；
+  实施计划书 4.0 T1 定义，实现随 T2/T3 落 ``execution.store``）。
 """
 
-from .ports import LedgerPort
+from .ports import LedgerPort, PipelineLedgerPort
 from .service import LedgerQueryService
 
-__all__ = ["LedgerPort", "LedgerQueryService"]
+__all__ = ["LedgerPort", "LedgerQueryService", "PipelineLedgerPort"]

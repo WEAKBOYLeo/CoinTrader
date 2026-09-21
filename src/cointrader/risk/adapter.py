@@ -8,6 +8,7 @@ Broker。新开风险必须同时通过内核与闸门；本适配器只做状�
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import cast
 
 from ..domain.control import SafetyStateKind
@@ -85,6 +86,9 @@ class RiskRulesAdapter:
 
     内核只依赖端口（config + domain）；本适配器把 ``RiskManager`` 的
     限额/日亏/对冲/基差检查投影成纯数据 ``(规则名, 是否通过, 原因)``。
+    端口金额边界为 ``Decimal``（实施计划书 4.0 T1）：legacy ``RiskManager``
+    的 float API 仅在本适配器做**一次性单向** Decimal→float 边界转换，
+    返回只有 bool/str 判定，不存在 float→Decimal 往返。
     """
 
     def __init__(self, manager: RiskManager) -> None:
@@ -96,13 +100,13 @@ class RiskRulesAdapter:
         worst = next((v.reason for v in verdicts if not v.allowed), "全部数值风控检查通过")
         return (("risk_preflight", all_ok, worst),)
 
-    def check_order(self, symbol: str, notional: float, state: object) -> tuple[bool, str]:
-        v = self._manager.check_order(symbol, notional, cast(RiskState, state))
+    def check_order(self, symbol: str, notional: Decimal, state: object) -> tuple[bool, str]:
+        v = self._manager.check_order(symbol, float(notional), cast(RiskState, state))
         return (v.allowed, v.reason)
 
     def exposure(self, state: object) -> RiskExposure:
         st = cast(RiskState, state)
         return RiskExposure(
-            total_exposure=st.total_exposure,
-            symbol_exposure={s: p.notional for s, p in st.positions.items()},
+            total_exposure=Decimal(str(st.total_exposure)),
+            symbol_exposure={s: Decimal(str(p.notional)) for s, p in st.positions.items()},
         )

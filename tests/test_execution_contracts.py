@@ -42,6 +42,7 @@ def make_intent(action: IntentAction = IntentAction.OPEN) -> PortfolioIntent:
         snapshot_id="snap-1",
         decision_cutoff_ms=NOW - 1000,
         created_at_ms=NOW,
+        reduces_risk=action is IntentAction.CLOSE,
     )
 
 
@@ -145,6 +146,28 @@ def test_open_plan_rejects_bad_price(planner):
             spot_rules=make_rule("spot"),
             perp_rules=make_rule("perp"),
             now_ms=NOW,
+        )
+
+
+def test_expired_approved_intent_rejected_before_planning(planner):
+    approved = make_approved(make_intent())
+    expired = ApprovedIntent(
+        intent=approved.intent,
+        decision_id=approved.decision_id,
+        approved_spot_notional=approved.approved_spot_notional,
+        approved_perp_notional=approved.approved_perp_notional,
+        decided_at_ms=NOW - 60_000,
+        valid_until_ms=NOW - 30_000,  # 已过期
+    )
+    with pytest.raises(PlanError, match="过期"):
+        planner.plan(
+            expired,
+            spot_price=PRICE,
+            perp_price=PRICE,
+            spot_rules=make_rule("spot"),
+            perp_rules=make_rule("perp"),
+            now_ms=NOW,
+            plan_id="plan-expired-approved",
         )
 
 

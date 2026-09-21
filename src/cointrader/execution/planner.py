@@ -67,6 +67,11 @@ class OrderPlanner:
         """
         now_ms = _now_ms() if now_ms is None else now_ms
         plan_id = plan_id or new_id("plan")
+        if approved.is_expired(now_ms):
+            raise PlanError(
+                f"ApprovedIntent 已过期（valid_until={approved.valid_until_ms}, "
+                f"now={now_ms}），拒绝规划（过期计划不可提交）"
+            )
         closing = approved.is_closing
         symbol = approved.intent.symbol
 

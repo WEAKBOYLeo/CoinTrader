@@ -114,10 +114,17 @@ class _FakeQuery:
     def __init__(self, snapshots: list[AccountSnapshot]) -> None:
         self._snaps = list(snapshots)
         self.calls = 0
+        self._current: AccountSnapshot | None = None
 
     def capture(self) -> AccountSnapshot:
         self.calls += 1
-        return self._snaps.pop(0)
+        snap = self._snaps.pop(0)
+        if snap.complete:
+            self._current = snap
+        return snap
+
+    def current(self) -> AccountSnapshot | None:
+        return self._current
 
 
 def _snap(complete: bool, id: str = "a1") -> AccountSnapshot:
