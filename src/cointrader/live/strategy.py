@@ -907,7 +907,11 @@ class PublicDataStrategyProvider:
         from ..data.funding import fetch_funding_history
 
         interval = self.funding_interval_hours(symbol)
-        start_ms = int(self._now() * 1000) - (periods + 5) * interval * 3600 * 1000
+        # start 锚到 8h 网格：同一 8h 窗口内缓存键稳定，epoch 重试/重建命中
+        # 磁盘缓存，避免每 pass 重复 3 页拉取触发 WAF 速率拦截
+        span_ms = (periods + 5) * interval * 3600 * 1000
+        _grid = 8 * 3600 * 1000
+        start_ms = (int(self._now() * 1000) - span_ms) // _grid * _grid
         frame = fetch_funding_history(self.client, symbol, start_ms=start_ms)
         rates = frame["funding_rate"]
         marks = frame["mark_price"]

@@ -263,8 +263,8 @@ class TestSchedulerAndEpochConfig:
 
     def test_project_config_loads_new_execution_fields(self, project_root: Path) -> None:
         config = load_config(project_root / "config" / "config.yaml")
-        assert config.execution.candidate_refresh_concurrency == 4
-        assert config.execution.scan_epoch_deadline_seconds == 600
+        assert config.execution.candidate_refresh_concurrency == 2
+        assert config.execution.scan_epoch_deadline_seconds == 900
         assert config.execution.candidate_quote_top_k == 10
         assert config.execution.max_quote_skew_ms == 500
         assert config.execution.recovery_backfill_days == 30

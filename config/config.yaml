@@ -212,10 +212,12 @@ execution:
   candidate_pool_max_symbols: 100
   # 动态候选池刷新周期（秒）；失败保留旧池
   universe_refresh_seconds: 1800
-  # 候选后台刷新有界并发（共享 weight 调度，1..16）
-  candidate_refresh_concurrency: 4
+  # 候选后台刷新有界并发（共享 weight 调度，1..16）；2026-09-21 实测 4 并发
+  # burst 会触发币安 WAF 403 速率拦截 + 429，降到 2 把 burst 拉长
+  candidate_refresh_concurrency: 2
   # scan epoch 构建截止（秒）：超时标 DEGRADED 并告警，绝不放行交易
-  scan_epoch_deadline_seconds: 600
+  # （403 退避重试会让冷构建变慢，600s 不够，放宽到 900s）
+  scan_epoch_deadline_seconds: 900
   # READY 排名后取执行报价的最大候选数（top K）
   candidate_quote_top_k: 10
   # Spot/Futures 报价接收时间最大偏差（毫秒），超过则本轮 SKIP

@@ -73,8 +73,8 @@ FAPI_KLINES = "/fapi/v1/klines"
 FAPI_TICKER_24H = "/fapi/v1/ticker/24hr"
 FAPI_OPEN_INTEREST = "/fapi/v1/openInterest"
 
-#: 币安返回的错误码 → 是否可重试
-_RETRYABLE_STATUS = frozenset({408, 425, 500, 502, 503, 504})
+#: 币安返回的错误码 → 是否可重试（403 HTML = WAF 按速率拦截，退避重试可恢复）
+_RETRYABLE_STATUS = frozenset({403, 408, 425, 500, 502, 503, 504})
 
 #: K 线单次请求最大条数（币安硬限制，滑动窗口分页时必须遵守）
 KLINES_MAX_LIMIT = 1500
