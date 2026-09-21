@@ -31,6 +31,7 @@ from inspect import signature
 from typing import Any, Protocol
 
 from ..config import Config
+from ..data.funding import normalize_funding_records_to_8h
 from ..errors import CoinTraderError
 
 logger = logging.getLogger(__name__)
@@ -487,29 +488,38 @@ class MarketDataSynchronizer:
     def _fetch_candidate(
         self, builder: _EpochBuilder, symbol: str, periods: int
     ) -> CandidateSnapshot:
-        """拉取单个候选并校验 cutoff 不变量；任何失败带 error 返回（failed 而非 excluded）。"""
+        """拉取单个候选并校验 cutoff 不变量；任何失败带 error 返回（failed 而非 excluded）。
+
+        费率统一聚合到 8h 结算桶（与回测同口径）：4h 币每桶 2 期、1h 币
+        每桶 8 期，桶费率 = 桶内求和。候选的「期」一律 = 8h 日历天，
+        避免不同周期币的决策窗口/持有期/交易频率语义漂移。
+        """
         cutoff = builder.decision_cutoff_ms
         try:
-            interval_hours = int(self._data.funding_interval_hours(symbol))
+            # 原始事件数 = 目标 8h 桶数 × 每桶最多 8 期（1h 币），保证桶数充足
+            raw_periods = periods * 8
             if self._funding_supports_end_ms:
-                raw = self._data.funding_rates(symbol, periods, end_ms=cutoff)
+                raw = self._data.funding_rates(symbol, raw_periods, end_ms=cutoff)
             else:
-                raw = self._data.funding_rates(symbol, periods)
+                raw = self._data.funding_rates(symbol, raw_periods)
             # 不变量 1：只用 cutoff 前已发生的结算（synchronizer 兜底过滤）
             raw = [(ts, r, m) for ts, r, m in raw if ts <= cutoff]
             if not raw:
                 raise ValueError("无资金费历史")
-            timestamps = [int(ts) for ts, _, _ in raw]
-            rates = tuple(Decimal(str(r)) for _, r, _ in raw)
-            marks = tuple(Decimal(str(m)) for _, _, m in raw)
+            # 不变量 2：统一 8h 桶；结束点 > cutoff 的桶未可见（无前瞻）
+            timestamps, bucket_rates, marks = normalize_funding_records_to_8h(
+                raw, cutoff_ms=cutoff
+            )
+            if not timestamps:
+                raise ValueError("无已可见的 8h 结算桶")
             if timestamps[-1] > cutoff:  # 防御：上面已过滤，正常不可达
-                raise ValueError(f"funding 行 {timestamps[-1]} 晚于 cutoff {cutoff}")
-            # 不变量 2：cutoff 前应有的最后一次结算必须已到账（结算滞后 = failed）
+                raise ValueError(f"funding 桶 {timestamps[-1]} 晚于 cutoff {cutoff}")
+            # 不变量 3：cutoff 前应可见的最后一个 8h 桶必须已到账（结算滞后 = failed）
             expected_last = timestamps[-1]
-            next_settle = timestamps[-1] + interval_hours * 3600 * 1000
+            next_settle = timestamps[-1] + 8 * 3600 * 1000
             if next_settle <= cutoff:
                 raise ValueError(
-                    f"应有结算 {next_settle} 未到账（cutoff={cutoff}），结算滞后"
+                    f"应有 8h 桶 {next_settle} 未到账（cutoff={cutoff}），结算滞后"
                 )
             # 取「闭合时间 <= cutoff 的最后一根 4h K 线」的闭合时间
             volume_end_ms = (cutoff // _KLINE_INTERVAL_MS + 1) * _KLINE_INTERVAL_MS
@@ -536,9 +546,9 @@ class MarketDataSynchronizer:
         return CandidateSnapshot(
             epoch_id=builder.epoch_id,
             symbol=symbol,
-            interval_hours=interval_hours,
-            rates=rates,
-            mark_prices=marks,
+            interval_hours=8,
+            rates=tuple(bucket_rates),
+            mark_prices=tuple(marks),
             timestamps=tuple(timestamps),
             expected_last_funding_ms=expected_last,
             volume_window_end_ms=volume_end_ms,

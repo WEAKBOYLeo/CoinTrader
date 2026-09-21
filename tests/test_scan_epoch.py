@@ -437,3 +437,57 @@ class TestPairExclusion:
         assert epoch is not None and epoch.status is ScanEpochStatus.READY
         assert "AUSDT" in epoch.funding_last_ts_ms
         assert epoch.excluded == {}
+
+
+class TestEightHourNormalization:
+    """live 口径对齐回测：4h 币自动两期聚合为一个 8h 桶（桶内求和），
+    候选的「期」统一 = 8h 日历天。"""
+
+    def test_4h_symbol_bucketed_to_8h_in_epoch_snapshot(self, tmp_path) -> None:
+        from conftest import make_rate_series
+
+        clock = {"t": NOW}
+        cutoff_ms = int(clock["t"] * 1000)
+        # 40 个 4h 结算（20 个 8h 桶），右端锚定到逻辑时钟
+        rates4h = make_rate_series(40, "0.001", interval_ms=4 * 3600 * 1000, end_ms=cutoff_ms)
+        data = EpochFakeData(
+            {"FASTUSDT": rates4h},
+            universe=("FASTUSDT",),
+            interval_hours={"FASTUSDT": 4},
+            volumes_24h={"FASTUSDT": 50e6},
+            now_ms=NOW_MS,
+        )
+        cfg = _cfg()
+        sync = MarketDataSynchronizer(
+            config=cfg,
+            data=data,
+            server_time_fn=lambda: cutoff_ms,
+            now_fn=lambda: clock["t"],
+        )
+        sync.build_once()
+        epoch = sync.latest_ready()
+        assert epoch is not None and epoch.status is ScanEpochStatus.READY
+        snap = sync.snapshots_for(epoch.epoch_id)["FASTUSDT"]
+        # 40 个 4h 结算（右端锚点前一格）：首尾各 1 个单期桶 + 中间 19 个双期桶 = 21 桶
+        assert snap.interval_hours == 8
+        assert len(snap.rates) == 21
+        assert snap.rates[0] == Decimal("0.001")
+        assert all(r == Decimal("0.002") for r in snap.rates[1:-1])
+        assert snap.rates[-1] == Decimal("0.001")
+        for ts in snap.timestamps:
+            assert ts % (8 * 3600 * 1000) == 0
+        assert snap.timestamps[-1] == cutoff_ms
+        # 年化按 8h 桶：0.002 × 3 × 365
+        strat = LiveStrategy(
+            config=cfg, data=data,
+            store=StateStore(tmp_path / "trading.sqlite3"),
+            strategy_version="t", config_hash="t", now_fn=lambda: clock["t"],
+            synchronizer=sync,
+        )
+        strat.refresh_candidates()
+        cache = strat.candidates["FASTUSDT"]
+        trailing, _streak = strat._entry_metrics(cache)
+        # 年化 = 最近 lookback 桶均值 × 3 × 365（8h 标准）
+        lb = cfg.strategy.entry.lookback_periods
+        expect = sum(cache.rates[-lb:], Decimal("0")) / lb * 3 * 365
+        assert trailing == expect
