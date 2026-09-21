@@ -191,6 +191,10 @@ class MarketDataSynchronizer:
         now_fn: 本地时钟（秒）。
         excluded_symbols: 确定性 excluded（无共同规则/非 TRADING 等，带 reason）；
             由 service 在装配时传入，universe 内命中即 excluded 而非 failed。
+        exclusion_fn: 动态排除判定（symbol → reason 或 None）；每次 epoch 构建时
+            对每个候选调用，命中即 excluded。用于可开仓对预筛（无现货/合约
+            交易对、非 TRADING、最小名义额超 canary）——未接入时这些币会进入
+            后续筛选并永久占用开仓槽位（demo 受限对实测）。
     """
 
     def __init__(
@@ -201,12 +205,14 @@ class MarketDataSynchronizer:
         server_time_fn: Callable[[], int] | None = None,
         now_fn: Callable[[], float] = time.time,
         excluded_symbols: Mapping[str, str] | None = None,
+        exclusion_fn: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
         self._data = data
         self._now = now_fn
         self._server_time = server_time_fn
         self._excluded_symbols: dict[str, str] = dict(excluded_symbols or {})
+        self._exclusion_fn = exclusion_fn
 
         self._lock = threading.Lock()
         self._building: _EpochBuilder | None = None
@@ -399,6 +405,12 @@ class MarketDataSynchronizer:
         expected: list[str] = []
         for symbol in pool:
             reason = self._excluded_symbols.get(symbol)
+            if reason is None and self._exclusion_fn is not None:
+                try:
+                    reason = self._exclusion_fn(symbol)
+                except Exception:  # noqa: BLE001 —— fn 异常 ≠ 确定性排除，交给后续闸门
+                    logger.warning("可开仓预筛 %s 异常（不剔除）", symbol, exc_info=True)
+                    reason = None
             if reason is not None:
                 excluded[symbol] = reason
             else:

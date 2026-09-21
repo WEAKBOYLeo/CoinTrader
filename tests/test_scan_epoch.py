@@ -83,6 +83,7 @@ def _env(
     *,
     fail: set[str] | None = None,
     excluded: dict[str, str] | None = None,
+    exclusion_fn: object | None = None,
     config: Config | None = None,
     **exec_overrides: object,
 ) -> tuple[LiveStrategy, MarketDataSynchronizer, EpochFakeData, dict]:
@@ -102,6 +103,7 @@ def _env(
         server_time_fn=lambda: int(clock["t"] * 1000),
         now_fn=lambda: clock["t"],
         excluded_symbols=excluded,
+        exclusion_fn=exclusion_fn,  # type: ignore[arg-type]
     )
     store = StateStore(tmp_path / "trading.sqlite3")
     strat = LiveStrategy(
@@ -389,3 +391,49 @@ class TestOldEpochNoMix:
         assert decisions["BBBUSDT"].scan_epoch_id == second
         pending = [s for s, d in decisions.items() if d.decision_kind is DecisionKind.PENDING_QUOTE]
         assert pending[0] == "BBBUSDT", "排名必须基于新 epoch 横截面（BBB 最高收益）"
+
+
+class TestPairExclusion:
+    """可开仓对预筛（exclusion_fn）：无现货/合约腿的币在 epoch 构建时
+    直接 excluded，不进排名、不占开仓槽位。
+
+    回归：demo 受限对（BR/BTW/PIEVERSE 无 demo 现货交易对）资金费排名最高
+    → 永久占满 top3 槽位 → 报价永远失败（STALE_QUOTE）→ 10+ 小时零开仓。
+    """
+
+    def test_excluded_pair_does_not_occupy_open_slot(self, tmp_path) -> None:
+        rates = {"BRUSDT": RATE_HIGH, "XMRUSDT": RATE_OK}
+        strat, sync, data, clock = _env(
+            tmp_path,
+            rates,
+            exclusion_fn=lambda s: "无现货交易对" if s == "BRUSDT" else None,
+        )
+        sync.build_once()
+        epoch = sync.latest_ready()
+        assert epoch is not None and epoch.status is ScanEpochStatus.READY
+        assert epoch.excluded.get("BRUSDT") == "无现货交易对"
+        assert "XMRUSDT" in epoch.funding_last_ts_ms
+
+        strat.refresh_candidates()
+        decisions = {d.symbol: d for d in strat.evaluate(_ctx(clock))}
+        # excluded 币不参与评估（不在候选内）；有现货腿的 XMR 正常进排名，
+        # 全闸通过（PENDING_QUOTE = 等新鲜报价，ctx 未带报价）
+        assert "BRUSDT" not in decisions
+        assert decisions["XMRUSDT"].decision_kind in (
+            DecisionKind.OPEN,
+            DecisionKind.PENDING_QUOTE,
+        )
+
+    def test_exclusion_fn_exception_keeps_symbol_in_expected(self, tmp_path) -> None:
+        """fn 异常 ≠ 确定性排除：symbol 留在 expected，交给后续闸门。"""
+
+        def boom(_s: str) -> str | None:
+            raise RuntimeError("rules unavailable (fake)")
+
+        rates = {"AUSDT": RATE_OK}
+        _strat, sync, _data, _clock = _env(tmp_path, rates, exclusion_fn=boom)
+        sync.build_once()
+        epoch = sync.latest_ready()
+        assert epoch is not None and epoch.status is ScanEpochStatus.READY
+        assert "AUSDT" in epoch.funding_last_ts_ms
+        assert epoch.excluded == {}

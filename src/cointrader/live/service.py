@@ -144,12 +144,14 @@ class LiveService:
         futures_endpoint: str = "",
         synchronizer: MarketDataSynchronizer | None = None,
         exch_sync: ExchangeStateSynchronizer | None = None,
+        pair_exclusion_fn: Callable[[str], str | None] | None = None,
     ) -> None:
         self.config = config
         self.mode = config.execution.mode
         self.fresh_wait_seconds = fresh_wait_seconds
         self.spot = spot
         self.futures = futures
+        self._pair_exclusion_fn = pair_exclusion_fn
         self.store = store
         self.gate = gate
         self.executor = executor
@@ -751,25 +753,31 @@ class LiveService:
             dynamic_pool = self.strategy is not None and self.strategy.dynamic_pool
             if dynamic_pool and self.strategy is not None:
                 self.strategy.refresh_universe()
-                canary = Decimal(str(self.config.execution.canary_notional))
-                allowed: set[str] = set()
-                for symbol in self.strategy.candidate_symbols:
-                    spot_rule = spot_rules.get(symbol)
-                    perp_rule = perp_rules.get(symbol)
-                    if spot_rule is None or perp_rule is None:
-                        continue
-                    healthy = True
-                    for rule in (spot_rule, perp_rule):
-                        status = getattr(rule, "status", "")
-                        if status and status != "TRADING":
-                            healthy = False
-                            break
-                        min_notional = getattr(rule, "min_notional", None)
-                        if min_notional is not None and canary < Decimal(str(min_notional)):
-                            healthy = False
-                            break
-                    if healthy:
-                        allowed.add(symbol)
+                if self._pair_exclusion_fn is not None:
+                    allowed = {
+                        s for s in self.strategy.candidate_symbols
+                        if self._pair_exclusion_fn(s) is None
+                    }
+                else:
+                    canary = Decimal(str(self.config.execution.canary_notional))
+                    allowed = set()
+                    for symbol in self.strategy.candidate_symbols:
+                        spot_rule = spot_rules.get(symbol)
+                        perp_rule = perp_rules.get(symbol)
+                        if spot_rule is None or perp_rule is None:
+                            continue
+                        healthy = True
+                        for rule in (spot_rule, perp_rule):
+                            status = getattr(rule, "status", "")
+                            if status and status != "TRADING":
+                                healthy = False
+                                break
+                            min_notional = getattr(rule, "min_notional", None)
+                            if min_notional is not None and canary < Decimal(str(min_notional)):
+                                healthy = False
+                                break
+                        if healthy:
+                            allowed.add(symbol)
                 pruned = self.strategy.prune_universe(allowed)
                 report.symbols = tuple(self.strategy.candidate_symbols)
                 logger.info(
@@ -1451,8 +1459,43 @@ def build_live_context(  # noqa: PLR0913
     )
 
     provider = PublicDataStrategyProvider(config, client=public_client)
+    # 可开仓对预筛（§启动预检同一口径）：无现货/合约交易对、非 TRADING、
+    # 最小名义额超 canary → epoch 构建时直接 excluded，不进入后续筛选。
+    # 规则 5 分钟刷新（exchangeInfo 变化不频繁）；规则不可用时返回 None
+    # （≠确定性排除，放行后由开仓闸门再次拦截）。
+    canary_notional = Decimal(str(config.execution.canary_notional))
+    _rules_cache: dict[str, Any] = {"ts": 0.0, "spot": {}, "perp": {}}
+
+    def _pair_exclusion_reason(symbol: str) -> str | None:
+        if time.monotonic() - float(_rules_cache["ts"]) > 300:
+            try:
+                _rules_cache["spot"] = spot.load_rules()
+                _rules_cache["perp"] = futures.load_rules()
+                _rules_cache["ts"] = time.monotonic()
+            except Exception:  # noqa: BLE001 —— 刷新失败保留旧规则
+                logger.warning("现货/合约规则刷新失败（保留旧规则）", exc_info=True)
+        spot_map = _rules_cache["spot"]
+        perp_map = _rules_cache["perp"]
+        if not spot_map or not perp_map:
+            return None
+        spot_rule = spot_map.get(symbol)
+        if spot_rule is None:
+            return "无现货交易对"
+        perp_rule = perp_map.get(symbol)
+        if perp_rule is None:
+            return "无合约交易对"
+        for name, rule in (("现货", spot_rule), ("合约", perp_rule)):
+            status = getattr(rule, "status", "")
+            if status and status != "TRADING":
+                return f"{name}非TRADING({status})"
+            min_notional = getattr(rule, "min_notional", None)
+            if min_notional is not None and canary_notional < Decimal(str(min_notional)):
+                return f"{name}最小名义额{min_notional}超canary"
+        return None
+
     # T2/T3：scan epoch 同步器（后台有界并发，交易主循环只读 READY 快照）
-    synchronizer = MarketDataSynchronizer(config=config, data=provider)
+    synchronizer = MarketDataSynchronizer(config=config, data=provider,
+                                          exclusion_fn=_pair_exclusion_reason)
 
     service = LiveService(
         config=config,
@@ -1479,6 +1522,7 @@ def build_live_context(  # noqa: PLR0913
         futures_endpoint=futures_url,
         synchronizer=synchronizer,
         exch_sync=exch_sync,
+        pair_exclusion_fn=_pair_exclusion_reason,
     )
 
     # 测试网/demo 的 user stream 端点可在 config 中覆盖（demo trading 域名不同）
