@@ -84,6 +84,32 @@ class IntentAction(str, Enum):
     REPLACE = "REPLACE"
 
 
+def intent_fingerprint(
+    action: IntentAction,
+    symbol: str,
+    target_spot_notional: Decimal,
+    target_perp_notional: Decimal,
+    snapshot_id: str,
+    decision_cutoff_ms: int,
+) -> str:
+    """确定性幂等指纹：只取语义字段（不含 id/时间戳/关联 id）。"""
+
+    def canon(value: Decimal) -> str:
+        return format(value, "f")
+
+    payload = "|".join(
+        [
+            action.value,
+            symbol,
+            canon(target_spot_notional),
+            canon(target_perp_notional),
+            snapshot_id,
+            str(decision_cutoff_ms),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
 @dataclass(frozen=True)
 class PortfolioIntent:
     """从目标组合到当前组合的差异。
@@ -126,21 +152,14 @@ class PortfolioIntent:
 
     def fingerprint(self) -> str:
         """确定性幂等指纹（sha256 前 32 位十六进制）。"""
-
-        def canon(value: Decimal) -> str:
-            return format(value, "f")
-
-        payload = "|".join(
-            [
-                self.action.value,
-                self.symbol,
-                canon(self.target_spot_notional),
-                canon(self.target_perp_notional),
-                self.snapshot_id,
-                str(self.decision_cutoff_ms),
-            ]
+        return intent_fingerprint(
+            self.action,
+            self.symbol,
+            self.target_spot_notional,
+            self.target_perp_notional,
+            self.snapshot_id,
+            self.decision_cutoff_ms,
         )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
     def to_dict(self) -> dict[str, object]:
         return {

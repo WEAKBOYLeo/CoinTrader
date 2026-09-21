@@ -13,6 +13,10 @@
    名义额检查（portfolio.py），资金费策略判断在本模块。
 5. 去重统一入口 ``can_open()``：实际持仓 / 非终态 pair / intent / order /
    本轮已提交，任一成立禁止重复开仓（§7.3）。
+6. **判断逻辑委托**（实施计划书 3.0 T2）：指标计算与入场/退出/排序判断
+   全部在纯 evaluator（``cointrader.strategy.funding_carry.FundingCarryEvaluator``）
+   中执行；本类只保留 IO（候选刷新、去重查询、报价获取/校验）与
+   ``StrategyDecision`` 组装，公开调用签名保持不变。
 
 无未来数据：所有窗口右端都是当前点，只用已结算（已可见）资金费。
 """
@@ -29,6 +33,15 @@ from typing import Any, Protocol
 from ..config import Config
 from ..errors import LiveGateBlocked
 from ..execution.store import StateStore
+from ..strategy.funding_carry import (
+    CandidateInput,
+    CarryEvaluation,
+    EvalContext,
+    EvalKind,
+    FundingCarryEvaluator,
+    HeldInput,
+    QuoteInput,
+)
 from . import portfolio
 from .decisions import DecisionKind, ReasonCode, StrategyDecision
 from .market_sync import MarketDataSynchronizer, ScanEpoch
@@ -43,8 +56,6 @@ __all__ = [
     "Quote",
     "StrategyDataProvider",
 ]
-
-_HOURS_PER_YEAR = Decimal(24 * 365)
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +141,33 @@ class LiveContext:
     market_data_ready: bool = True
 
 
+class _StoreDedupProbe:
+    """账本只读去重查询 → 纯 evaluator 的 ``DedupProbe``。"""
+
+    def __init__(self, store: StateStore) -> None:
+        self._store = store
+
+    def active_pair(self, symbol: str) -> bool:
+        return self._store.active_pair_for_symbol(symbol) is not None
+
+    def has_open_intent(self, symbol: str) -> bool:
+        return bool(self._store.has_open_intent(symbol))
+
+    def has_open_order(self, symbol: str) -> bool:
+        return bool(self._store.has_open_order(symbol))
+
+
 # ---------------------------------------------------------------------------
 # 协调器
 # ---------------------------------------------------------------------------
 
 
 class LiveStrategy:
-    """实时策略协调器。
+    """实时策略协调器（兼容 facade）。
+
+    判断逻辑委托 ``FundingCarryEvaluator``（纯计算）；本类保留：
+    - IO：候选池/指标刷新、scan epoch 触发、store 去重查询；
+    - 决策组装：评估结果 → ``StrategyDecision``（字段/原因码逐一对应）。
 
     Args:
         config: 顶层配置（门槛唯一来源 = strategy 段 + execution.canary_notional）。
@@ -172,6 +203,13 @@ class LiveStrategy:
         self._universe: list[str] = []
         self._universe_ts_ms = 0
         self._epoch_id: str = ""
+        self._evaluator = FundingCarryEvaluator(
+            config=config,
+            strategy_version=strategy_version,
+            config_hash=config_hash,
+            now_fn=now_fn,
+        )
+        self._dedup = _StoreDedupProbe(store)
 
     # -- 低频刷新 -------------------------------------------------------------
 
@@ -336,124 +374,108 @@ class LiveStrategy:
                 error="",
             )
 
-    def _cache_age_ms(self, cache: CandidateCache) -> int:
-        return self._ctx_now_ms() - cache.refreshed_ts_ms
-
-    def _ctx_now_ms(self) -> int:
-        return int(self._now() * 1000)
-
-    # -- 指标（纯函数，复用 backtest 语义） ------------------------------------
-
-    @staticmethod
-    def _annualized(period_rate: Decimal, interval_hours: int) -> Decimal:
-        return period_rate * _HOURS_PER_YEAR / Decimal(interval_hours)
+    # -- 指标兼容转发（旧私有方法 → 纯 evaluator；仅测试/诊断使用） -------------
 
     def _entry_metrics(self, cache: CandidateCache) -> tuple[Decimal, int]:
-        """(最近 lookback 期滑动平均的年化, 连续正滑动平均期数)。
+        """兼容转发：与旧实现同口径（委托 ``FundingCarryEvaluator.entry_metrics``）。"""
+        candidate = CandidateInput(
+            symbol=cache.symbol,
+            rates=tuple(cache.rates),
+            mark_prices=tuple(cache.mark_prices),
+            timestamps=tuple(cache.timestamps),
+            interval_hours=cache.interval_hours,
+            volume_3d_avg=cache.volume_3d_avg,
+            refreshed_ts_ms=cache.refreshed_ts_ms,
+            error=cache.error,
+        )
+        return self._evaluator.entry_metrics(candidate)
 
-        与 ``backtest.engine.build_signals`` 同口径：
-        先对原始费率做 lookback 期滑动平均，再按该币自己的周期年化。
-        """
-        rates = cache.rates
-        lookback = self.config.strategy.entry.lookback_periods
-        if len(rates) < lookback:
-            return Decimal("0"), 0
-        window = rates[-lookback:]
-        mean = sum(window, Decimal("0")) / Decimal(lookback)
-        annualized = self._annualized(mean, cache.interval_hours)
+    # -- 纯评估上下文构造 -------------------------------------------------------
 
-        # 连续正：从当前位置往回数「滑动平均为正」的期数（窗口未满的位置不算正）
-        streak = 0
-        for pos in range(len(rates) - 1, lookback - 2, -1):
-            w = rates[pos - lookback + 1 : pos + 1]
-            if sum(w, Decimal("0")) / Decimal(lookback) > 0:
-                streak += 1
-            else:
-                break
-        return annualized, streak
+    def _eval_candidates(self) -> dict[str, CandidateInput]:
+        """可变缓存 → 纯 evaluator 的不可变输入。"""
+        return {
+            symbol: CandidateInput(
+                symbol=cache.symbol,
+                rates=tuple(cache.rates),
+                mark_prices=tuple(cache.mark_prices),
+                timestamps=tuple(cache.timestamps),
+                interval_hours=cache.interval_hours,
+                volume_3d_avg=cache.volume_3d_avg,
+                refreshed_ts_ms=cache.refreshed_ts_ms,
+                error=cache.error,
+            )
+            for symbol, cache in self.candidates.items()
+        }
 
-    def _exit_average_annualized(self, cache: CandidateCache) -> Decimal | None:
-        """最近 exit_lookback_periods 期平均费率年化；窗口未满返回 None。"""
-        rates = cache.rates
-        window = self.config.strategy.exit.exit_lookback_periods
-        if len(rates) < window:
-            return None
-        mean = sum(rates[-window:], Decimal("0")) / Decimal(window)
-        return self._annualized(mean, cache.interval_hours)
-
-    def _position_age_periods(self, held: HeldPosition, interval_hours: int) -> int:
-        if held.opened_ms <= 0:
-            return 0
-        period_ms = Decimal(interval_hours) * 3600 * 1000
-        return int((self._ctx_now_ms() - held.opened_ms) // period_ms)
+    def _eval_context(self, ctx: LiveContext) -> EvalContext:
+        """LiveContext → 纯 EvalContext；有 synchronizer 时绑定 READY epoch
+        并同步回填 LiveContext 的 epoch 审计字段（与旧行为一致）。"""
+        held = {
+            symbol: HeldInput(
+                symbol=position.symbol,
+                spot_qty=position.spot_qty,
+                perp_qty=position.perp_qty,
+                opened_ms=position.opened_ms,
+            )
+            for symbol, position in ctx.held.items()
+        }
+        quotes = {
+            symbol: QuoteInput(
+                spot_price=quote.spot_price,
+                perp_price=quote.perp_price,
+                ts_ms=quote.ts_ms,
+                spot_ts_ms=quote.spot_ts_ms,
+                perp_ts_ms=quote.perp_ts_ms,
+            )
+            for symbol, quote in ctx.quotes.items()
+        }
+        if self._synchronizer is None:
+            return EvalContext(
+                now_ms=ctx.now_ms,
+                total_capital=ctx.total_capital,
+                held=held,
+                quotes=quotes,
+                submitted_this_run=ctx.submitted_this_run,
+                account_ok=ctx.account_ok,
+                reconcile_ok=ctx.reconcile_ok,
+            )
+        epoch = self._current_ready_epoch()
+        if epoch is not None:
+            ctx.market_data_ready = True
+            ctx.scan_epoch_id = epoch.epoch_id
+            ctx.decision_cutoff_ms = epoch.decision_cutoff_ms
+        return EvalContext(
+            now_ms=ctx.now_ms,
+            total_capital=ctx.total_capital,
+            held=held,
+            quotes=quotes,
+            submitted_this_run=ctx.submitted_this_run,
+            account_ok=ctx.account_ok,
+            reconcile_ok=ctx.reconcile_ok,
+            epoch_active=True,
+            epoch_id=epoch.epoch_id if epoch is not None else None,
+            decision_cutoff_ms=epoch.decision_cutoff_ms if epoch is not None else 0,
+            epoch_excluded=dict(epoch.excluded) if epoch is not None else {},
+            expected_symbols=self._non_held_expected_symbols(ctx.held)
+            if epoch is None
+            else (),
+        )
 
     # -- 主入口 ---------------------------------------------------------------
 
     def evaluate(self, ctx: LiveContext) -> list[StrategyDecision]:
         """评估全部候选与持仓。每个 symbol 恰好一条决策。
 
-        开仓槽位按 trailing 年化从高到低分配：只放行 top (max_positions -
-        已持仓)，落选记 ``RANKED_OUT``（防止单 tick 内 held 未更新导致开超
-        上限，也防止低收益币抢先占用槽位）。
+        判断逻辑（scan epoch 闸门、退出/换仓、入场门槛、槽位排序）在纯
+        evaluator 中执行；本方法只负责上下文构造与决策组装。
         """
-        decisions: list[StrategyDecision] = []
-
-        # 0) scan epoch 闸门（实施计划书 v2.0 T2）：无 READY epoch 时
-        # 未持仓候选统一 SKIP MARKET_DATA_NOT_READY；持仓评估（风险降低）不被阻止。
-        epoch = self._current_ready_epoch()
-        if self._synchronizer is not None and epoch is None:
-            for symbol in sorted(ctx.held):
-                decisions.append(self._evaluate_exit(symbol, ctx.held[symbol], ctx))
-            for symbol in self._non_held_expected_symbols(ctx.held):
-                skip = self._make_skip(symbol, ctx)
-                decisions.append(
-                    skip(
-                        ReasonCode.MARKET_DATA_NOT_READY,
-                        "无 READY scan epoch（市场数据不完整），禁止新开仓",
-                    )
-                )
-            return decisions
-        if self._synchronizer is not None:
-            assert epoch is not None
-            ctx.market_data_ready = True
-            ctx.scan_epoch_id = epoch.epoch_id
-            ctx.decision_cutoff_ms = epoch.decision_cutoff_ms
-
-        # 1) 持仓 symbol：退出/换仓评估（异常退出路径由 service 优先处理）
-        for symbol in sorted(ctx.held):
-            held = ctx.held[symbol]
-            decisions.append(self._evaluate_exit(symbol, held, ctx))
-
-        # 2) 未持仓候选：开仓评估；通过前置门槛的按收益率排序分配槽位
-        pending: list[tuple[Decimal, str, StrategyDecision]] = []
-        for symbol in self.candidate_symbols:
-            if symbol in ctx.held:
-                continue
-            decision = self.can_open(symbol, ctx)
-            if decision.decision_kind is DecisionKind.PENDING_QUOTE:
-                cache = self.candidates[symbol]
-                trailing, _ = self._entry_metrics(cache)
-                pending.append((trailing, symbol, decision))
-            else:
-                decisions.append(decision)
-
-        slots = max(int(self.config.strategy.selection.max_positions) - len(ctx.held), 0)
-        pending.sort(key=lambda item: (-item[0], item[1]))
-        for rank, (trailing, symbol, decision) in enumerate(pending):
-            if rank < slots:
-                decisions.append(decision)
-                continue
-            skip = self._make_skip(symbol, ctx)
-            decisions.append(
-                skip(
-                    ReasonCode.RANKED_OUT,
-                    f"本轮通过门槛 {len(pending)} 个，槽位 {slots} 个；"
-                    f"{symbol} 年化 {trailing} 排名第 {rank + 1}，未进 top {slots}",
-                    trailing_annualized=trailing,
-                )
-            )
-
-        return decisions
+        eval_ctx = self._eval_context(ctx)
+        candidates = self._eval_candidates()
+        evaluations = self._evaluator.evaluate(
+            eval_ctx, self.candidate_symbols, candidates, self._dedup
+        )
+        return [self._to_decision(ev, ctx) for ev in evaluations]
 
     def _non_held_expected_symbols(self, held: dict[str, HeldPosition]) -> tuple[str, ...]:
         """无 READY 时仍需产出决策的候选集合（每个 symbol 恰好一条决策）。"""
@@ -466,8 +488,6 @@ class LiveStrategy:
             return tuple(s for s in expected if s not in held and s not in excluded)
         return tuple(s for s in self.candidate_symbols if s not in held)
 
-    # -- 开仓（§7.2 判断顺序，尽早拒绝并记录原因） -----------------------------
-
     def _epoch_stamp(self) -> tuple[str | None, int | None]:
         """当前 READY epoch 的审计戳（(epoch_id, cutoff_ms)）；无则 (None, None)。"""
         epoch = self._current_ready_epoch()
@@ -475,38 +495,153 @@ class LiveStrategy:
             return (None, None)
         return (epoch.epoch_id, epoch.decision_cutoff_ms)
 
-    def _make_skip(self, symbol: str, ctx: LiveContext) -> Callable[..., StrategyDecision]:
-        """构造拒绝/中间态决策的闭包（§7.2 判断顺序各处复用同一形状）。"""
+    # -- 决策组装（评估结果 → StrategyDecision） --------------------------------
 
-        def skip(code: str, text: str, kind: str = DecisionKind.SKIP,
-                 **metrics: object) -> StrategyDecision:
-            # 已知审计字段提升到顶层列（DB 可直接查询），其余进 metrics
-            scan_epoch_id, decision_cutoff_ms = self._epoch_stamp()
-            # 已知审计字段提升到顶层列（DB 可直接查询），其余进 metrics
-            lift_keys = (
-                "funding_interval_hours", "trailing_annualized", "exit_average_annualized",
-                "consecutive_positive_periods", "quote_volume_3d_avg", "entry_threshold",
-                "exit_threshold", "position_age_periods", "spot_price", "perp_price",
-                "quote_ts_ms", "requested_notional",
-            )
-            lifted = {k: metrics.pop(k) for k in lift_keys if k in metrics}
+    def _decision_skip(
+        self, ctx: LiveContext, ev: CarryEvaluation, **fields: object
+    ) -> StrategyDecision:
+        scan_epoch_id, decision_cutoff_ms = self._epoch_stamp()
+        base: dict[str, object] = {
+            "symbol": ev.symbol,
+            "run_id": ctx.run_id,
+            "ts_ms": ctx.now_ms,
+            "decision_kind": (
+                DecisionKind.PENDING_QUOTE if ev.kind == EvalKind.PENDING_QUOTE else DecisionKind.SKIP
+            ),
+            "allowed": False,
+            "reason_code": ev.reason_code,
+            "reason_text": ev.reason_text,
+            "strategy_version": self.strategy_version,
+            "config_hash": self.config_hash,
+            "funding_interval_hours": ev.funding_interval_hours,
+            "trailing_annualized": ev.trailing_annualized,
+            "exit_average_annualized": ev.exit_average_annualized,
+            "consecutive_positive_periods": ev.consecutive_positive_periods,
+            "quote_volume_3d_avg": ev.quote_volume_3d_avg,
+            "entry_threshold": ev.entry_threshold,
+            "exit_threshold": ev.exit_threshold,
+            "position_age_periods": ev.position_age_periods,
+            "spot_price": ev.spot_price,
+            "perp_price": ev.perp_price,
+            "quote_ts_ms": ev.quote_ts_ms,
+            "requested_notional": ev.requested_notional,
+            "scan_epoch_id": scan_epoch_id,
+            "decision_cutoff_ms": decision_cutoff_ms,
+            "metrics": dict(ev.metrics),
+        }
+        base.update(fields)
+        return StrategyDecision(**base)  # type: ignore[arg-type]
+
+    def _to_decision(self, ev: CarryEvaluation, ctx: LiveContext) -> StrategyDecision:
+        scan_epoch_id, decision_cutoff_ms = self._epoch_stamp()
+
+        if ev.kind == EvalKind.OPEN:
+            if (
+                ev.spot_price is None
+                or ev.perp_price is None
+                or ev.quote_ts_ms is None
+                or ev.requested_notional is None
+            ):
+                return self._decision_skip(
+                    ctx,
+                    CarryEvaluation(
+                        symbol=ev.symbol,
+                        kind=EvalKind.SKIP,
+                        allowed=False,
+                        reason_code=ReasonCode.STALE_QUOTE,
+                        reason_text="评估结果缺少开仓必要字段（内部错误）",
+                    ),
+                )
+            # build_signal 保留为本地拦截兼容层（与 evaluator 同口径双保险）
+            try:
+                signal = portfolio.build_signal(
+                    ev.symbol,
+                    spot_price=ev.spot_price,
+                    perp_price=ev.perp_price,
+                    quote_ts_ms=ev.quote_ts_ms,
+                    requested_notional=ev.requested_notional,
+                    config=self.config,
+                    reason="funding_carry",
+                    strategy_version=self.strategy_version,
+                    now_ms=ctx.now_ms,
+                )
+            except LiveGateBlocked as exc:
+                return self._decision_skip(
+                    ctx,
+                    CarryEvaluation(
+                        symbol=ev.symbol,
+                        kind=EvalKind.SKIP,
+                        allowed=False,
+                        reason_code=ReasonCode.STALE_QUOTE,
+                        reason_text=str(exc),
+                    ),
+                )
+            if signal is None:
+                return self._decision_skip(
+                    ctx,
+                    CarryEvaluation(
+                        symbol=ev.symbol,
+                        kind=EvalKind.SKIP,
+                        allowed=False,
+                        reason_code=ReasonCode.NOTIONAL_TOO_SMALL,
+                        reason_text="build_signal 本地拒绝（名义额/价格非法）",
+                    ),
+                )
             return StrategyDecision(
-                symbol=symbol,
+                symbol=ev.symbol,
                 run_id=ctx.run_id,
                 ts_ms=ctx.now_ms,
-                decision_kind=kind,
-                allowed=False,
-                reason_code=code,
-                reason_text=text,
+                decision_kind=DecisionKind.OPEN,
+                allowed=True,
+                reason_code=ReasonCode.ENTRY_OK,
+                reason_text="策略条件全部满足，允许开仓",
                 strategy_version=self.strategy_version,
                 config_hash=self.config_hash,
+                funding_interval_hours=ev.funding_interval_hours,
+                trailing_annualized=ev.trailing_annualized,
+                consecutive_positive_periods=ev.consecutive_positive_periods,
+                quote_volume_3d_avg=ev.quote_volume_3d_avg,
+                entry_threshold=ev.entry_threshold,
+                spot_price=ev.spot_price,
+                perp_price=ev.perp_price,
+                quote_ts_ms=ev.quote_ts_ms,
+                requested_notional=signal.target_notional,
                 scan_epoch_id=scan_epoch_id,
                 decision_cutoff_ms=decision_cutoff_ms,
-                metrics=dict(metrics),
-                **lifted,  # type: ignore[arg-type]
+                metrics=dict(ev.metrics),
             )
 
-        return skip
+        if ev.kind in (EvalKind.EXIT, EvalKind.REPLACE, EvalKind.HOLD):
+            metrics: dict[str, object] = {}
+            if ev.kind == EvalKind.REPLACE and ev.replacement_symbol is not None:
+                metrics["replacement_symbol"] = ev.replacement_symbol
+                if ev.premium is not None:
+                    metrics["premium"] = str(ev.premium)
+            return StrategyDecision(
+                symbol=ev.symbol,
+                run_id=ctx.run_id,
+                ts_ms=ctx.now_ms,
+                decision_kind=ev.kind,
+                allowed=True,
+                reason_code=ev.reason_code,
+                reason_text=ev.reason_text,
+                strategy_version=self.strategy_version,
+                config_hash=self.config_hash,
+                funding_interval_hours=ev.funding_interval_hours,
+                trailing_annualized=ev.trailing_annualized,
+                exit_average_annualized=ev.exit_average_annualized,
+                quote_volume_3d_avg=ev.quote_volume_3d_avg,
+                exit_threshold=ev.exit_threshold,
+                position_age_periods=ev.position_age_periods,
+                scan_epoch_id=scan_epoch_id,
+                decision_cutoff_ms=decision_cutoff_ms,
+                metrics=metrics,
+            )
+
+        # SKIP / PENDING_QUOTE
+        return self._decision_skip(ctx, ev)
+
+    # -- 单 symbol 入口（service 兼容） ------------------------------------------
 
     def can_open(self, symbol: str, ctx: LiveContext) -> StrategyDecision:
         """统一开仓判断入口（§7.3）。返回 SKIP/OPEN/PENDING_QUOTE 决策，本身不下单。
@@ -515,337 +650,30 @@ class LiveStrategy:
         ``PENDING_QUOTE`` 中间态：LiveService 按需获取报价后调 ``complete_open``
         产出最终决策（动态候选池池子大，每轮只为通过前置检查的少数候选拉报价）。
         """
-        skip = self._make_skip(symbol, ctx)
-        entry = self.config.strategy.entry
-        selection = self.config.strategy.selection
-        base = symbol.replace("USDT", "")
-        cache = self.candidates.get(symbol)
-
-        # 前置状态（service 也已把关，这里记录原因保证决策链完整）
-        if not ctx.reconcile_ok:
-            return skip(ReasonCode.RECONCILIATION_BLOCKED, "最近对账未通过，禁止新增风险")
-        if not ctx.account_ok or ctx.total_capital <= 0:
-            return skip(ReasonCode.ACCOUNT_STATE_UNKNOWN, "账户快照缺失/过期/资金为零，禁止开仓")
-
-        # scan epoch 闸门：只允许对 READY 同一 cutoff 横截面内的候选开仓
-        if self._synchronizer is not None:
-            epoch = self._current_ready_epoch()
-            if epoch is None:
-                return skip(ReasonCode.MARKET_DATA_NOT_READY, "无 READY scan epoch，禁止新开仓")
-            if symbol in epoch.excluded:
-                return skip(
-                    ReasonCode.EXCLUDED_ASSET,
-                    f"{symbol} 在 epoch {epoch.epoch_id} 中确定性排除: {epoch.excluded[symbol]}",
-                )
-            if symbol not in self.candidates:
-                return skip(
-                    ReasonCode.MARKET_DATA_NOT_READY,
-                    f"{symbol} 不在 READY epoch {epoch.epoch_id} 的已完成快照内",
-                )
-
-        # 5. 排除列表
-        if base.upper() in {b.upper() for b in selection.exclude_bases}:
-            return skip(ReasonCode.EXCLUDED_ASSET, f"{base} 在排除列表中")
-        if not symbol.endswith("USDT"):
-            return skip(ReasonCode.INVALID_SYMBOL, f"{symbol} 不是 USDT 永续对")
-
-        # 6/7/8/9. 数据窗口与策略门槛
-        if cache is None:
-            return skip(ReasonCode.INSUFFICIENT_HISTORY, "候选指标缓存不存在（刷新失败）")
-        if cache.error:
-            return skip(ReasonCode.STALE_DATA, f"候选指标缓存异常: {cache.error}")
-        # 数据年龄上限 = 该币结算周期 + 宽限（两次结算间费率不变，超龄=刷新掉链）
-        stale_after_ms = (
-            int(cache.interval_hours) * 3600 * 1000
-            + int(self.config.execution.max_candidate_data_age_seconds * 1000)
+        ev = self._evaluator.can_open(
+            symbol, self._eval_context(ctx), self._eval_candidates(), self._dedup
         )
-        if self._cache_age_ms(cache) > stale_after_ms:
-            return skip(
-                ReasonCode.STALE_DATA,
-                f"候选指标数据年龄 {self._cache_age_ms(cache)}ms 超过 {stale_after_ms}ms",
-            )
-        # 结算滞后门：最新一期结算已发生但缓存未刷新 → 本轮禁止开仓。
-        # 刷新是限流分批的，滞后窗口内拿旧数据比较收益率会选错币。
-        if cache.timestamps:
-            last_settle_ms = cache.timestamps[-1] + int(cache.interval_hours) * 3600 * 1000
-            if last_settle_ms <= ctx.now_ms:
-                return skip(
-                    ReasonCode.SETTLEMENT_LAG,
-                    f"最新结算（{last_settle_ms}）已发生但缓存未刷新，等待数据补齐",
-                )
-        if len(cache.rates) < entry.lookback_periods:
-            return skip(
-                ReasonCode.INSUFFICIENT_HISTORY,
-                f"资金费历史 {len(cache.rates)} 期 < 入场窗口 {entry.lookback_periods} 期",
-            )
-
-        trailing, streak = self._entry_metrics(cache)
-        min_trailing = Decimal(str(entry.min_trailing_annualized))
-        min_rate = Decimal(str(entry.min_annualized_rate))
-        if trailing < max(min_trailing, min_rate):
-            return skip(
-                ReasonCode.TRAILING_RATE_BELOW_THRESHOLD,
-                f"最近 {entry.lookback_periods} 期滑动平均年化 {trailing} 低于门槛 "
-                f"{max(min_trailing, min_rate)}",
-                trailing_annualized=trailing,
-                consecutive_positive_periods=streak,
-                funding_interval_hours=cache.interval_hours,
-            )
-        if streak < entry.min_consecutive_positive:
-            return skip(
-                ReasonCode.CONSECUTIVE_POSITIVE_TOO_SHORT,
-                f"连续正滑动平均 {streak} 期 < 要求 {entry.min_consecutive_positive} 期",
-                trailing_annualized=trailing,
-                consecutive_positive_periods=streak,
-                funding_interval_hours=cache.interval_hours,
-            )
-        min_volume = Decimal(str(selection.min_quote_volume_3d_avg))
-        if cache.volume_3d_avg < min_volume:
-            return skip(
-                ReasonCode.LOW_LIQUIDITY,
-                f"3 天平均日成交额 {cache.volume_3d_avg} < 门槛 {min_volume}",
-                quote_volume_3d_avg=cache.volume_3d_avg,
-            )
-
-        # 10-12. 去重（§7.3 三层 + 本轮已提交 + 最大持仓数）
-        if symbol in ctx.held:
-            return skip(ReasonCode.ALREADY_HELD, "交易所存在实际持仓")
-        if symbol in ctx.submitted_this_run:
-            return skip(ReasonCode.ALREADY_SUBMITTED, "本轮已提交相同 symbol 的开仓")
-        if self.store.active_pair_for_symbol(symbol):
-            return skip(ReasonCode.ACTIVE_ORDER, "存在同 symbol 非终态 pair")
-        if self.store.has_open_intent(symbol):
-            return skip(ReasonCode.ACTIVE_INTENT, "存在同 symbol 未终态 intent")
-        if self.store.has_open_order(symbol):
-            return skip(ReasonCode.ACTIVE_ORDER, "存在同 symbol 未终态 order")
-        if len(ctx.held) >= selection.max_positions:
-            return skip(
-                ReasonCode.MAX_POSITIONS,
-                f"当前持仓 {len(ctx.held)} 已达上限 {selection.max_positions}",
-            )
-
-        # 13. 新鲜报价（动态候选池：上下文未含该 symbol 报价 → PENDING 中间态）
-        quote = ctx.quotes.get(symbol)
-        if quote is None:
-            return skip(
-                ReasonCode.PENDING_QUOTE,
-                "前置门槛通过，等待新鲜报价（service 按需获取）",
-                kind=DecisionKind.PENDING_QUOTE,
-            )
-        return self._open_with_quote(symbol, ctx, quote, skip)
+        return self._to_decision(ev, ctx)
 
     def complete_open(
         self, symbol: str, ctx: LiveContext, quote: Quote | None
     ) -> StrategyDecision:
         """第二阶段：LiveService 获取报价后定案（步骤 13-15）。获取失败 = STALE_QUOTE。"""
-        skip = self._make_skip(symbol, ctx)
-        if quote is None:
-            return skip(ReasonCode.STALE_QUOTE, "无新鲜报价（本轮获取失败）")
-        return self._open_with_quote(symbol, ctx, quote, skip)
-
-    def _open_with_quote(
-        self, symbol: str, ctx: LiveContext, quote: Quote,
-        skip: Callable[..., StrategyDecision],
-    ) -> StrategyDecision:
-        """开仓第二阶段（§7.2 步骤 13-15）：报价新鲜度 → 名义额/基差 → build_signal。"""
-        selection = self.config.strategy.selection
-        scan_epoch_id, decision_cutoff_ms = self._epoch_stamp()
-        cache = self.candidates.get(symbol)
-        if cache is None:
-            return skip(ReasonCode.INSUFFICIENT_HISTORY, "候选指标缓存缺失（前置检查后异常）")
-        trailing, streak = self._entry_metrics(cache)
-        min_trailing = Decimal(str(self.config.strategy.entry.min_trailing_annualized))
-        max_quote_age_ms = int(self.config.execution.max_market_data_age_seconds * 1000)
-        age = ctx.now_ms - quote.ts_ms
-        if age < 0 or age > max_quote_age_ms:
-            return skip(ReasonCode.STALE_QUOTE, f"报价年龄 {age}ms > {max_quote_age_ms}ms")
-        if quote.spot_price <= 0 or quote.perp_price <= 0:
-            return skip(ReasonCode.STALE_QUOTE, "报价非正数")
-
-        # 两市场报价接收时间偏差（AC-05：未同步 Spot/Futures 价格不得生成交易意图）
-        spot_ts = quote.spot_ts_ms or quote.ts_ms
-        perp_ts = quote.perp_ts_ms or quote.ts_ms
-        skew = abs(spot_ts - perp_ts)
-        max_skew_ms = int(self.config.execution.max_quote_skew_ms)
-        if skew > max_skew_ms:
-            return skip(
-                ReasonCode.STALE_QUOTE,
-                f"Spot/Futures 报价接收时间偏差 {skew}ms > {max_skew_ms}ms（两市场不同步）",
+        quote_input = (
+            None
+            if quote is None
+            else QuoteInput(
                 spot_price=quote.spot_price,
                 perp_price=quote.perp_price,
-                quote_ts_ms=quote.ts_ms,
+                ts_ms=quote.ts_ms,
+                spot_ts_ms=quote.spot_ts_ms,
+                perp_ts_ms=quote.perp_ts_ms,
             )
-
-        # 14. 名义额与意图前市场检查（build_signal 只负责这层，§7.1 第 6 条）
-        requested = (ctx.total_capital * Decimal(str(selection.per_position_weight))).quantize(
-            Decimal("0.01")
         )
-        if requested <= 0:
-            return skip(ReasonCode.NOTIONAL_TOO_SMALL, "目标名义额非正")
-        basis = (quote.perp_price - quote.spot_price) / quote.spot_price
-        if basis < 0 and abs(basis) > Decimal(str(self.config.execution.hedge_tolerance_pct)):
-            return skip(
-                ReasonCode.BASIS_DISCOUNT,
-                f"永续深度贴水 {basis}，开空头不利，等待收敛",
-                spot_price=quote.spot_price,
-                perp_price=quote.perp_price,
-                quote_ts_ms=quote.ts_ms,
-            )
-        try:
-            signal = portfolio.build_signal(
-                symbol,
-                spot_price=quote.spot_price,
-                perp_price=quote.perp_price,
-                quote_ts_ms=quote.ts_ms,
-                requested_notional=requested,
-                config=self.config,
-                reason="funding_carry",
-                strategy_version=self.strategy_version,
-                now_ms=ctx.now_ms,
-            )
-        except LiveGateBlocked as exc:
-            return skip(ReasonCode.STALE_QUOTE, str(exc))
-        if signal is None:
-            return skip(ReasonCode.NOTIONAL_TOO_SMALL, "build_signal 本地拒绝（名义额/价格非法）")
-
-        # 15. 通过 → OPEN（intent 与下单由 service 执行）
-        return StrategyDecision(
-            symbol=symbol,
-            run_id=ctx.run_id,
-            ts_ms=ctx.now_ms,
-            decision_kind=DecisionKind.OPEN,
-            allowed=True,
-            reason_code=ReasonCode.ENTRY_OK,
-            reason_text="策略条件全部满足，允许开仓",
-            strategy_version=self.strategy_version,
-            config_hash=self.config_hash,
-            funding_interval_hours=cache.interval_hours,
-            trailing_annualized=trailing,
-            consecutive_positive_periods=streak,
-            quote_volume_3d_avg=cache.volume_3d_avg,
-            entry_threshold=min_trailing,
-            spot_price=quote.spot_price,
-            perp_price=quote.perp_price,
-            quote_ts_ms=quote.ts_ms,
-            requested_notional=signal.target_notional,
-            scan_epoch_id=scan_epoch_id,
-            decision_cutoff_ms=decision_cutoff_ms,
-            metrics={
-                "quote_source": "public",
-                "requested_notional_raw": str(requested),
-            },
+        ev = self._evaluator.complete_open(
+            symbol, self._eval_context(ctx), self._eval_candidates(), quote_input
         )
-
-    # -- 退出 / 换仓（§7.4） ----------------------------------------------------
-
-    def _evaluate_exit(self, symbol: str, held: HeldPosition, ctx: LiveContext) -> StrategyDecision:
-        exit_cfg = self.config.strategy.exit
-        cache = self.candidates.get(symbol)
-        interval = cache.interval_hours if cache else 8
-        age_periods = self._position_age_periods(held, interval)
-        exit_avg = self._exit_average_annualized(cache) if cache else None
-
-        common: dict[str, object] = {
-            "run_id": ctx.run_id,
-            "ts_ms": ctx.now_ms,
-            "symbol": symbol,
-            "strategy_version": self.strategy_version,
-            "config_hash": self.config_hash,
-            "position_age_periods": age_periods,
-            "exit_average_annualized": exit_avg,
-            "exit_threshold": Decimal("0"),
-            "funding_interval_hours": interval,
-        }
-        if cache is not None:
-            trailing, _ = self._entry_metrics(cache)
-            common["trailing_annualized"] = trailing
-            common["quote_volume_3d_avg"] = cache.volume_3d_avg
-
-        # 1. 负资金费退出（最近 exit_lookback 期均值转负；窗口未满不判定）
-        if exit_avg is not None and exit_avg < 0:
-            return StrategyDecision(
-                decision_kind=DecisionKind.EXIT,
-                allowed=True,
-                reason_code=ReasonCode.NEGATIVE_EXIT_AVG,
-                reason_text=(
-                    f"最近 {exit_cfg.exit_lookback_periods} 期平均资金费率年化 {exit_avg} 转负，策略退出"
-                ),
-                **common,  # type: ignore[arg-type]
-            )
-
-        # 2. 最长持仓（结算周期数）
-        if age_periods >= exit_cfg.max_holding_periods:
-            return StrategyDecision(
-                decision_kind=DecisionKind.EXIT,
-                allowed=True,
-                reason_code=ReasonCode.MAX_HOLDING,
-                reason_text=f"持仓 {age_periods} 期达到最长 {exit_cfg.max_holding_periods} 期，强制退出",
-                **common,  # type: ignore[arg-type]
-            )
-
-        # 3. 换仓：新候选相对优势超过按年龄分段的 premium（先平旧，后开新）
-        if cache is not None and age_periods > 60:
-            premium = (
-                Decimal(str(exit_cfg.replacement_premium_under_120))
-                if age_periods <= 120
-                else Decimal(str(exit_cfg.replacement_premium_over_120))
-            )
-            held_trailing = self._entry_metrics(cache)[0]
-            best_symbol, best_trailing = self._best_replacement_candidate(
-                symbol, ctx, premium, held_trailing
-            )
-            if best_symbol is not None:
-                return StrategyDecision(
-                    decision_kind=DecisionKind.REPLACE,
-                    allowed=True,
-                    reason_code=ReasonCode.REPLACEMENT,
-                    reason_text=(
-                        f"{best_symbol} trailing {best_trailing} 超过持仓 "
-                        f"{held_trailing} × premium {premium}"
-                    ),
-                    metrics={"replacement_symbol": best_symbol, "premium": str(premium)},
-                    **common,  # type: ignore[arg-type]
-                )
-
-        # 4. 否则 HOLD
-        return StrategyDecision(
-            decision_kind=DecisionKind.HOLD,
-            allowed=True,
-            reason_code=ReasonCode.HOLD_OK,
-            reason_text="未触发退出/换仓条件，继续持有",
-            **common,  # type: ignore[arg-type]
-        )
-
-    def _best_replacement_candidate(
-        self,
-        held_symbol: str,
-        ctx: LiveContext,
-        premium: Decimal,
-        held_trailing: Decimal,
-    ) -> tuple[str | None, Decimal | None]:
-        """找一个未持仓候选，trailing >= 持仓 trailing × premium。
-
-        epoch 模式：替换候选必须来自同一 READY epoch（无 READY = 数据不足，
-        不得发策略性换仓；风险降低型退出不受影响）。
-        """
-        entry = self.config.strategy.entry
-        if self._synchronizer is not None and self._current_ready_epoch() is None:
-            return None, None
-        best: tuple[str, Decimal] | None = None
-        for symbol in self.candidate_symbols:
-            if symbol == held_symbol or symbol in ctx.held:
-                continue
-            cache = self.candidates.get(symbol)
-            if cache is None or cache.error or len(cache.rates) < entry.lookback_periods:
-                continue
-            trailing, streak = self._entry_metrics(cache)
-            if streak < entry.min_consecutive_positive:
-                continue
-            if trailing >= held_trailing * premium and (best is None or trailing > best[1]):
-                best = (symbol, trailing)
-        if best is None:
-            return None, None
-        return best[0], best[1]
+        return self._to_decision(ev, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -966,4 +794,3 @@ class PublicDataStrategyProvider:
         if value is None or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
             raise ValueError(f"{symbol} 3 天平均日成交额无效")
         return Decimal(str(value))
-

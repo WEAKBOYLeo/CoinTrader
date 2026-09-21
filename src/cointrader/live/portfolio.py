@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ..config import Config
+from ..domain.portfolio import PortfolioIntent
 from ..errors import LiveGateBlocked
 
 __all__ = ["Signal", "build_signal"]
@@ -41,6 +42,28 @@ class Signal:
         if self.spot_price <= 0:
             return Decimal("0")
         return (self.perp_price - self.spot_price) / self.spot_price
+
+    def to_intent(
+        self,
+        *,
+        snapshot_id: str,
+        decision_cutoff_ms: int,
+        created_at_ms: int,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> PortfolioIntent:
+        """兼容入口：legacy 信号 → 领域 OPEN 意图（经 ``portfolio.adapter``，
+        确定性幂等：intent_id = fingerprint）。不直接生成订单参数。"""
+        from ..portfolio.adapter import signal_to_intent
+
+        return signal_to_intent(
+            self,
+            snapshot_id=snapshot_id,
+            decision_cutoff_ms=decision_cutoff_ms,
+            created_at_ms=created_at_ms,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+        )
 
 
 def _dec(value: float | int | str | Decimal) -> Decimal:
