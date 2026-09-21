@@ -129,6 +129,24 @@ class TestT4ControlIntegration:
         assert r2["state"] == "RUNNING"
         assert svc.safety_state.state is SafetyStateKind.RUNNING
 
+    def test_ledger_write_failure_enters_recovery_no_new_risk(self, tmp_path: Any) -> None:
+        """账本写失败 → RECOVERY（fail closed），禁止继续新增风险。"""
+        from cointrader.execution.store import StoreError
+
+        env = _env(tmp_path)
+        svc = env["svc"]
+        r0 = svc.run_once()
+        assert r0["state"] == "RUNNING"
+
+        def boom(*a: Any, **k: Any) -> None:
+            raise StoreError("模拟磁盘写失败")
+
+        svc.store.record_signal_decision = boom  # type: ignore[method-assign]
+        r1 = svc.run_once()
+        assert r1["state"] == "RECOVERY"
+        assert svc.safety_state.state is SafetyStateKind.RECOVERY
+        assert len(env["executor"].open_calls) == 1, "RECOVERY 不得开新仓"
+
     def test_stop_marks_safety_stopped(self, tmp_path: Any) -> None:
         env = _env(tmp_path)
         svc = env["svc"]

@@ -103,7 +103,8 @@ src/cointrader/
   research/      纯计算：成本模型、绩效指标
   backtest/      确定性回测引擎 + 破产情景分析
   execution/     签名 REST、订单状态机、双腿执行、对账器、账本存储（默认禁用）
-  live/          实盘兼容 facade：启动预检、LiveService、市场同步、看门狗
+  live/          实盘兼容 facade：启动预检阶段、LiveService、市场同步、看门狗
+                 （run_once/run_forever 委托 application；安全状态由状态机拥有）
   webui/         只读实时仪表盘（独立守护线程，/api/state + /healthz）
   reporting/     报告导出
 tests/         含安全静态扫描、前瞻偏差证伪与架构边界测试
@@ -116,6 +117,23 @@ Binance client / `data/` / 网络 IO；`risk/` 只允许依赖 config、domain �
 execution 的 rule/gate 模块；只有 `application/` 与 `live/` 可以装配全部层。
 
 ## 实盘执行（分阶段，见 docs/开发设计文档.md）
+
+生产交易链路（实施计划书 4.0，T1–T4 已接通；测试全部离线 fake 验证）：
+
+    策略评估 → StrategyProposal（先落账）→ PortfolioIntent（指纹幂等，先落账）
+    → RiskKernel 审批 RiskDecision（先落账；仅 ALLOW/RESIZE 继续）
+    → ApprovedIntent → OrderPlanner 执行计划 ExecutionPlan（先落账）
+    → PairExecutor.open_pair_from_plan（开仓/平仓唯一入口；平仓全 reduce-only）
+
+- 生产路径不存在 raw `executor.open_pair`/`close_pair` 直调（AST 静态测试强制）；
+  平仓由账本 current projection 差异产生的 CLOSE intent 走同一链路。
+- 安全状态由 `SafetyStateMachine` 唯一拥有（初始 RECOVERY，fail closed）；
+  停机/恢复经 `ControlPublisher` 控制命令，放宽必须显式两步
+  （RECOVERY → RESUME_AFTER_CHECKS，附预检+对账证明）。
+- 查询层（WebUI/CLI/reporting）只读 `LedgerQueryService`（唯一查询端口）；
+  LiveService 内存块仅作诊断字段（带来源+时间）。
+- 审计链：`pipeline_records`（schema v3）保存 proposal/intent/risk decision/
+  execution plan 全量序列化证据；未知提交按 client id 查询不重发。
 
 执行层已实现 M1-M3（签名 REST/限流、Decimal 规则归一化、SQLite 事件账本、
 订单状态机、双腿开平仓与 UNKNOWN 恢复、用户数据流、对账器），并带完整单测。
@@ -184,7 +202,8 @@ uv run cointrader live pnl --all-runs  # 跨所有 run 的 PnL 汇总
 - 实时展示：服务状态/模式/允许开仓/对账/账户资金、持仓与未实现 PnL、
   最近订单/成交、PnL 分项（funding/fee/basis/realized/unrealized/net）、最近告警；
 - 页面每 3 秒轮询 `/api/state`（JSON 接口，可单独 fetch/接入）；`/healthz` 供探活；
-- 纯只读：数据来自 LiveService 内存快照 + 状态账本（独立 SQLite 连接），
+- 纯只读：账本读取一律经 `LedgerQueryService`（唯一查询端口）；
+  LiveService 内存块仅作诊断字段（带来源+时间）；独立 SQLite 连接，
   WebUI 任何异常/端口冲突只告警，绝不影响主循环；`live run` 停止时自动关闭；
 - 配置：`config.yaml → execution.webui_enabled / webui_host / webui_port`。
 
@@ -203,7 +222,9 @@ M4 与 M6（主网 canary）尚未通过，`live run` 目前只应在 demo 环�
 - 交易所尾部风险无法对冲，只能靠仓位控制（见 `cointrader scenarios`）
 - Demo Trading 用户数据流不可用，poll 模式下成交/撤单感知延迟高于 WS 模式；
   M6 主网 canary 必须回到 stream 模式
-- 实盘链路尚未经长跑验证（M4 进行中）
+- 实盘链路尚未经长跑验证（M4 进行中）；4.0 生产链（proposal→intent→
+  风险审批→计划→计划化执行）与状态机/查询隔离均为**离线 fake 验证**，
+  testnet 联调与主网 canary（M6/M7）尚未执行，不得据此声称实盘可用
 
 ## 开发规范
 

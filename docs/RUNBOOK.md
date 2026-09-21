@@ -334,6 +334,28 @@ Web/CLI 的 `current projection` 状态与 `账户/对账/心跳年龄`（数据
 INTERRUPTED 会话按 heartbeat 截断，所以“停机 5 小时再重启”不会把这 5 小时
 算进在线。
 
+#### 2.6.11 4.0 生产链与安全状态怎么看（T1–T4 后口径）
+
+- **交易链路**：开仓/平仓统一走
+  `proposal → intent → 风险审批（RiskDecision）→ 执行计划 → 计划化执行`，
+  每步先落 `pipeline_records`（schema v3）再进下一步；风险审批拒绝
+  （CLOSE_ONLY/REJECT）只留理由不产生订单。Web/日志里的 `SHADOW_*`、
+  `RISK_BLOCKED`、`PLAN_FAILED`、`EXIT_FAILED` 告警对应各环节。
+- **安全状态**：Web 服务状态区的 `safety` 字段 = 安全状态机当前状态
+  （RUNNING / CLOSE_ONLY / RECOVERY / HALTED / EMERGENCY_FLATTEN /
+  STOPPED + 原因 + 时间 + 来源）；`control_events` = 近期控制命令审计。
+  状态机是唯一 owner；旧 `gate_state`/`state` 字段只是兼容投影。
+- **恢复口径**：RECOVERY 可自动解除（全部用户流新鲜 + 对账通过 +
+  闸门 NORMAL）；闸门停机（含 KILL_SWITCH 文件）后即使删掉文件也**不自动
+  恢复**，必须重新预检+对账后显式恢复（两步：RECOVERY → RESUME_AFTER_CHECKS）。
+- **平仓事实源**：平仓 intent 由账本 current projection（对账/同步写入）
+  差异产生，统一经计划化入口执行（全 reduce-only）。投影价格缺失
+  （UNKNOWN/STALE）时名义额为 0、不产生平仓，等下一轮对账——
+  不要手工绕过。
+- **查询数据源**：Web/CLI/报告的持仓、订单、成交、PnL 一律来自账本只读
+  `LedgerQueryService`；`service` 内存块（held/账户摘要等）只是诊断字段，
+  带来源+时间标签，不得当作持仓事实。
+
 ---
 
 ## 3. 如何解读回测报告

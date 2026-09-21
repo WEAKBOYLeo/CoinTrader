@@ -287,6 +287,57 @@ STOPPED 的合法迁移，恢复必须 RECOVERY → RESUME_AFTER_CHECKS 显式�
 
 ---
 
+## 4.6 生产链路与生命周期（实施计划书 4.0，T1–T4）
+
+**唯一生产交易链**（raw `executor.open_pair`/`close_pair` 直调已删除，
+AST 静态测试强制；开仓与平仓统一走计划化入口）：
+
+```
+策略评估（LiveStrategy）
+  → StrategyProposal（strategy/adapter 转换；先落 pipeline_records）
+  → PortfolioIntent（portfolio/planner 目标差异 diff；指纹幂等；先落账）
+  → RiskKernel.approve（risk/kernel；注入 MarketSnapshot/AccountSnapshot/
+     SafetyState/legacy risk facts；RiskDecision 先落账）
+     · 仅 ALLOW/RESIZE 继续；CLOSE_ONLY/REJECT 只记录理由，不创建计划
+  → ApprovedIntent（domain/risk；审批证据校验：金额≤申请、快照因果一致、
+     过期拒绝）
+  → OrderPlanner.plan（execution/planner；执行前重取新鲜报价；两腿齐全；
+     确定性 client_order_id；plan 先落账）
+  → PairExecutor.open_pair_from_plan（唯一入口；过期/两腿不齐/缺证据拒绝；
+     内部保留 partial fill / UNKNOWN / 5xx / 补偿 / 实际 executedQty 逻辑；
+     平仓全 reduce-only）
+```
+
+审计链：`pipeline_records`（schema v3 additive）保存 proposal / intent /
+risk decision / execution plan 全量序列化；关联键
+`proposal_id → intent_id → decision_id → plan_id → client_order_id`。
+
+**安全状态**（T4）：`SafetyStateMachine`（risk/state_machine）是唯一
+生产安全状态 owner；watchdog/用户流/对账/限流/DB 失败/人工命令全部经
+`ControlPublisher`（observability/control）进入状态机。初始 RECOVERY
+（fail closed）；放宽必须显式两步（RECOVERY → RESUME_AFTER_CHECKS，
+附重新预检+对账证明）；`EMERGENCY_FLATTEN` 只接受 source=manual；
+`KILL_SWITCH` 文件存在 = 强制 HALT_NEW_RISK，删文件不自动恢复。
+旧 `ServiceState`/`RiskGate` 只做兼容投影，不再独立决定 `can_open`
+（`can_open` = 状态机 RUNNING ∧ 流新鲜 ∧ 账户完整 ∧ 账本同步 ∧
+对账 ∧ epoch READY ∧ 闸门 NORMAL）。
+
+**启动顺序**（application/lifecycle 固化，trace 写 run 报告）：
+config→mode → server time → 规则 → lease → capture → facts → 对账 →
+用户流 → run_session → 账户完整 →（市场 READY/闸门）→ RUNNING；
+硬失败崩溃，软闸门失败默认 RECOVERY。
+
+**查询隔离**（T4）：WebUI / CLI live 查询 / reporting 导出只读
+`LedgerQueryService`（ledger/service，唯一查询端口，注入 `LedgerPort`，
+默认实现 StateStore）；不持有 broker/executor、不访问签名客户端、
+不依赖 LiveService mutable state（测试 `test_query_isolation.py` 强制）。
+LiveService 内存快照仅作诊断字段（带来源+时间标签）。
+
+**未验证项**：4.0 链路全部为离线 fake 验证；testnet 联调、主网 canary
+（M6/M7）、长跑稳定性尚未执行（见 `docs/开发日志.md` 残余风险清单）。
+
+---
+
 ## 5. 回测方法论
 
 ### 5.1 前瞻偏差（lookahead bias）的防治
@@ -374,9 +425,9 @@ CoinTrader/
 │   ├── account/                 # 账户端口与投影器（仅完整 capture 更新投影）
 │   ├── risk/                    # 风险内核 + 安全状态机 + RiskGate 适配
 │   ├── observability/           # 健康事件与控制命令发布（只发布不下单）
-│   ├── ledger/                  # 账本端口 + 只读 read model
+│   ├── ledger/                  # 账本端口 + 只读 read model（LedgerQueryService = 查询层唯一端口）
 │   ├── reconciliation/          # 对账门面（gate 输入）
-│   ├── application/             # 应用编排（ServiceRunner 生命周期）
+│   ├── application/             # 应用编排（ServiceRunner tick + lifecycle 启动顺序固化）
 │   └── execution/
 │       ├── guard.py             # 安全闸门（默认拒绝）
 │       ├── risk.py              # 风控限额
