@@ -216,7 +216,9 @@ class TestEpochCompleteness:
         data.set_rates(
             "LAGUSDT",
             make_rate_series(
-                20, RATE_OK, end_ms=NOW_MS - 30 * 60 * 1000
+                # 最后结算距 cutoff 20h > 2×8h 间隔 = 真实结算滞后
+                # （若只慢 30 分钟，那是 cutoff 整点结算尚未入 API，不算滞后）
+                20, RATE_OK, end_ms=NOW_MS - 20 * 60 * 60 * 1000
             ),
         )
         sync.build_once()
@@ -227,6 +229,23 @@ class TestEpochCompleteness:
         epoch = sync.latest()
         assert epoch is not None and epoch.status is ScanEpochStatus.DEGRADED
         assert "LAGUSDT" in epoch.failed
+        assert "OKUSDT" not in epoch.failed
+
+    def test_cutoff_settlement_pending_is_not_lag(self, tmp_path) -> None:
+        """cutoff 整点的 8h 结算尚未入 API（只慢 30 分钟）不是滞后，应 READY。
+
+        回归：旧实现按「cutoff 前应有结算未到账」判滞后，会把刚发生、
+        API 尚未返回的 cutoff 结算误判为滞后（live 实测 36/71 候选假 failed）。
+        """
+        rates = {"OKUSDT": RATE_OK}
+        _strat, sync, data, _clock = _env(tmp_path, rates)
+        data.set_rates(
+            "OKUSDT",
+            make_rate_series(20, RATE_OK, end_ms=NOW_MS - 30 * 60 * 1000),
+        )
+        sync.build_once()
+        epoch = sync.latest_ready()
+        assert epoch is not None and epoch.status is ScanEpochStatus.READY
         assert "OKUSDT" not in epoch.failed
 
     def test_trigger_respects_universe_interval(self, tmp_path) -> None:

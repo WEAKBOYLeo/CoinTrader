@@ -52,6 +52,25 @@ _VOLUME_KLINES = 18
 _MAX_KEPT_EPOCHS = 8
 
 
+_KNOWN_SETTLE_INTERVALS_MS = (3600 * 1000, 4 * 3600 * 1000, 8 * 3600 * 1000)
+
+
+def _infer_settle_interval_ms(raw: list[tuple[int, Decimal, Decimal]]) -> int:
+    """从连续结算记录推断结算间隔（1h/4h/8h），未知时回退 8h。
+
+    用最小正间隔（取最近已知值）：只要数据里存在一对相邻结算就准确；
+    偶发的缺失/修订不会把最小值拉大，只会暴露为更小的间隔（不会误判）。
+    """
+    gaps = [
+        b[0] - a[0]
+        for a, b in zip(raw, raw[1:], strict=False)
+        if b[0] > a[0]
+    ]
+    if not gaps:
+        return 8 * 3600 * 1000
+    return min(_KNOWN_SETTLE_INTERVALS_MS, key=lambda k: abs(k - min(gaps)))
+
+
 class EpochBuildError(CoinTraderError):
     """universe 快照失败（候选池本身无法构建）。"""
 
@@ -506,20 +525,22 @@ class MarketDataSynchronizer:
             raw = [(ts, r, m) for ts, r, m in raw if ts <= cutoff]
             if not raw:
                 raise ValueError("无资金费历史")
-            # 不变量 2：统一 8h 桶；结束点 > cutoff 的桶未可见（无前瞻）
-            timestamps, bucket_rates, marks = normalize_funding_records_to_8h(
+            # 不变量 2：统一 8h 桶；不完整桶（桶内最后结算 > cutoff）已丢弃（无前瞻）
+            timestamps, bucket_rates, marks, last_raw_ts = normalize_funding_records_to_8h(
                 raw, cutoff_ms=cutoff
             )
             if not timestamps:
                 raise ValueError("无已可见的 8h 结算桶")
             if timestamps[-1] > cutoff:  # 防御：上面已过滤，正常不可达
                 raise ValueError(f"funding 桶 {timestamps[-1]} 晚于 cutoff {cutoff}")
-            # 不变量 3：cutoff 前应可见的最后一个 8h 桶必须已到账（结算滞后 = failed）
-            expected_last = timestamps[-1]
-            next_settle = timestamps[-1] + 8 * 3600 * 1000
-            if next_settle <= cutoff:
+            # 不变量 3：真实结算滞后 = cutoff 距最后一条到账结算超过 2 个结算
+            # 间隔（1h 币 >2h、4h 币 >8h、8h 币 >16h）。不能用「cutoff 整点
+            # 结算未到账」判滞后：结算恰在 cutoff 发生时 API 可能尚未返回它
+            # （非滞后，下一轮自然补齐）
+            settle_ms = _infer_settle_interval_ms(raw)
+            if cutoff - last_raw_ts[-1] > 2 * settle_ms:
                 raise ValueError(
-                    f"应有 8h 桶 {next_settle} 未到账（cutoff={cutoff}），结算滞后"
+                    f"最后结算 {last_raw_ts[-1]} 距 cutoff {cutoff} 超过 2 个结算间隔，结算滞后"
                 )
             # 取「闭合时间 <= cutoff 的最后一根 4h K 线」的闭合时间
             volume_end_ms = (cutoff // _KLINE_INTERVAL_MS + 1) * _KLINE_INTERVAL_MS
@@ -550,7 +571,7 @@ class MarketDataSynchronizer:
             rates=tuple(bucket_rates),
             mark_prices=tuple(marks),
             timestamps=tuple(timestamps),
-            expected_last_funding_ms=expected_last,
+            expected_last_funding_ms=last_raw_ts[-1],
             volume_window_end_ms=volume_end_ms,
             quote_volume_3d_avg=Decimal(str(volume)),
             fetched_ms=int(self._now() * 1000),

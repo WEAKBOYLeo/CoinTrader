@@ -381,6 +381,7 @@ class LiveService:
                 "completed": int(rd.completed),
                 "excluded_count": int(rd.excluded_count),
                 "failed_count": int(rd.failed_count),
+                "failed": {str(k): str(v) for k, v in (rd.failed or {}).items()},
                 "age_ms": int(rd.age_ms),
                 "reason": str(rd.reason or ""),
                 "decision_cutoff_ms": cutoff_ms,

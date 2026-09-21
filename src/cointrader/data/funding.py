@@ -159,7 +159,7 @@ def normalize_funding_records_to_8h(
     records: Sequence[tuple[int, Decimal, Decimal]],
     *,
     cutoff_ms: int | None = None,
-) -> tuple[list[int], list[Decimal], list[Decimal]]:
+) -> tuple[list[int], list[Decimal], list[Decimal], list[int]]:
     """资金费事件 → 统一 8h 结算桶（live 口径，与回测 ``normalize_funding_to_8h`` 一致）。
 
     目的：入场/退出/持有的「期」统一按 8h 日历天计——4h 币每桶 2 期、
@@ -169,30 +169,38 @@ def normalize_funding_records_to_8h(
     规则（与回测同口径）：
     - 时间 T 的事件归入结束点为 ≥T 的最近 8h 整点的桶（右端 = 可见时点，无前瞻）；
     - 桶费率 = 桶内各结算费率**求和**（该 8h 实际总成本；年化 = 桶和 × 3 × 365）；
-    - 结束点 > ``cutoff_ms`` 的桶视为未可见，丢弃（不完整桶下一轮补齐）；
+    - 结束点 > ``cutoff_ms`` 的桶未完整可见（桶内最后一条结算恰在桶右端，
+      未到即不完整）→ 丢弃，下一轮补齐；
     - 桶 mark 取桶内最后一笔结算的 mark price。
 
     Args:
         records: (ts_ms, rate, mark_price) 升序结算记录。
-        cutoff_ms: 决策截止；未给则不过滤未可见桶。
+        cutoff_ms: 决策截止；未给则不过滤不完整桶（回测/离线场景）。
 
     Returns:
-        (桶结束时间列表, 桶费率列表, 桶 mark 列表)，升序。
+        (桶结束时间, 桶费率, 桶 mark, 桶内最后一条结算时间)，均升序。
     """
     buckets: dict[int, list[Decimal]] = {}
+    last_raw: dict[int, int] = {}
     for ts, rate, mark in records:
         ts = int(ts)
         end = ts if ts % _BUCKET_8H_MS == 0 else ((ts - 1) // _BUCKET_8H_MS + 1) * _BUCKET_8H_MS
         if cutoff_ms is not None and end > cutoff_ms:
-            continue  # 桶尚未可见（无前瞻）
+            continue  # 桶未完整可见（无前瞻）
         bucket = buckets.get(end)
         if bucket is None:
             buckets[end] = [Decimal(rate), Decimal(mark)]
         else:
             bucket[0] += Decimal(rate)
             bucket[1] = Decimal(mark)
+        last_raw[end] = max(last_raw.get(end, 0), ts)
     ends = sorted(buckets)
-    return ends, [buckets[e][0] for e in ends], [buckets[e][1] for e in ends]
+    return (
+        ends,
+        [buckets[e][0] for e in ends],
+        [buckets[e][1] for e in ends],
+        [last_raw[e] for e in ends],
+    )
 
 
 def normalize_funding_to_8h(rates: pd.Series, interval_hours: int) -> pd.Series:
