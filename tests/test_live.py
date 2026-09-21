@@ -310,6 +310,8 @@ class TestRunLoop:
         return service
 
     def test_running_executes_signals(self, service_env: dict) -> None:
+        """计划 4.0 T2.4：legacy signal_provider 路径不再直接下单；
+        信号必须经领域 pipeline（T3 接通风险/执行），本轮不触 executor。"""
         service = self._started(service_env)
         sig = build_signal("BTCUSDT", spot_price=100, perp_price=100.1,
                            quote_ts_ms=NOW_MS, now_ms=NOW_MS, requested_notional=10, config=service.config)
@@ -317,8 +319,10 @@ class TestRunLoop:
         service._signal_provider = lambda: [sig]  # type: ignore[method-assign]  # noqa: SLF001
         result = service.run_once()
         assert result["state"] == "RUNNING"
-        assert result["opened"] == ["BTCUSDT"]
-        assert len(service_env["executor"].calls) == 1
+        assert result["opened"] == []
+        assert service_env["executor"].calls == [], "legacy signal 路径不得直接下单（T2.4）"
+        kinds = [k for k, _ in service_env["alerts"]]
+        assert "SIGNAL_PATH_DISABLED" in kinds
 
     def test_shadow_mode_records_but_never_orders(self, service_env: dict) -> None:
         service = self._started(service_env)
@@ -332,7 +336,7 @@ class TestRunLoop:
         assert result["state"] == "RUNNING"
         assert service_env["executor"].calls == [], "SHADOW 模式禁止下单"
         kinds = [k for k, _ in service_env["alerts"]]
-        assert "SHADOW_INTENT" in kinds
+        assert "SIGNAL_PATH_DISABLED" in kinds
 
     def test_stale_stream_refuses_startup(self, service_env: dict) -> None:
         """启动前流未新鲜 → 拒绝启动（避免首轮误入不可自动解除的 RECOVERY）。"""
@@ -374,10 +378,12 @@ class TestRunLoop:
         assert result["state"] == "RUNNING"
 
     def test_open_failure_is_reported_not_retried(self, service_env: dict) -> None:
+        """计划 4.0 T2.4 后：legacy signal 路径不下单，provider 只被消费一次
+        （无重试循环），失败不静默。"""
         service = self._started(service_env)
-        service_env["executor"].status = "FAILED"
         sig = build_signal("BTCUSDT", spot_price=100, perp_price=100.1,
                            quote_ts_ms=NOW_MS, now_ms=NOW_MS, requested_notional=10, config=service.config)
+        assert sig is not None
         provider = {"calls": 0}
 
         def once() -> list:
@@ -388,9 +394,10 @@ class TestRunLoop:
         result = service.run_once()
         assert result["state"] == "RUNNING"
         assert result["opened"] == []
-        assert len(service_env["executor"].calls) == 1
+        assert len(service_env["executor"].calls) == 0, "legacy signal 路径不得直接下单（T2.4）"
+        assert provider["calls"] == 1, "provider 只消费一次，不重试"
         kinds = [k for k, _ in service_env["alerts"]]
-        assert "OPEN_FAILED" in kinds
+        assert "SIGNAL_PATH_DISABLED" in kinds
 
     def test_default_risk_state_unknown_capital_refuses_open(self, service_env: dict) -> None:
         """默认 RiskState 资金未知：即使走到 executor，preflight 也应拒绝。

@@ -126,7 +126,8 @@ class TestServiceDedup:
         assert "OPEN" not in kinds
 
     def test_open_then_second_round_no_reopen(self, tmp_path):
-        """开仓成功 → 下轮（对账确认真实持仓后）重复信号不产生第二笔开仓。"""
+        """OPEN 决策 → 落一条 OPEN intent（T2.4：不直接下单）；下轮（对账确认
+        真实持仓后）重复信号不产生第二份 intent（指纹幂等 + HOLD）。"""
         clock = {"t": NOW}
         env = _env(tmp_path, now_fn=lambda: clock["t"])
         spot: FakeServiceAdapter = env["spot"]
@@ -136,7 +137,8 @@ class TestServiceDedup:
 
         r1 = svc.run_once()
         assert r1["state"] == "RUNNING"
-        assert len(env["executor"].open_calls) == 1, f"第一轮应开仓一次: {r1}"
+        assert env["executor"].open_calls == [], "T2 阶段 raw 开仓路径已移除"
+        assert len(r1["intents"]) == 1, f"第一轮应落一条 OPEN intent: {r1}"
         # 模拟交易所确认持仓
         spot.balances_map["BTC"] = Decimal("0.01")
         futures.position_amt = Decimal("-0.01")
@@ -145,20 +147,24 @@ class TestServiceDedup:
 
         r2 = svc.run_once()
         assert r2["state"] == "RUNNING"
-        assert len(env["executor"].open_calls) == 1, f"第二轮不得重复开仓: {r2}"
+        assert env["executor"].open_calls == [], f"第二轮不得重复开仓: {r2}"
+        assert r2["intents"] == [], "HOLD 轮无新目标 → 无新 intent"
         assert len(env["executor"].close_calls) == 0
+        # 全周期仅一条 portfolio intent（指纹幂等）
+        assert len(env["store"].pipeline_records("portfolio_intent")) == 1
         decisions = env["store"].signal_decisions(run_id="run-dedup2")
         second_round = [d for d in decisions if d["ts_ms"] >= int((NOW + 31) * 1000)]
         assert {d["decision_kind"] for d in second_round} == {"HOLD"}
 
     def test_restart_no_reopen_with_existing_position(self, tmp_path):
-        """重启（新 service + 同一账本）且交易所仍有持仓 → 不得再开仓。"""
+        """重启（新 service + 同一账本）且交易所仍有持仓 → 不得再开仓/新 intent。"""
         data = LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")})
         env1 = make_service(tmp_path, data)
         svc1 = env1["svc"]
         svc1.run_id = "run-restart"
-        svc1.run_once()
-        assert len(env1["executor"].open_calls) == 1
+        r1 = svc1.run_once()
+        assert env1["executor"].open_calls == [], "T2 阶段 raw 开仓路径已移除"
+        assert len(r1["intents"]) == 1
 
         # 交易所持仓仍在（平仓没发生）
         env1["spot"].balances_map["BTC"] = Decimal("0.01")
@@ -173,10 +179,9 @@ class TestServiceDedup:
         r = svc2.run_once()
         assert r["state"] == "RUNNING"
         assert env2["executor"].open_calls == [], "重启后持仓仍在，不得再开仓"
-        # 账本中该 symbol 的开仓 pair 只有一条
-        pairs = env2["store"].pair_executions(symbol=SYMBOL, limit=100)
-        opens = [p for p in pairs if p.get("kind") == "open"]
-        assert len(opens) == 1
+        assert r["intents"] == [], "重启后持仓仍在 → HOLD，无新 intent"
+        # 账本中 portfolio intent 只有一条（指纹幂等跨重启）
+        assert len(env2["store"].pipeline_records("portfolio_intent")) == 1
 
 
 class TestFillIdempotency:

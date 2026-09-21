@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Protocol
 
@@ -198,3 +199,55 @@ class PortfolioPlanner:
             as_of_ms=as_of_ms,
             entries=tuple(sorted(entries, key=lambda e: e.symbol)),
         )
+
+    @staticmethod
+    def view_from_ledger_positions(
+        rows: Sequence[Mapping[str, object]],
+        *,
+        as_of_ms: int,
+    ) -> PortfolioView:
+        """ledger current projection 行 → ``PortfolioView``（实施计划书 4.0 T2）。
+
+        名义额 = |qty| × 快照价格（价格缺失/为 0 → 该腿名义额 0，fail
+        closed：不产生 CLOSE 意图，等对账后的下一份完整快照）。
+        ``snapshot_id`` 由行内最大 ``observed_at_ms`` 派生，相同投影内容
+        产生相同 id（保证 planner 指纹确定性）。
+        """
+        entries: list[CurrentPosition] = []
+        max_observed = 0
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            if not symbol:
+                continue
+            spot_qty = abs(_decimal_or_zero(row.get("spot_qty")))
+            perp_qty = abs(_decimal_or_zero(row.get("perp_qty")))
+            spot_price = _decimal_or_zero(row.get("spot_price"))
+            perp_price = _decimal_or_zero(row.get("perp_price"))
+            raw_observed = row.get("observed_at_ms")
+            observed = int(raw_observed) if isinstance(raw_observed, int) else 0
+            max_observed = max(max_observed, observed)
+            entries.append(
+                CurrentPosition(
+                    symbol=symbol,
+                    spot_notional=spot_qty * spot_price,
+                    perp_notional=perp_qty * perp_price,
+                    updated_at_ms=observed,
+                )
+            )
+        return PortfolioPlanner.view_from_entries(
+            entries,
+            snapshot_id=f"proj-{max_observed}",
+            as_of_ms=as_of_ms,
+        )
+
+
+def _decimal_or_zero(value: object) -> Decimal:
+    """账本行 Decimal（TEXT）/数值 → 非负 Decimal；非法/缺失 → 0。"""
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except Exception:  # noqa: BLE001 - 账本行损坏时按 0 处理（fail closed）
+        return Decimal("0")

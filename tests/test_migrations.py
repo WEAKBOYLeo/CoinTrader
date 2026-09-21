@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -244,7 +245,7 @@ class TestMigrate2:
         _make_v1_db(db)
         store = StateStore(db)
         conn = store._conn  # noqa: SLF001
-        assert schema_version_of(conn) == 2
+        assert schema_version_of(conn) == 3
         # 行数/关联字段不丢
         assert conn.execute("SELECT COUNT(*) FROM run_sessions").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM pair_executions").fetchone()[0] == 2
@@ -284,8 +285,8 @@ class TestMigrate2:
         _make_v1_db(db)
         store = StateStore(db)
         conn = store._conn  # noqa: SLF001
-        assert apply_migrations(conn) == 2
-        assert apply_migrations(conn) == 2
+        assert apply_migrations(conn) == 3
+        assert apply_migrations(conn) == 3
         assert conn.execute("SELECT COUNT(*) FROM funding_cashflows").fetchone()[0] == 3
         store.close()
 
@@ -309,7 +310,7 @@ class TestMigrate2:
         assert n == 3
         monkeypatch.undo()
         store = StateStore(db)
-        assert schema_version_of(store._conn) == 2  # noqa: SLF001
+        assert schema_version_of(store._conn) == 3  # noqa: SLF001
         assert store._conn.execute("SELECT COUNT(*) FROM funding_cashflows").fetchone()[0] == 3  # noqa: SLF001
         store.close()
 
@@ -323,3 +324,88 @@ class TestMigrate2:
         conn.close()
         with pytest.raises(StoreError, match="高于本代码"):
             StateStore(db)
+
+
+def _make_v2_db(path) -> None:
+    """v1 账本 + v2 迁移完成（v3 测试的输入 fixture）。"""
+    _make_v1_db(path)
+    conn = sqlite3.connect(path)
+    migrations_mod._migrate_2(conn)  # noqa: SLF001
+    conn.commit()
+    conn.close()
+
+
+class TestMigrate3:
+    """v2 → v3（实施计划书 4.0 T2：pipeline 持久化表，additive、数据无损、
+    幂等、失败回滚保留 v2）。"""
+
+    def test_v2_db_upgrades_to_v3_with_pipeline_records(self, tmp_path):
+        db = tmp_path / "v2.sqlite3"
+        _make_v2_db(db)
+        store = StateStore(db)
+        conn = store._conn  # noqa: SLF001
+        assert schema_version_of(conn) == 3
+        # v2 数据无损
+        assert conn.execute("SELECT COUNT(*) FROM funding_cashflows").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM pair_executions").fetchone()[0] == 2
+        # 新表存在且旧数据可读
+        assert "pipeline_records" in _tables(conn)
+        assert store.pipeline_records("portfolio_intent") == []
+        # 幂等 append：同一 intent_id 只落一条
+        intent = {
+            "intent_id": "fp-1",
+            "action": "CLOSE",
+            "symbol": "BTCUSDT",
+            "created_at_ms": NOW_MS - 1000,
+            "run_id": "run-1",
+        }
+        assert store.append_portfolio_intent(intent) is True
+        assert store.append_portfolio_intent(intent) is False, "重复 fingerprint 不得产生第二条"
+        assert store.has_portfolio_intent_fingerprint("fp-1") is True
+        assert store.has_portfolio_intent_fingerprint("fp-2") is False
+        rows = store.pipeline_records("portfolio_intent")
+        assert len(rows) == 1
+        assert rows[0]["run_id"] == "run-1"
+        payload = json.loads(rows[0]["payload_json"])
+        assert payload["symbol"] == "BTCUSDT"
+        assert payload["intent_id"] == "fp-1"
+        # 其它记录类型互不干扰
+        assert store.append_strategy_proposal({"proposal_id": "p-1", "run_id": "run-1"}) is True
+        assert store.append_risk_decision({"decision_id": "d-1", "decided_at_ms": NOW_MS}) is True
+        assert store.append_execution_plan({"plan_id": "pl-1", "plan_created_at_ms": NOW_MS}) is True
+        assert len(store.pipeline_records("strategy_proposal")) == 1
+        store.close()
+
+    def test_v3_migration_idempotent(self, tmp_path):
+        db = tmp_path / "v2.sqlite3"
+        _make_v2_db(db)
+        store = StateStore(db)
+        conn = store._conn  # noqa: SLF001
+        assert apply_migrations(conn) == 3
+        assert apply_migrations(conn) == 3
+        assert conn.execute("SELECT COUNT(*) FROM funding_cashflows").fetchone()[0] == 3
+        store.close()
+
+    def test_v3_migration_failure_keeps_v2(self, tmp_path, monkeypatch):
+        """v3 迁移中途失败 → 事务回滚，schema 仍为 v2，重试可完成。"""
+        db = tmp_path / "v2.sqlite3"
+        _make_v2_db(db)
+
+        def boom3(conn):
+            raise sqlite3.OperationalError("simulated power loss in v3")
+
+        monkeypatch.setitem(migrations_mod.MIGRATIONS, 3, boom3)
+        with pytest.raises(StoreError, match="迁移失败"):
+            StateStore(db)
+        # 回滚后仍是 v2，pipeline 表未出现，旧数据完好
+        assert schema_version_of(sqlite3.connect(db)) == 2
+        assert "pipeline_records" not in _tables(sqlite3.connect(db))
+        assert (
+            sqlite3.connect(db).execute("SELECT COUNT(*) FROM funding_cashflows").fetchone()[0]
+            == 3
+        )
+        monkeypatch.undo()
+        store = StateStore(db)
+        assert schema_version_of(store._conn) == 3  # noqa: SLF001
+        assert store._conn.execute("SELECT COUNT(*) FROM funding_cashflows").fetchone()[0] == 3  # noqa: SLF001
+        store.close()

@@ -59,19 +59,21 @@ class TestServiceCycle:
             spot_endpoint="e", futures_endpoint="f", user_stream_mode="poll",
         )
 
-        # 1) 正费率 → 开仓一次
+        # 1) 正费率 → OPEN 决策 → pipeline 落 OPEN intent（T2.4：不直接下单）
         r1 = svc.run_once()
         assert r1["state"] == "RUNNING"
-        assert [c["symbol"] for c in env["executor"].open_calls] == [SYMBOL]
+        assert env["executor"].open_calls == [], "T2 阶段 raw 开仓路径已移除"
+        assert len(r1["intents"]) == 1, f"应落一条 OPEN intent: {r1}"
         assert env["executor"].close_calls == []
 
-        # 2) 交易所确认持仓 → 重复信号不重复开仓
+        # 2) 交易所确认持仓 → 重复信号不重复开仓/不重复 intent
         spot.balances_map["BTC"] = Decimal("0.01")
         futures.position_amt = Decimal("-0.01")
         clock["t"] = NOW + 31
         r2 = svc.run_once()
         assert r2["state"] == "RUNNING"
-        assert len(env["executor"].open_calls) == 1, f"不得重复开仓: {r2}"
+        assert env["executor"].open_calls == [], f"不得重复开仓: {r2}"
+        assert r2["intents"] == [], "HOLD 轮无新目标 → 无新 intent"
         assert env["executor"].close_calls == []
 
         # 3) 尾部费率转负（新结算期到点后才可见）→ 策略退出 → 平仓一次
@@ -83,13 +85,14 @@ class TestServiceCycle:
         close_reason = env["executor"].close_calls[0]["reason"]
         assert "NEGATIVE_EXIT_AVG" in close_reason
 
-        # 4) 平仓成交 → 交易所持仓归零 → 下一轮不再开新仓
+        # 4) 平仓成交 → 交易所持仓归零 → 下一轮不再开新仓/新 intent
         spot.balances_map["BTC"] = Decimal("0")
         futures.position_amt = Decimal("0")
         clock["t"] = NOW + 8 * 3600 + 93
         r4 = svc.run_once()
         assert r4["state"] == "RUNNING"
-        assert len(env["executor"].open_calls) == 1, f"平仓后费率仍为负，不得开新仓: {r4}"
+        assert env["executor"].open_calls == [], f"平仓后费率仍为负，不得开新仓: {r4}"
+        assert r4["intents"] == []
         assert len(env["executor"].close_calls) == 1
 
         # 决策链完整：OPEN → HOLD → EXIT → SKIP（拒绝原因落盘）
@@ -117,9 +120,9 @@ class TestServiceCycle:
         r5 = svc2.run_once()
         assert r5["state"] == "RUNNING"
         assert env2["executor"].open_calls == [], "重启后费率仍为负，不得开新仓"
-        pairs = env2["store"].pair_executions(symbol=SYMBOL, limit=100)
-        assert [p["kind"] for p in pairs].count("open") == 1
-        assert [p["kind"] for p in pairs].count("close") == 1
+        # 意图级去重（T2）：全周期只有第一条 OPEN intent（指纹幂等）
+        assert len(env2["store"].pipeline_records("portfolio_intent")) == 1
+        assert r5["intents"] == []
 
     def test_exit_failure_enters_recovery_and_no_new_risk(self, tmp_path):
         """平仓失败 → RECOVERY：禁止开新仓（不得带着未知状态继续）。"""
@@ -131,7 +134,8 @@ class TestServiceCycle:
         data: FakeStrategyData = svc.strategy.data  # noqa: SLF001
 
         r1 = svc.run_once()
-        assert len(env["executor"].open_calls) == 1
+        assert env["executor"].open_calls == [], "T2 阶段 raw 开仓路径已移除"
+        assert len(r1["intents"]) == 1
         spot.balances_map["BTC"] = Decimal("0.01")
         futures.position_amt = Decimal("-0.01")
 
@@ -160,7 +164,7 @@ class TestServiceCycle:
         # RECOVERY 期间再跑：不开新仓
         r3 = svc.run_once()
         assert r3["state"] in ("RECOVERY", "HALTED")
-        assert len(env["executor"].open_calls) == 1, "RECOVERY 禁止开新仓"
+        assert env["executor"].open_calls == [], "RECOVERY 禁止开新仓"
         _ = r1
 
 

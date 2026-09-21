@@ -23,7 +23,7 @@ from ..domain.strategy import (
 )
 from .funding_carry import CarryEvaluation, EvalKind
 
-__all__ = ["StrategyPort", "to_strategy_proposal"]
+__all__ = ["LegacyStrategyDecision", "StrategyPort", "decisions_to_proposal", "to_strategy_proposal"]
 
 
 class StrategyPort(Protocol):
@@ -98,6 +98,99 @@ def to_strategy_proposal(
             TargetPosition(symbol=symbol, spot_notional=spot, perp_notional=perp)
             for symbol, (spot, perp) in sorted(targets.items())
             if spot + perp > 0
+        )
+    )
+    return StrategyProposal(
+        proposal_id=proposal_id,
+        snapshot_id=snapshot_id,
+        decision_cutoff_ms=decision_cutoff_ms,
+        strategy_version=strategy_version,
+        config_hash=config_hash,
+        valid_until_ms=valid_until_ms,
+        target=target_portfolio,
+        reasons=tuple(reasons),
+    )
+
+
+class LegacyStrategyDecision(Protocol):
+    """legacy ``live.decisions.StrategyDecision`` 的结构契约（只读）。
+
+    本包不 import ``cointrader.live``（依赖方向由 application 层组装），
+    与 ``portfolio.adapter.LegacySignal`` 同风格。
+    """
+
+    @property
+    def symbol(self) -> str: ...
+
+    @property
+    def decision_kind(self) -> str: ...  # OPEN/HOLD/EXIT/REPLACE/SKIP/PENDING_QUOTE
+
+    @property
+    def allowed(self) -> bool: ...
+
+    @property
+    def requested_notional(self) -> Decimal | None: ...
+
+    @property
+    def reason_code(self) -> str: ...
+
+    @property
+    def reason_text(self) -> str: ...
+
+
+def decisions_to_proposal(
+    decisions: Sequence[LegacyStrategyDecision],
+    view: PortfolioView,
+    *,
+    proposal_id: str,
+    snapshot_id: str,
+    decision_cutoff_ms: int,
+    strategy_version: str,
+    config_hash: str,
+    valid_until_ms: int,
+) -> StrategyProposal:
+    """legacy 策略决策序列 → 领域 ``StrategyProposal``（实施计划书 4.0 T2）。
+
+    数值语义与 legacy signal 路径一致：
+
+    - 目标组合 = 当前组合 − EXIT/REPLACE symbol + OPEN（allowed）symbol，
+      两腿目标名义额 = ``requested_notional``（与 ``Signal.to_intent`` 一致：
+      spot = perp = 请求名义额，拆半由执行层负责）；
+    - 拒绝/跳过（SKIP/未放行 OPEN）不改变目标组合，但证据逐条落
+      ``reasons``（拒绝也留痕）；
+    - 纯计算：不含订单/网络/账本能力。
+    """
+    targets: dict[str, tuple[Decimal, Decimal]] = {
+        e.symbol: (e.spot_notional, e.perp_notional) for e in view.entries
+    }
+    reasons: list[PositionReason] = []
+    for decision in sorted(decisions, key=lambda d: d.symbol):
+        kind = decision.decision_kind
+        if kind in ("EXIT", "REPLACE"):
+            action = StrategyAction.EXIT if kind == "EXIT" else StrategyAction.REPLACE
+            targets.pop(decision.symbol, None)
+        elif kind == "OPEN" and decision.allowed:
+            action = StrategyAction.OPEN
+            notional = decision.requested_notional
+            if notional is not None and notional > 0:
+                targets[decision.symbol] = (notional, notional)
+        elif kind == "HOLD":
+            action = StrategyAction.HOLD
+        else:  # SKIP / 未放行 OPEN / 中间态
+            action = StrategyAction.SKIP
+        reasons.append(
+            PositionReason(
+                symbol=decision.symbol,
+                action=action,
+                reason=decision.reason_text or decision.reason_code,
+                evidence=(decision.reason_code,),
+            )
+        )
+    target_portfolio = TargetPortfolio(
+        entries=tuple(
+            TargetPosition(symbol=s, spot_notional=sp, perp_notional=pe)
+            for s, (sp, pe) in sorted(targets.items())
+            if sp + pe > 0
         )
     )
     return StrategyProposal(

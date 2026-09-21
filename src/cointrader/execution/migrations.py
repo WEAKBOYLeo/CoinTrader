@@ -28,7 +28,7 @@ class MigrationError(Exception):
 
 
 #: 本代码支持的 schema 版本
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _now_ms() -> int:
@@ -400,12 +400,55 @@ def _migrate_2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_3(conn: sqlite3.Connection) -> None:
+    """v2 → v3：pipeline 持久化记录表（实施计划书 4.0 T2，additive）。
+
+    单张通用表承载 strategy proposal / portfolio intent / risk decision /
+    execution plan 四类记录（payload_json = 领域契约 ``to_dict`` 输出 +
+    ``run_id``）。``(record_type, record_id)`` 主键提供幂等键：
+    重复 append 被 ``INSERT OR IGNORE`` 挡住，不产生第二条记录。
+    纯新增，不触碰 v2 任何数据/表结构。
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pipeline_records ("
+        " record_type TEXT NOT NULL,"
+        " record_id TEXT NOT NULL,"
+        " run_id TEXT NOT NULL DEFAULT '',"
+        " ts_ms INTEGER NOT NULL,"
+        " payload_json TEXT NOT NULL DEFAULT '{}',"
+        " PRIMARY KEY (record_type, record_id))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pipeline_records_run"
+        " ON pipeline_records(run_id, ts_ms)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pipeline_records_type_ts"
+        " ON pipeline_records(record_type, ts_ms)"
+    )
+    conn.execute(
+        "INSERT INTO schema_meta (schema_version, migrated_at_ms) VALUES (?, ?)"
+        " ON CONFLICT DO UPDATE SET"
+        " schema_version = excluded.schema_version,"
+        " migrated_at_ms = excluded.migrated_at_ms",
+        (3, _now_ms()),
+    )
+    conn.execute(
+        "UPDATE schema_meta SET schema_version = ?, migrated_at_ms = ? WHERE schema_version < ?",
+        (3, _now_ms(), 3),
+    )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}  # noqa: S608
 
 
 #: 版本号 → 迁移函数（顺序执行）
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1, 2: _migrate_2}
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    1: _migrate_1,
+    2: _migrate_2,
+    3: _migrate_3,
+}
 
 
 def schema_version_of(conn: sqlite3.Connection) -> int:

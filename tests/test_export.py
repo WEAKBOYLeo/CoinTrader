@@ -53,7 +53,7 @@ class TestExport:
         manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
         assert manifest["run_id"] == "run-exp"
         # T4：迁移版本 + authority 口径 + cursor/epoch 完整性
-        assert manifest["schema_version"] == 2
+        assert manifest["schema_version"] == 3
         authority = manifest["funding_authority"]
         assert isinstance(authority["authoritative_rows"], int)
         assert isinstance(authority["estimated_rows"], int)

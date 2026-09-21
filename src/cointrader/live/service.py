@@ -23,6 +23,9 @@ from enum import Enum
 from typing import Any
 
 from ..config import Config
+from ..domain.market import DataQuality, MarketSnapshot
+from ..domain.portfolio import PortfolioView
+from ..domain.strategy import StrategyProposal
 from ..errors import BinanceError, ClockError, LiveGateBlocked
 from ..execution.futures import FuturesAdapter
 from ..execution.guard import AuditLog
@@ -36,7 +39,10 @@ from ..execution.spot import SpotAdapter
 from ..execution.store import LeaseConflict, StateStore, StoreError
 from ..execution.sync import ExchangeStateSynchronizer, SyncCaptureError
 from ..execution.user_stream import PollingUserStream, UserStream
+from ..market_data.service import MarketDataService
+from ..portfolio.planner import PortfolioPlanner
 from ..reporting.pnl import PnlAggregator
+from ..strategy.adapter import decisions_to_proposal
 from .account_state import AccountStateBuilder, AccountStateError, AccountStateResult
 from .market_sync import MarketDataSynchronizer
 from .portfolio import Signal
@@ -941,6 +947,63 @@ class LiveService:
             submitted_this_run=frozenset(self._submitted_this_run),
             account_ok=account_ok,
             reconcile_ok=self._reconcile_ok,
+        )
+
+    # ---- 领域生产流水线（实施计划书 4.0 T2） ------------------------------
+
+    @property
+    def _pipeline(self):
+        """延迟组装的 ``application.composition.Pipeline``（单一 composition 入口）。
+
+        T2 边界：pipeline 只做 proposal/intent 落账与 diff，不触 broker；
+        T3 在此追加 RiskKernel → ApprovedIntent → ExecutionPlan → submit。
+        """
+        obj = self.__dict__.get("_pipeline_obj")
+        if obj is None:
+            from ..application.composition import Pipeline
+
+            obj = Pipeline(planner=PortfolioPlanner(), ledger=self.store)
+            self.__dict__["_pipeline_obj"] = obj
+        return obj
+
+    def _market_snapshot(self, now_ms: int) -> MarketSnapshot:
+        """当前市场事实（scan epoch READY → FRESH；无 synchronizer → INCOMPLETE）。"""
+        if self.synchronizer is not None:
+            return MarketDataService(self.synchronizer, now_fn=self._now).snapshot()
+        return MarketSnapshot(
+            snapshot_id="no-epoch",
+            generated_at_ms=now_ms,
+            decision_cutoff_ms=0,
+            quality=DataQuality.INCOMPLETE,
+            quotes=(),
+        )
+
+    def _portfolio_view(self, now_ms: int) -> PortfolioView:
+        """ledger current projection → 只读 PortfolioView（查询事实源）。"""
+        return PortfolioPlanner.view_from_ledger_positions(
+            self.store.current_positions(), as_of_ms=now_ms
+        )
+
+    def _build_strategy_proposal(
+        self,
+        decisions,
+        view: PortfolioView,
+        market_snap: MarketSnapshot,
+        now_ms: int,
+    ) -> StrategyProposal:
+        """legacy 策略决策 → 领域 StrategyProposal（数值语义不变，adapter 转换）。"""
+        run_id = self.run_id or ""
+        return decisions_to_proposal(
+            decisions,
+            view,
+            proposal_id=f"{run_id}:{market_snap.snapshot_id}:{market_snap.decision_cutoff_ms}",
+            snapshot_id=market_snap.snapshot_id,
+            decision_cutoff_ms=market_snap.decision_cutoff_ms,
+            strategy_version=(
+                self.strategy.strategy_version if self.strategy is not None else "funding_carry-1.0"
+            ),
+            config_hash=self.config_hash,
+            valid_until_ms=now_ms + 30_000,
         )
 
     def run_forever(self, *, tick_seconds: float = 5.0, stop_check: Callable[[], bool] | None = None) -> bool:

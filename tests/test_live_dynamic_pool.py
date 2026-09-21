@@ -6,6 +6,7 @@ PENDING_QUOTE 中间态 → complete_open 定案、service run_once 端到端解
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal  # noqa: F401  (保持与兄弟测试一致的类型习惯)
 
 from cointrader.live.decisions import DecisionKind, ReasonCode
@@ -212,15 +213,23 @@ class TestDynamicOpenFlow:
 
     def test_service_run_once_resolves_pending_and_opens(self, tmp_path):
         env = make_service(tmp_path, _data(), config=_dyn_config())
-        env["svc"].run_once()
-        # 3 个池 symbol 全部通过门槛，槽位 2 → 按池序（收益率相同）取前 2 开仓
-        assert [c["symbol"] for c in env["executor"].open_calls] == ["AAAUSDT", "BBBUSDT"]
+        # 计划 4.0 T2.4：run_once 不再直接下单；OPEN 决策 → pipeline 落
+        # OPEN intent（T3 才经风险/执行链提交），槽位 2 → 前 2 symbol
+        r = env["svc"].run_once()
+        assert env["executor"].open_calls == [], "T2 阶段 raw 开仓路径已移除"
         rows = env["store"].signal_decisions()
-        assert all(r["decision_kind"] != DecisionKind.PENDING_QUOTE for r in rows)
-        opens = [r for r in rows if r["reason_code"] == ReasonCode.ENTRY_OK]
+        assert all(r2["decision_kind"] != DecisionKind.PENDING_QUOTE for r2 in rows)
+        opens = [r2 for r2 in rows if r2["reason_code"] == ReasonCode.ENTRY_OK]
         assert len(opens) == 2
-        ranked = [r for r in rows if r["reason_code"] == ReasonCode.RANKED_OUT]
-        assert [r["symbol"] for r in ranked] == ["CCCUSDT"]
+        ranked = [r2 for r2 in rows if r2["reason_code"] == ReasonCode.RANKED_OUT]
+        assert [r2["symbol"] for r2 in ranked] == ["CCCUSDT"]
+        # PENDING_QUOTE 中间态已定案，且前 2 symbol 落为 OPEN intent
+        intent_rows = env["store"].pipeline_records("portfolio_intent")
+        assert [json.loads(x["payload_json"])["symbol"] for x in intent_rows] == [
+            "AAAUSDT",
+            "BBBUSDT",
+        ]
+        assert len(r["intents"]) == 2
 
     def test_service_quote_failure_records_stale_quote(self, tmp_path):
         env = make_service(tmp_path, _data(), config=_dyn_config())

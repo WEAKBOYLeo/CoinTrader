@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from ..execution.risk_gate import HaltState
@@ -200,27 +199,14 @@ class ServiceRunner:
                 if svc.store.active_pair_for_symbol(signal.symbol):
                     skipped.append(f"{signal.symbol}: 已有未完结 pair")
                     continue
-                if svc.mode == "shadow":
-                    svc._on_alert(
-                        "SHADOW_INTENT",
-                        f"shadow 模式只记录意图: {signal.symbol} notional={signal.target_notional}",
-                    )
-                    svc.metrics.inc("strategy_signal_count", labels={"symbol": signal.symbol})
-                    continue
-                pair = svc.executor.open_pair(
-                    signal.symbol,
-                    signal.target_notional,
-                    spot_price=signal.spot_price,
-                    perp_price=signal.perp_price,
-                    quote_ts_ms=signal.quote_ts_ms,
-                    state=svc._risk_state_fn(),
-                    reason=signal.reason,
+                # 计划 4.0 T2（T2.4）：raw signal → executor.open_pair 直调路径已移除。
+                # 信号必须经领域 pipeline（strategy → proposal → intent → T3 风险/执行），
+                # legacy signal_provider 不再直接下单。
+                svc._on_alert(
+                    "SIGNAL_PATH_DISABLED",
+                    f"legacy signal_provider 路径不直接下单（领域 pipeline 待接入）: "
+                    f"{signal.symbol} notional={signal.target_notional}",
                 )
-                if pair.status == "COMPLETE":
-                    opened.append(signal.symbol)
-                else:
-                    skipped.append(f"{signal.symbol}: {pair.status} {pair.error}")
-                    svc._on_alert("OPEN_FAILED", f"{signal.symbol}: {pair.status} {pair.error}")
                 svc.metrics.inc("strategy_signal_count", labels={"symbol": signal.symbol})
             svc._persist_runtime_state()
             return {"state": "RUNNING", "opened": opened, "skipped": skipped, "closed": closed}
@@ -273,64 +259,38 @@ class ServiceRunner:
                 svc._persist_runtime_state()
                 return {"state": svc.state.value, "reason": svc._recovery_reason}
 
-        # 2) 开仓（决策已含全部门槛判断；执行层仍会再次检查，不能只信上层）
-        for decision in decisions:
-            if decision.decision_kind is not DecisionKind.OPEN or not decision.allowed:
-                continue
-            symbol = decision.symbol
+        # 2) 开仓：领域 pipeline（计划 4.0 T2）：proposal → intent（先落账 + 指纹幂等）。
+        #    raw executor.open_pair 直调路径已移除（T2.4）：新增风险必须经 T3 接通的
+        #    RiskKernel → ApprovedIntent → ExecutionPlan → submit；T2 阶段 intent
+        #    只落账，不触 broker。
+        view = svc._portfolio_view(now_ms)
+        market_snap = svc._market_snapshot(now_ms)
+        proposal = svc._build_strategy_proposal(decisions, view, market_snap, now_ms)
+        _, new_intents = svc._pipeline.run_round(
+            proposal=proposal, view=view, now_ms=now_ms, run_id=svc.run_id or ""
+        )
+        intent_ids: list[str] = []
+        for intent in new_intents:
+            intent_ids.append(intent.intent_id)
+            svc.metrics.inc(
+                "pipeline_intent_count",
+                labels={"action": intent.action.value, "symbol": intent.symbol},
+            )
             if svc.mode == "shadow":
                 svc._on_alert(
                     "SHADOW_INTENT",
-                    f"shadow 模式只记录意图: {symbol} notional={decision.requested_notional}",
+                    f"shadow 模式只记录意图: {intent.symbol} {intent.action.value} "
+                    f"spot={format(intent.target_spot_notional, 'f')} "
+                    f"perp={format(intent.target_perp_notional, 'f')}",
                 )
-                svc.metrics.inc("strategy_signal_count", labels={"symbol": symbol})
-                continue
-            if symbol in svc._submitted_this_run:
-                skipped.append(f"{symbol}: 本轮已提交")
-                continue
-            # 执行前重新确认报价新鲜（决策到下单之间可能已过期）
-            if decision.quote_ts_ms is None or decision.spot_price is None or decision.perp_price is None:
-                skipped.append(f"{symbol}: 决策缺少报价")
-                continue
-            quote = svc._quote_fetcher(symbol)
-            if quote is None:
-                skipped.append(f"{symbol}: 提交前报价获取失败")
-                continue
-            # 杠杆/保证金：固定池启动预检已验证；动态池 symbol 首次开仓时验证一次
-            if symbol not in svc._leverage_checked:
-                lev, margin, _read = svc._check_leverage_margin(
-                    symbol, svc.config.execution.leverage, svc.config.execution.margin_type
-                )
-                if (lev, margin) != (svc.config.execution.leverage, svc.config.execution.margin_type):
-                    skipped.append(f"{symbol}: 杠杆/保证金 ({lev}, {margin}) 与配置不符，放弃开仓")
-                    svc._on_alert(
-                        "OPEN_FAILED", f"{symbol} 杠杆/保证金模式不符: ({lev}, {margin})"
-                    )
-                    continue
-                svc._leverage_checked.add(symbol)
-            svc._submitted_this_run.add(symbol)
-            state = svc._risk_state_fn()
-            pair = svc.executor.open_pair(
-                symbol,
-                decision.requested_notional or Decimal("0"),
-                spot_price=quote.spot_price,
-                perp_price=quote.perp_price,
-                quote_ts_ms=quote.ts_ms,
-                state=state,
-                reason=f"{decision.reason_code}: {decision.reason_text}",
-                run_id=svc.run_id,
-                signal_decision_id=decision.decision_id,
-                decision_ts_ms=decision.ts_ms,
-            )
-            if pair.status == "COMPLETE":
-                opened.append(symbol)
-            else:
-                skipped.append(f"{symbol}: {pair.status} {pair.error}")
-                svc._on_alert("OPEN_FAILED", f"{symbol}: {pair.status} {pair.error}")
-            svc.metrics.inc("strategy_signal_count", labels={"symbol": symbol})
-
         svc._persist_runtime_state()
-        return {"state": "RUNNING", "opened": opened, "skipped": skipped, "closed": closed}
+        return {
+            "state": "RUNNING",
+            "opened": opened,
+            "skipped": skipped,
+            "closed": closed,
+            "intents": intent_ids,
+        }
 
 
     def run_forever(self, *, tick_seconds: float = 5.0, stop_check: Callable[[], bool] | None = None) -> bool:

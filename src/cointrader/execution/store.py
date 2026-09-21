@@ -21,7 +21,7 @@ import logging
 import os
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -1420,6 +1420,98 @@ class StateStore:
             return True
         except sqlite3.IntegrityError:
             return False
+
+    # -- pipeline 持久化（实施计划书 4.0 T2；``ledger.ports.PipelineLedgerPort``） --
+
+    def append_pipeline_record(
+        self,
+        record_type: str,
+        record_id: str,
+        payload: Mapping[str, object],
+        *,
+        run_id: str = "",
+        ts_ms: int | None = None,
+    ) -> bool:
+        """幂等写入 pipeline 记录；已存在（幂等命中）返回 False，新写入返回 True。
+
+        写失败（数据库错误）抛 ``StoreError``，调用方 fail closed（不得吞掉）。
+        """
+        ts = ts_ms if ts_ms is not None else _now_ms()
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO pipeline_records"
+                    " (record_type, record_id, run_id, ts_ms, payload_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        record_type,
+                        record_id,
+                        run_id,
+                        ts,
+                        json.dumps(payload, ensure_ascii=False, default=str),
+                    ),
+                )
+                return cur.rowcount > 0
+        except sqlite3.Error as exc:
+            raise StoreError(f"pipeline_records 写入失败: {exc}") from exc
+
+    def has_pipeline_record(self, record_type: str, record_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM pipeline_records WHERE record_type = ? AND record_id = ?",
+                (record_type, record_id),
+            ).fetchone()
+        return row is not None
+
+    def pipeline_records(
+        self, record_type: str, *, since_ms: int | None = None, limit: int = 5000
+    ) -> list[dict[str, Any]]:
+        where = "WHERE record_type = ?"
+        params: list[Any] = [record_type]
+        if since_ms is not None:
+            where += " AND ts_ms >= ?"
+            params.append(since_ms)
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT record_type, record_id, run_id, ts_ms, payload_json"  # noqa: S608
+                f" FROM pipeline_records {where} ORDER BY ts_ms, record_id LIMIT ?",
+                (*params, limit),
+            )
+            rows = cur.fetchall()
+            names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=False)) for row in rows]
+
+    # ``PipelineLedgerPort`` 协议方法（幂等键 = 领域契约记录 id）
+
+    def append_strategy_proposal(self, proposal: Mapping[str, object]) -> bool:
+        return self._append_pipeline(
+            "strategy_proposal", str(proposal["proposal_id"]), proposal
+        )
+
+    def append_portfolio_intent(self, intent: Mapping[str, object]) -> bool:
+        return self._append_pipeline("portfolio_intent", str(intent["intent_id"]), intent)
+
+    def append_risk_decision(self, decision: Mapping[str, object]) -> bool:
+        return self._append_pipeline("risk_decision", str(decision["decision_id"]), decision)
+
+    def append_execution_plan(self, plan: Mapping[str, object]) -> bool:
+        return self._append_pipeline("execution_plan", str(plan["plan_id"]), plan)
+
+    def has_portfolio_intent_fingerprint(self, fingerprint: str) -> bool:
+        # intent_id == 确定性指纹（planner 契约），主键幂等等价于指纹幂等
+        return self.has_pipeline_record("portfolio_intent", fingerprint)
+
+    def _append_pipeline(
+        self, record_type: str, record_id: str, payload: Mapping[str, object]
+    ) -> bool:
+        run_id = str(payload.get("run_id") or "")
+        ts: int | None = None
+        for key in ("created_at_ms", "decided_at_ms", "plan_created_at_ms", "decision_cutoff_ms"):
+            raw = payload.get(key)
+            if isinstance(raw, int):
+                ts = raw
+                break
+        return self.append_pipeline_record(record_type, record_id, payload, run_id=run_id, ts_ms=ts)
 
     # -- 风控决策 / 对账 ------------------------------------------------------
 
