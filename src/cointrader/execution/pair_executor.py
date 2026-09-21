@@ -18,6 +18,8 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import Any, cast
 
+from ..domain.execution import ExecutionPlan  # 领域计划（T4 adapter 消费）
+from ..domain.market import MarketKind
 from ..errors import BinanceError, OrderRejected, UnknownSubmission
 from .futures import FuturesAdapter
 from .guard import AuditLog, Market, OrderSide, OrderType
@@ -92,6 +94,7 @@ class PairExecutor:
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now_fn
         self._sleep = sleep_fn
+        self._plan_cids: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 开仓
@@ -110,8 +113,15 @@ class PairExecutor:
         run_id: str = "",
         signal_decision_id: str = "",
         decision_ts_ms: int = 0,
+        plan_client_order_ids: dict[str, str] | None = None,
     ) -> PairExecution:
-        """开一对对冲头寸（永续空 + 现货多）。返回终态 PairExecution。"""
+        """开一对对冲头寸（永续空 + 现货多）。返回终态 PairExecution。
+
+        ``plan_client_order_ids``（T3/T4 adapter）：来自执行计划的
+        ``{"perp": cid, "spot": cid}``；提供时两腿直接复用计划 clientOrderId
+        （幂等/审计一致），缺省保持原有生成逻辑。
+        """
+        self._plan_cids = plan_client_order_ids or {}
         pair = PairExecution(
             pair_execution_id=new_id("pair"),
             symbol=symbol,
@@ -243,7 +253,8 @@ class PairExecutor:
         check_notional(qty, perp_price, rule)
 
         req = OrderRequest(
-            client_order_id=new_client_order_id(self.strategy_version, pair.pair_execution_id, "perp"),
+            client_order_id=self._plan_cids.get("perp")
+            or new_client_order_id(self.strategy_version, pair.pair_execution_id, "perp"),
             symbol=pair.symbol,
             side=OrderSide.SELL,
             market=Market.PERP,
@@ -294,7 +305,8 @@ class PairExecutor:
                     return None
 
         req = OrderRequest(
-            client_order_id=new_client_order_id(self.strategy_version, pair.pair_execution_id, "spot"),
+            client_order_id=self._plan_cids.get("spot")
+            or new_client_order_id(self.strategy_version, pair.pair_execution_id, "spot"),
             symbol=pair.symbol,
             side=OrderSide.BUY,
             market=Market.SPOT,
@@ -336,6 +348,64 @@ class PairExecutor:
     # ------------------------------------------------------------------
     # 平仓
     # ------------------------------------------------------------------
+
+    def open_pair_from_plan(
+        self,
+        plan: ExecutionPlan,
+        *,
+        spot_price: Decimal,
+        perp_price: Decimal,
+        quote_ts_ms: int,
+        state: RiskState,
+        reason: str = "",
+    ) -> PairExecution:
+        """T4 adapter 入口：消费只读 ``ExecutionPlan``（T3，AC-06）。
+
+        - 过期计划拒绝；reduce_only 标志与平仓语义由领域层强制，
+          本方法不修改计划。
+        - 开仓：委托 ``open_pair``（目标名义额取计划现货腿 × 现报价）；
+          两腿实际数量仍由执行状态机按 Futures 实际成交量归一化
+          （现有规则 2 不变）。
+        - 平仓（全部 reduce_only）：委托 ``close_pair``。
+        部分成交/UNKNOWN/补偿逻辑全部保持原路径。
+        """
+        now = self._now()
+        if plan.is_expired(int(now * 1000)):
+            raise PairPrecheckFailed(
+                f"执行计划已过期（expires_at_ms={plan.expires_at_ms}）：拒绝执行 {plan.plan_id}"
+            )
+        symbol = plan.approved_intent.intent.symbol
+        if plan.approved_intent.is_closing:
+            return self.close_pair(
+                symbol,
+                reason=reason or f"plan:{plan.plan_id}",
+                signal_decision_id=plan.approved_intent.decision_id,
+                decision_ts_ms=plan.approved_intent.decided_at_ms,
+            )
+        spot_order = next(
+            (o for o in plan.orders if o.market is MarketKind.SPOT), None
+        )
+        if spot_order is None:
+            raise PairPrecheckFailed(f"执行计划缺少现货腿: {plan.plan_id}")
+        target_notional = spot_order.quantity * spot_price
+        plan_cids = {
+            "perp": next(
+                (o.client_order_id for o in plan.orders if o.market is MarketKind.FUTURES), ""
+            ),
+            "spot": spot_order.client_order_id,
+        }
+        return self.open_pair(
+            symbol,
+            target_notional,
+            spot_price=spot_price,
+            perp_price=perp_price,
+            quote_ts_ms=quote_ts_ms,
+            state=state,
+            reason=reason or f"plan:{plan.plan_id}",
+            signal_decision_id=plan.approved_intent.decision_id,
+            decision_ts_ms=plan.approved_intent.decided_at_ms,
+            plan_client_order_ids=plan_cids,
+        )
 
     def close_pair(
         self, symbol: str, *, reason: str = "", run_id: str = "",

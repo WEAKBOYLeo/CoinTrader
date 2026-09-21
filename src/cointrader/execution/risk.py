@@ -263,6 +263,33 @@ class RiskManager:
 
     # -- 综合检查 -----------------------------------------------------------
 
+    def preflight_all(
+        self, state: RiskState, now: float | None = None
+    ) -> list[RiskVerdict]:
+        """与 ``preflight`` 相同检查，但不提前退出：返回全部规则证据。
+
+        供新风险内核（``risk.kernel``）收集逐条 ``RuleEvidence``；
+        原 ``preflight`` 行为保持不变（最严重优先、提前返回）。
+        """
+        import time as _time
+
+        now = now if now is not None else _time.time()
+        verdicts: list[RiskVerdict] = [
+            self.check_daily_loss(state),
+            self.check_unhedged_duration(state, now),
+        ]
+        hedge_warnings = self.check_hedge_integrity(state)
+        if hedge_warnings:
+            verdicts.append(
+                RiskVerdict.deny(
+                    f"存在 {len(hedge_warnings)} 个未完全对冲的持仓，禁止开新仓",
+                    warnings=[w.reason for w in hedge_warnings],
+                )
+            )
+        for position in state.positions.values():
+            verdicts.append(self.check_basis(position))
+        return verdicts
+
     def preflight(self, state: RiskState, now: float | None = None) -> RiskVerdict:
         """下单前的全面自检。
 

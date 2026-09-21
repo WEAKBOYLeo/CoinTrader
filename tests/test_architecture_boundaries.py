@@ -195,6 +195,41 @@ class TestStrategySideHasNoExchangeClient:
         assert violations == [], f"{pkg} 边界违规:\n" + "\n".join(violations)
 
 
+class TestRiskPackageDependencyScope:
+    """risk 包只依赖 config/domain/errors 与 execution 的 rule/gate 模块（T3）。"""
+
+    ALLOWED_COINTRADER = frozenset(
+        {
+            "cointrader.config",
+            "cointrader.domain",
+            "cointrader.errors",
+            "cointrader.execution.rules",
+            "cointrader.execution.risk",
+            "cointrader.execution.risk_gate",
+        }
+    )
+
+    def test_risk_imports_within_scope(self, src_root: Path) -> None:
+        root = src_root / "risk"
+        if not root.is_dir():
+            pytest.skip("risk 包尚未创建")
+        violations: list[str] = []
+        for path in _python_files(root):
+            rel = path.relative_to(src_root.parent)
+            for lineno, module in _imports_in_file(path, src_root):
+                top = module.split(".")[0]
+                if top != "cointrader":
+                    continue
+                if module == "cointrader.risk" or module.startswith("cointrader.risk."):
+                    continue
+                if not any(
+                    module == allowed or module.startswith(allowed + ".")
+                    for allowed in self.ALLOWED_COINTRADER
+                ):
+                    violations.append(f"{rel}:{lineno}: import {module}（超出 risk 包允许范围）")
+        assert violations == [], "risk 依赖范围违规:\n" + "\n".join(violations)
+
+
 class TestWebuiHasNoBrokerOrExecutor:
     """webui/ 不导入 broker/executor（查询层与执行解耦）。"""
 
