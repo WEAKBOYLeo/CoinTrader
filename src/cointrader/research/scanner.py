@@ -38,6 +38,7 @@ import pandas as pd
 from ..config import Config
 from ..data.binance import BinancePublicClient
 from ..data.funding import (
+    FUNDING_HISTORY_RETENTION_DAYS,
     FundingIntervals,
     annualize_rate,
     consecutive_positive_streak,
@@ -283,12 +284,22 @@ class FundingScanner:
         interval_hours = intervals.get(symbol)
 
         start_ms = None
+        # 按最短结算周期（1h）估算满窗记录数 + 2 天余量（含 0 点对齐偏移）；
+        # lookback 未指定时取币安保留期内全量，避免 4h/1h 结算币近期数据
+        # 被默认 limit 截断。
+        lookback_span_days = (
+            lookback_days if lookback_days is not None else FUNDING_HISTORY_RETENTION_DAYS
+        )
+        funding_limit = int(lookback_span_days * 24) + 2 * 24
         if lookback_days is not None:
             import time
 
-            start_ms = int((time.time() - lookback_days * 86_400) * 1000)
+            # 起点对齐本地 0 点：同一天内缓存键稳定（历史数据不可变）
+            now_ms = int(time.time() * 1000)
+            day0_ms = (now_ms - time.timezone * 1000) // 86_400_000 * 86_400_000
+            start_ms = day0_ms - int(lookback_days * 86_400) * 1000
 
-        frame = fetch_funding_history(self.client, symbol, start_ms=start_ms)
+        frame = fetch_funding_history(self.client, symbol, start_ms=start_ms, limit=funding_limit)
         rates = frame["funding_rate"]
 
         if rates.empty:

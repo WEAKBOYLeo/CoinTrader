@@ -413,7 +413,15 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
     rates: dict[str, object] = {}
     intervals: dict[str, int] = {}
     historical_volumes: dict[str, object] = {}
-    start_ms = int((time.time() - config.backtest.history_days * 86_400) * 1000)
+    # 起点对齐本地 0 点：同一天的多次运行缓存键稳定（历史数据不可变，
+    # 秒级 start_ms 会让每次运行都全量重拉 500+ 币 × 365 天数据）。
+    # 尾部始终到拉取时刻（无 end_ms），仅起点最多偏移一天。
+    now_ms = int(time.time() * 1000)
+    day0_ms = (now_ms - time.timezone * 1000) // 86_400_000 * 86_400_000
+    start_ms = day0_ms - int(config.backtest.history_days * 86_400) * 1000
+    # 按最短结算周期（1h）估算满窗记录数 + 2 天余量（含 0 点对齐偏移）；
+    # 不传足量时分页会取满 limit 即停，4h/1h 结算币的近期数据会被静默截断。
+    funding_record_limit = int(config.backtest.history_days * 24) + 2 * 24
 
     with BinancePublicClient(config.api, config.data) as client:
         funding_intervals = fetch_funding_intervals(client)
@@ -430,20 +438,57 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
                 symbols = symbols[:max_symbols]
             print(f"  自动候选池: {len(symbols)} 个当前可交易 USDT 永续（历史成交量动态过滤）")
 
-        for symbol in symbols:
+        fetch_started = time.time()
+        skipped: list[str] = []
+        for idx, symbol in enumerate(symbols, start=1):
             try:
-                frame = fetch_funding_history(client, symbol, start_ms=start_ms)
+                frame = fetch_funding_history(
+                    client, symbol, start_ms=start_ms, limit=funding_record_limit
+                )
                 volume = fetch_historical_quote_volume_3d_avg(
                     client,
                     symbol,
                     start_ms=start_ms - 86_400_000,
                 )
             except Exception as exc:  # noqa: BLE001
-                print(f"  [提示] 跳过 {symbol}：历史资金费或成交量获取失败（{exc}）")
+                print(f"  [提示] 跳过 {symbol}：历史资金费或成交量获取失败（{exc}）", flush=True)
+                skipped.append(symbol)
                 continue
             rates[symbol] = frame["funding_rate"]
             intervals[symbol] = funding_intervals.get(symbol)
             historical_volumes[symbol] = volume
+            if idx % 25 == 0 or idx == len(symbols):
+                elapsed = time.time() - fetch_started
+                print(f"  数据拉取进度: {idx}/{len(symbols)}（{elapsed:.0f}s）", flush=True)
+
+        # 突发请求会触发 WAF 403（单发重试可恢复）：主循环失败币冷却后
+        # 重试一轮，避免候选池被静默缩小、选币结果有偏。
+        if skipped:
+            cooldown = 60.0
+            print(f"  {len(skipped)} 个币拉取失败，{cooldown:.0f}s 冷却后重试一轮...", flush=True)
+            time.sleep(cooldown)
+            still_failed: list[str] = []
+            for symbol in skipped:
+                try:
+                    frame = fetch_funding_history(
+                        client, symbol, start_ms=start_ms, limit=funding_record_limit
+                    )
+                    volume = fetch_historical_quote_volume_3d_avg(
+                        client,
+                        symbol,
+                        start_ms=start_ms - 86_400_000,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  [提示] 重试仍失败，跳过 {symbol}（{exc}）", flush=True)
+                    still_failed.append(symbol)
+                    continue
+                rates[symbol] = frame["funding_rate"]
+                intervals[symbol] = funding_intervals.get(symbol)
+                historical_volumes[symbol] = volume
+            if still_failed:
+                print(
+                    f"  [提示] {len(still_failed)} 个币重试后仍失败，本轮回测未包含它们"
+                )
 
     if not rates:
         print("  [FAIL] 没有可用于组合回测的资金费历史")

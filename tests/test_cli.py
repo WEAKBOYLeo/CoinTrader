@@ -566,3 +566,123 @@ class TestT4CliCrossRestartView:
         payload = _json.loads(output)
         assert payload["positions"] == [], "历史快照不得冒充当前持仓"
         assert payload["positions_state"] == "UNKNOWN"
+
+
+class TestPortfolioVolumeCoverage:
+    """组合回测数据覆盖回归：池内每个币（含 WAF 重试恢复的）都必须有成交量。
+
+    背景：一次重试路径的编辑失误把 ``historical_volumes[symbol] = volume``
+    推出了主循环，导致成交量过滤把几乎整个候选池静默排除——
+    回测从 41 笔交易塌缩到 1 笔且不报任何错。本测试钉死该不变量。
+    """
+
+    def test_all_pool_symbols_get_volume(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        clean_env: None,
+        project_root: Path,
+    ) -> None:
+        import argparse
+
+        import pandas as pd
+
+        import cointrader.backtest.engine as engine_mod
+        import cointrader.cli as cli
+        import cointrader.data.binance as binance_mod
+        import cointrader.data.funding as funding_mod
+        import cointrader.data.klines as klines_mod
+        from cointrader.config import BacktestConfig, StrategyConfig
+        from cointrader.research.costs import CostModel, LiquidityTier
+
+        symbols = ["AAUSDT", "BBUSDT"]
+        funding_calls = {"AAUSDT": 0, "BBUSDT": 0}
+
+        def fake_fetch_funding(client: object, symbol: str, **kwargs: object) -> pd.DataFrame:
+            funding_calls[symbol] += 1
+            if symbol == "BBUSDT" and funding_calls[symbol] == 1:
+                raise RuntimeError("模拟 WAF 403（首次失败，重试恢复）")
+            index = pd.date_range("2025-09-25", periods=40, freq="8h", tz="UTC")
+            return pd.DataFrame(
+                {"funding_rate": [0.0001] * 40, "mark_price": [100.0] * 40},
+                index=index,
+            )
+
+        def fake_volume(client: object, symbol: str, **kwargs: object) -> pd.Series:
+            index = pd.date_range("2025-09-25", periods=80, freq="4h", tz="UTC")
+            return pd.Series(
+                [2_000_000.0] * 80, index=index, name="quote_volume_3d_avg"
+            )
+
+        class _FakeClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def futures_exchange_info(self) -> dict[str, object]:
+                return {}
+
+            def __enter__(self) -> _FakeClient:
+                return self
+
+            def __exit__(self, *exc_info: object) -> None:
+                return None
+
+        captured: dict[str, set[str]] = {}
+        real_run_portfolio = engine_mod.run_portfolio
+
+        def spy_run_portfolio(
+            rates: dict[str, pd.Series],
+            intervals: dict[str, int],
+            backtest: BacktestConfig,
+            strategy: StrategyConfig,
+            cost_model: CostModel,
+            *,
+            tiers: dict[str, LiquidityTier] | None = None,
+            quote_volumes_24h: dict[str, pd.Series] | None = None,
+            basis_adverse_pct: float = 0.0,
+            max_positions: int | None = None,
+        ):
+            captured["rates"] = set(rates)
+            captured["vols"] = set(quote_volumes_24h or {})
+            return real_run_portfolio(
+                rates,
+                intervals,
+                backtest,
+                strategy,
+                cost_model,
+                tiers=tiers,
+                quote_volumes_24h=quote_volumes_24h,
+                basis_adverse_pct=basis_adverse_pct,
+                max_positions=max_positions,
+            )
+
+        monkeypatch.setattr(binance_mod, "BinancePublicClient", _FakeClient)
+        monkeypatch.setattr(funding_mod, "fetch_funding_history", fake_fetch_funding)
+        monkeypatch.setattr(
+            funding_mod,
+            "fetch_funding_intervals",
+            lambda client: funding_mod.FundingIntervals(mapping={s: 8 for s in symbols}),
+        )
+        monkeypatch.setattr(klines_mod, "fetch_historical_quote_volume_3d_avg", fake_volume)
+        monkeypatch.setattr(
+            klines_mod, "tradable_perpetuals", lambda info, exclude_bases=(): list(symbols)
+        )
+        monkeypatch.setattr(engine_mod, "run_portfolio", spy_run_portfolio)
+        monkeypatch.setattr("cointrader.cli.time.sleep", lambda _seconds: None)
+
+        args = argparse.Namespace(
+            config=str(project_root / "config" / "config.yaml"),
+            symbols=[],
+            rolling_window=None,
+            min_volume=None,
+            max_symbols=None,
+            report_dir=None,
+            json=None,
+        )
+        rc = cli.cmd_portfolio(args)
+
+        assert rc == 0, "组合回测应成功"
+        assert captured["rates"] == set(symbols), "两个币都应进入候选池"
+        assert captured["vols"] == captured["rates"], (
+            "池内每个币都必须有成交量数据（含重试恢复的币），"
+            f"缺: {captured['rates'] - captured['vols']}"
+        )

@@ -874,6 +874,60 @@ class TestPagination:
         assert all(v == FUNDING_PAGE_SIZE for v in seen_limits), "单页 limit 必须 ≤ 100（防 WAF 403）"
         client.close()
 
+    def test_funding_history_exceeds_1000_nominal_cap(self, tmp_cache_dir: Path) -> None:
+        """超过单次请求 1000 名义上限时必须跨页取全，不能静默截断。
+
+        回归背景：旧实现把 limit 钳到 FUNDING_MAX_LIMIT(1000)，
+        365 天回测下 4h 结算币丢失约 200 天近期数据（分页从 start
+        向前取、满 1000 即停），直接污染回测结果。
+        """
+        from cointrader.data.binance import FUNDING_MAX_LIMIT, FUNDING_PAGE_SIZE
+
+        total = FUNDING_MAX_LIMIT + 200  # 需要 12 页
+        base_time = 1_700_000_000_000
+        step = 4 * 3_600_000  # 4h 结算
+        seen_limits: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            start = int(params.get("startTime", 0))
+            limit = int(params.get("limit", FUNDING_PAGE_SIZE))
+            seen_limits.append(limit)
+            all_records: list[dict[str, str | int]] = [
+                {
+                    "symbol": "BTCUSDT",
+                    "fundingTime": base_time + i * step,
+                    "fundingRate": "0.00010000",
+                    "markPrice": "70000.0",
+                }
+                for i in range(total)
+            ]
+            window = [r for r in all_records if int(r["fundingTime"]) >= start][:limit]
+            return httpx.Response(200, json=window)
+
+        data_config = DataConfig(cache_dir=tmp_cache_dir)
+        client = BinancePublicClient(
+            ApiConfig(), data_config, client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+        records = client.funding_history("BTCUSDT", limit=total)
+
+        assert len(records) == total, f"应跨页取回全部 {total} 条，实际 {len(records)} 条"
+        times = [r["fundingTime"] for r in records]
+        assert times[-1] == base_time + (total - 1) * step, "近期（尾部）记录不得被截断"
+        assert len(seen_limits) == (total + FUNDING_PAGE_SIZE - 1) // FUNDING_PAGE_SIZE
+        assert all(v == FUNDING_PAGE_SIZE for v in seen_limits), "单页 limit 必须 ≤ 100（防 WAF 403）"
+        client.close()
+
+    def test_funding_history_limit_below_1_rejected(self, tmp_cache_dir: Path) -> None:
+        """limit < 1 必须显式报错，不能静默取回 0 条。"""
+        data_config = DataConfig(cache_dir=tmp_cache_dir)
+        client = BinancePublicClient(
+            ApiConfig(), data_config, client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[])))
+        )
+        with pytest.raises(ValueError):
+            client.funding_history("X", limit=0)
+        client.close()
+
     def test_pagination_terminates_on_no_progress(self, tmp_cache_dir: Path) -> None:
         """服务端忽略 startTime 时必须能终止，不能死循环。
 

@@ -79,10 +79,12 @@ _RETRYABLE_STATUS = frozenset({403, 408, 425, 500, 502, 503, 504})
 #: K 线单次请求最大条数（币安硬限制，滑动窗口分页时必须遵守）
 KLINES_MAX_LIMIT = 1500
 
-#: 资金费历史 API 名义上限 1000，但实测大 limit（>100）会被 WAF 间歇
-#: 403 拦截（2026-09-21 实测 limit=1000/500 → 403，limit=100 → 200）。
-#: 分页固定小页，总量由 limit 参数控制。
+#: 资金费历史 API **单次请求** limit 名义上限 1000，但实测大 limit（>100）
+#: 会被 WAF 间歇 403 拦截（2026-09-21 实测 limit=1000/500 → 403，limit=100 → 200）。
+#: 因此分页固定小页（FUNDING_PAGE_SIZE），**跨页总量不受 1000 限制**，
+#: 由调用方的 limit 参数控制（1 年 4h 结算 ≈ 2190 条、1h 结算 ≈ 8760 条）。
 FUNDING_PAGE_SIZE = 100
+#: 单次请求 limit 的名义上限（仅文档/参考用；分页总量可以超过它）。
 FUNDING_MAX_LIMIT = 1000
 
 
@@ -496,13 +498,18 @@ class BinancePublicClient:
             symbol: 合约符号，如 ``BTCUSDT``。
             start_ms: 起始时间（毫秒，含）。
             end_ms: 结束时间（毫秒，含）。
-            limit: 返回总条数上限。
+            limit: 返回总条数上限。分页跨页取全，**不受单次请求 1000 名义
+                上限约束**（钳制到 1000 会静默丢弃长周期回测的近期数据）。
 
         Returns:
             按时间升序的结算记录列表，每条含 ``fundingTime`` /
             ``fundingRate`` / ``markPrice``。
+
+        Raises:
+            ValueError: limit < 1。
         """
-        limit = min(limit, FUNDING_MAX_LIMIT)
+        if limit < 1:
+            raise ValueError(f"limit 必须 >= 1，当前 {limit}")
 
         def loader() -> list[dict[str, Any]]:
             all_records: list[dict[str, Any]] = []

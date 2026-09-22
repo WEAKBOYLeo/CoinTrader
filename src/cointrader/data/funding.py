@@ -107,6 +107,7 @@ def fetch_funding_history(
     *,
     start_ms: int | None = None,
     end_ms: int | None = None,
+    limit: int = 1000,
 ) -> pd.DataFrame:
     """拉取单个合约的资金费历史并规范化为 DataFrame。
 
@@ -115,6 +116,10 @@ def fetch_funding_history(
         symbol: 合约符号。
         start_ms: 起始时间（毫秒）。
         end_ms: 结束时间（毫秒）。
+        limit: 返回总条数上限（分页跨页取全，可超过单次请求的 1000 名义上限）。
+            默认 1000 仅适用于短窗口；长历史（如 365 天回测）必须按
+            ``history_days * 24 + 余量`` 传入，否则 4h/1h 结算币的近期
+            数据会被静默截断（分页从 start 向前取，满 limit 即停）。
 
     Returns:
         DataFrame，索引为 UTC 时间戳，列为 ``funding_rate`` / ``mark_price``。
@@ -124,7 +129,7 @@ def fetch_funding_history(
         InsufficientDataError: 该合约没有任何资金费记录。
         ParseError: 字段缺失或格式异常。
     """
-    records = client.funding_history(symbol, start_ms=start_ms, end_ms=end_ms)
+    records = client.funding_history(symbol, start_ms=start_ms, end_ms=end_ms, limit=limit)
     if not records:
         raise InsufficientDataError(f"合约 {symbol} 无资金费历史记录")
 
