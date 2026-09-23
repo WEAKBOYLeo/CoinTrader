@@ -31,6 +31,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from ..config import Config
+from ..domain.market import DataQuality
 from ..errors import LiveGateBlocked
 from ..execution.store import StateStore
 from ..strategy.funding_carry import (
@@ -51,10 +52,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CandidateCache",
     "HeldPosition",
+    "KNOWN_QUOTE_SOURCES",
     "LiveContext",
     "LiveStrategy",
     "Quote",
+    "QuoteGateVerdict",
     "StrategyDataProvider",
+    "evaluate_quote_gate",
 ]
 
 
@@ -102,15 +106,161 @@ class CandidateCache:
     error: str = ""
 
 
+#: 已注册的报价来源（有限集）。空串/未注册值 = 未知来源，
+#: 生产开仓路径不得把未知来源的报价判为 FRESH（fail-closed）。
+KNOWN_QUOTE_SOURCES: frozenset[str] = frozenset({"rest", "stream", "fake"})
+
+
 @dataclass(frozen=True, slots=True)
 class Quote:
-    """一次新鲜报价（提交开仓前必须重新获取）。"""
+    """一次新鲜报价（提交开仓前必须重新获取）。
+
+    v5.0 T2（AC-04）provenance 字段（全部带默认值，既有构造调用/fake 不破）：
+
+    - ``symbol``/``source``：报价归属与来源（来源必须来自 ``KNOWN_QUOTE_SOURCES``）；
+    - ``spot_ts_ms``/``perp_ts_ms``：两腿各自的**本地接收时间**（0 = 用 ``ts_ms``）；
+    - ``spot_exchange_ts_ms``/``perp_exchange_ts_ms``：交易所时间戳；REST 报价
+      不提供交易所时间时记 ``None``，**不得**用本地接收时刻冒充；
+    - ``connection_generation``：stream 代次（REST 下为 ``None``）。
+
+    新鲜度不在此判定：由 ``evaluate_quote_gate`` 对注入时钟评估（同一报价
+    随时间变旧，构造时刻不得推导 freshness）。
+    """
 
     spot_price: Decimal
     perp_price: Decimal
     ts_ms: int  # 本地接收时间（UTC ms）
     spot_ts_ms: int = 0  # 现货报价接收时间（0 = 用 ts_ms）
     perp_ts_ms: int = 0  # 永续报价接收时间（0 = 用 ts_ms）
+    symbol: str = ""  # 报价所属交易对（空 = 未知，无法验证与 intent 一致）
+    source: str = ""  # 报价来源（必须 ∈ KNOWN_QUOTE_SOURCES，否则 fail-closed）
+    spot_exchange_ts_ms: int | None = None  # 交易所时间戳（None = 来源不提供）
+    perp_exchange_ts_ms: int | None = None
+    connection_generation: str | int | None = None  # stream 代次（REST 下 None）
+
+    @property
+    def spot_received_ms(self) -> int:
+        """现货腿本地接收时间（``spot_ts_ms`` 为 0 时回退 ``ts_ms``）。"""
+        return self.spot_ts_ms or self.ts_ms
+
+    @property
+    def perp_received_ms(self) -> int:
+        """永续腿本地接收时间（``perp_ts_ms`` 为 0 时回退 ``ts_ms``）。"""
+        return self.perp_ts_ms or self.ts_ms
+
+    @property
+    def received_at_ms(self) -> int:
+        """报价整体接收时间（``ts_ms``，本地接收时刻，非交易所时刻）。"""
+        return self.ts_ms
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteGateVerdict:
+    """双腿报价 gate 的判定结果（纯函数输出；fail-closed）。
+
+    只有 ``quality is FRESH`` 才允许 OPEN/增加风险；CLOSE/reduce-only 由调用方
+    记录本结果但不据此阻塞。
+    """
+
+    quality: DataQuality
+    reason: str  # 人类可读的拒绝/通过原因（含来源与时间证据）
+    spot_age_ms: int
+    perp_age_ms: int
+    max_leg_age_ms: int
+    skew_ms: int  # 两腿本地接收时间偏差（绝对值）
+
+
+def evaluate_quote_gate(
+    quote: Quote,
+    *,
+    intent_symbol: str,
+    now_ms: int,
+    max_age_ms: int,
+    max_skew_ms: int,
+) -> QuoteGateVerdict:
+    """新增风险双腿报价 gate（纯函数，注入时钟便于确定性测试）。
+
+    校验顺序（fail-closed，首个不通过即定级）：
+
+    1. 两腿价格必须 > 0（否则 INVALID）；
+    2. 来源必须 ∈ ``KNOWN_QUOTE_SOURCES``（缺失/未知 → INCOMPLETE，不得 FRESH）；
+    3. 接收时间必须存在（``ts_ms <= 0`` → INVALID）；
+    4. symbol 与 intent 一致（不一致 → INVALID；缺失无法验证 → INCOMPLETE）；
+    5. 无未来时间戳：交易所时间/本地接收时间晚于 ``now_ms`` → INVALID；
+    6. 每腿年龄 ``0 <= age <= max_age_ms``（超限 → STALE）；
+    7. 两腿 skew ``<= max_skew_ms``（超限 → STALE）。
+
+    边界含端点：``age == max_age_ms`` 仍 FRESH，``age == max_age_ms + 1`` 拒绝
+    （与既有 portfolio/pair_executor 的 ``age > max`` 拒绝口径一致）。
+    REST 来源不提供交易所时间戳（``None``）是合法口径：新鲜度以本地接收
+    年龄判定，不以构造时刻推导。
+    """
+    spot_age_ms = now_ms - quote.spot_received_ms
+    perp_age_ms = now_ms - quote.perp_received_ms
+    max_leg_age_ms = max(spot_age_ms, perp_age_ms)
+    skew_ms = abs(quote.spot_received_ms - quote.perp_received_ms)
+    ages = f"spot age={spot_age_ms}ms, perp age={perp_age_ms}ms"
+
+    if quote.spot_price <= 0 or quote.perp_price <= 0:
+        return QuoteGateVerdict(
+            DataQuality.INVALID,
+            f"报价非正（spot={quote.spot_price}, perp={quote.perp_price}）",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if quote.source not in KNOWN_QUOTE_SOURCES:
+        return QuoteGateVerdict(
+            DataQuality.INCOMPLETE,
+            f"报价来源缺失/未知（source={quote.source!r}），不得视为 FRESH",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if quote.ts_ms <= 0:
+        return QuoteGateVerdict(
+            DataQuality.INVALID,
+            "报价缺少接收时间（ts_ms <= 0）",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if intent_symbol and quote.symbol and quote.symbol != intent_symbol:
+        return QuoteGateVerdict(
+            DataQuality.INVALID,
+            f"报价 symbol {quote.symbol} 与 intent {intent_symbol} 不一致",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if not intent_symbol or not quote.symbol:
+        return QuoteGateVerdict(
+            DataQuality.INCOMPLETE,
+            f"报价/意图 symbol 缺失（quote={quote.symbol!r}, intent={intent_symbol!r}），"
+            "无法验证一致",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if (quote.spot_exchange_ts_ms or 0) > now_ms or (quote.perp_exchange_ts_ms or 0) > now_ms:
+        return QuoteGateVerdict(
+            DataQuality.INVALID,
+            "交易所时间戳晚于当前（未来/不可信时间戳）",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if spot_age_ms < 0 or perp_age_ms < 0:
+        return QuoteGateVerdict(
+            DataQuality.INVALID,
+            f"未来时间戳（{ages}，负年龄 = 报价时间晚于当前）",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if max_leg_age_ms > max_age_ms:
+        return QuoteGateVerdict(
+            DataQuality.STALE,
+            f"报价过期（{ages} > 上限 {max_age_ms}ms）",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    if skew_ms > max_skew_ms:
+        return QuoteGateVerdict(
+            DataQuality.STALE,
+            f"两腿报价接收时间偏差 {skew_ms}ms > {max_skew_ms}ms（两市场不同步）",
+            spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+        )
+    return QuoteGateVerdict(
+        DataQuality.FRESH,
+        f"来源/符号/新鲜度/同步性校验通过（source={quote.source}, {ages}, skew={skew_ms}ms）",
+        spot_age_ms, perp_age_ms, max_leg_age_ms, skew_ms,
+    )
 
 
 @dataclass(frozen=True, slots=True)

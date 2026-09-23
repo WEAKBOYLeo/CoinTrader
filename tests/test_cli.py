@@ -686,3 +686,81 @@ class TestPortfolioVolumeCoverage:
             "池内每个币都必须有成交量数据（含重试恢复的币），"
             f"缺: {captured['rates'] - captured['vols']}"
         )
+
+
+class TestV5T3ServiceDiagnostics:
+    """v5.0 T3（AC-06/07）：live status 展示服务诊断块。
+
+    CLI 是只读账本查询，不触 live run 进程内存（coordinator/cache 统计），
+    因此诊断统一 UNKNOWN/null，不得渲染为 0/healthy；既有字段与退出码不变。
+    """
+
+    def test_status_text_shows_diagnostics_unknown(self, clean_env, tmp_path: Path) -> None:
+        from cointrader.cli import cmd_live_status
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        StateStore(db).close()
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(cmd_live_status, config=config_path, json=False)
+        assert code == 0, output
+        assert "服务诊断" in output
+        assert "UNKNOWN" in output
+        assert "external_usage_uncertain=UNKNOWN" in output
+        # 既有字段/块全部保留（不得删改）
+        for legacy in ("服务状态", "run_id", "模式", "允许开仓", "心跳年龄", "运行连续性"):
+            assert legacy in output, f"既有输出字段缺失: {legacy}"
+
+    def test_status_json_includes_diagnostics_block(self, clean_env, tmp_path: Path) -> None:
+        import json as _json
+
+        from cointrader.cli import cmd_live_status
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        StateStore(db).close()
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(cmd_live_status, config=config_path, json=True)
+        assert code == 0
+        payload = _json.loads(output)
+        diag = payload["service_diagnostics"]
+        assert diag["available"] is False
+        assert diag["quality"] == "UNKNOWN"
+        assert diag["observed_used"] is None
+        assert diag["header_age_ms"] is None
+        assert diag["external_usage_uncertain"] is None  # 未知，不是 False
+        assert "ledger only" in diag["source"]
+        # 既有 JSON 键保留
+        for legacy in ("service_state", "mode", "can_open", "heartbeat_age_ms",
+                       "schema_version", "now_ms"):
+            assert legacy in payload, f"既有 JSON 键缺失: {legacy}"
+
+    def test_diagnostics_render_shows_values_when_available(self, clean_env, capsys) -> None:
+        """渲染助手：有诊断时 observed/estimated/header_age/不确定性全部可见。"""
+        from cointrader.cli import _print_service_diagnostics
+
+        diag = {
+            "available": True,
+            "quality": "OK",
+            "source": "ledger+memory（诊断）",
+            "as_of_ms": 1_800_000_000_000,
+            "rate_scope": "futures",
+            "observed_used": 1200,
+            "local_used_estimate": 30,
+            "header_age_ms": 5000,
+            "external_usage_uncertain": True,
+        }
+        _print_service_diagnostics(diag)
+        out = capsys.readouterr().out
+        assert "quality=OK" in out
+        assert "as_of=1800000000000" in out
+        assert "scope=futures" in out
+        assert "observed(server)=1200" in out
+        assert "estimated(local)=30" in out
+        assert "header_age=5000 ms" in out
+        assert "external_usage_uncertain=True" in out
+        assert "不可精准归因" in out

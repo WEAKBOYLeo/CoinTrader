@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from cointrader.rate_limit import (
     RequestPriority,
     endpoint_weight,
     klines_weight,
+    rate_limit_diagnostics_to_dict,
 )
 from cointrader.secrets import SecretStr
 
@@ -313,6 +315,107 @@ class TestEndpointWeights:
         # 再次调用不再重复告警
         weight2 = endpoint_weight(FUT, "/fapi/v1/mystery", on_unknown=co.note_unknown_endpoint)
         assert weight2 == DEFAULT_ENDPOINT_WEIGHT
+
+
+class TestDiagnosticsSerialization:
+    """v5.0 T3（AC-05/06）：快照序列化 = 服务端观测 vs 本地估算分离 +
+    header 年龄 + 同出口 IP 不确定性；不改变任何调度语义。"""
+
+    def test_header_age_computed_from_injected_clock(self) -> None:
+        fake = FakeClock()  # value = 1000.0
+        co = make_coordinator(fake)
+        co.observe(FUT, 1200, 200)  # 观测时刻 = 1000.0
+        snap = co.snapshot()[FUT]
+        assert snap.observed_at == pytest.approx(1000.0)
+        d = rate_limit_diagnostics_to_dict(snap, now_mono=1000.0)
+        assert d["header_age_ms"] == 0
+        fake.value = 1005.0
+        d5 = rate_limit_diagnostics_to_dict(snap, now_mono=fake.value)
+        assert d5["header_age_ms"] == 5000
+        # 超过 65s 新鲜窗 → STALE（观测仍展示，不丢弃）
+        d_stale = rate_limit_diagnostics_to_dict(snap, now_mono=1100.0)
+        assert d_stale["quality"] == "STALE"
+        assert d_stale["header_age_ms"] == 100_000
+
+    def test_missing_header_is_unknown_not_zero(self) -> None:
+        """无 header 观测：quality=UNKNOWN、observed=None（不得渲染为 0）；
+        local_used 只能标注 estimate，不得冒充服务端事实。"""
+        fake = FakeClock()
+        co = make_coordinator(fake)
+        with co.acquire(FUT, RequestPriority.P3_CANDIDATE, 42):
+            pass  # 本地记账 42，无服务端观测
+        snap = co.snapshot()[FUT]
+        assert snap.observed_at is None
+        d = rate_limit_diagnostics_to_dict(snap, now_mono=fake.value)
+        assert d["observed_used"] is None
+        assert d["header_age_ms"] is None
+        assert d["quality"] == "UNKNOWN"
+        assert d["observed_usage_kind"] == "estimate"
+        assert d["local_used"] == 42
+        # 42 后窗口内：in_flight 已释放
+        assert d["in_flight"] == 0
+
+    def test_invalid_header_keeps_unknown_and_counts_diagnostic(self) -> None:
+        """非法（负值）header：忽略观测并计 diagnostic_errors，诊断仍 UNKNOWN。"""
+        fake = FakeClock()
+        co = make_coordinator(fake)
+        co.observe(FUT, -5, 200)
+        d = rate_limit_diagnostics_to_dict(co.snapshot()[FUT], now_mono=fake.value)
+        assert d["diagnostic_errors"] == 1
+        assert d["quality"] == "UNKNOWN"
+        assert d["observed_used"] is None
+
+    def test_429_418_counters_preserved_in_serialization(self) -> None:
+        """429/418 计数与冻结/封禁状态在序列化中保留（行为回归：语义未变）。"""
+        fake = FakeClock()
+        co = make_coordinator(fake)
+        co.observe(FUT, 100, 429)
+        d = rate_limit_diagnostics_to_dict(co.snapshot()[FUT], now_mono=fake.value)
+        assert d["freezes"] == 1
+        assert d["frozen"] is True
+        assert d["seconds_to_unfreeze"] == 120
+        # 冻结期 acquire 仍被拒（调度语义未变）
+        with pytest.raises(RateLimitBusyError), co.acquire(
+            FUT, RequestPriority.P0_CRITICAL, 1, timeout=1.0
+        ):
+            pass
+        co.observe(FUT, 100, 418)
+        d2 = rate_limit_diagnostics_to_dict(co.snapshot()[FUT], now_mono=fake.value)
+        assert d2["bans"] == 1
+        assert d2["banned"] is True
+        with pytest.raises(RateLimitBannedError), co.acquire(
+            FUT, RequestPriority.P0_CRITICAL, 1
+        ):
+            pass
+
+    def test_external_uncertainty_and_no_sensitive_fields(self) -> None:
+        """external_usage_uncertain 恒 True（同 IP 其他进程不可归因）；
+        序列化不含 URL/签名/密钥/请求参数。"""
+        fake = FakeClock()
+        co = make_coordinator(fake)
+        co.observe(FUT, 1200, 200)
+        d = rate_limit_diagnostics_to_dict(co.snapshot()[FUT], now_mono=fake.value)
+        assert d["external_usage_uncertain"] is True
+        assert "其他进程" in d["external_usage_note"]
+        assert d["scope"] == "futures"
+        text = json.dumps(d)
+        for forbidden in ("http", "signature", "apiKey", "listenKey", "api_key"):
+            assert forbidden not in text
+        # 原有消费者字段全部保留（向后兼容）
+        for key in ("limit", "soft_limit", "observed_used", "in_flight",
+                    "local_used", "frozen", "banned", "seconds_to_unfreeze",
+                    "freezes", "bans"):
+            assert key in d
+
+    def test_freeze_expiry_reflects_in_serialization(self) -> None:
+        """冻结到期后 frozen=False、seconds_to_unfreeze=None（不是 0 冒充）。"""
+        fake = FakeClock()
+        co = make_coordinator(fake)
+        co.observe(FUT, 100, 429)
+        fake.value = 1000.0 + 120.0 + 1.0
+        d = rate_limit_diagnostics_to_dict(co.snapshot()[FUT], now_mono=fake.value)
+        assert d["frozen"] is False
+        assert d["seconds_to_unfreeze"] is None
 
 
 # ---------------------------------------------------------------------------

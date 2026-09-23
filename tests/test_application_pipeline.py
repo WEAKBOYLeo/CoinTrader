@@ -79,6 +79,7 @@ class _FakeLedger:
     def __init__(self) -> None:
         self.proposals: list[dict[str, object]] = []
         self.intents: list[dict[str, object]] = []
+        self.plans: list[dict[str, object]] = []
         self.fail = False
 
     def _check(self) -> None:
@@ -107,6 +108,7 @@ class _FakeLedger:
 
     def append_execution_plan(self, plan: Mapping[str, object]) -> bool:  # pragma: no cover
         self._check()
+        self.plans.append(dict(plan))
         return True
 
     def has_portfolio_intent_fingerprint(self, fingerprint: str) -> bool:
@@ -354,3 +356,37 @@ class TestViewFromLedgerPositions:
         view = PortfolioPlanner.view_from_ledger_positions([], as_of_ms=NOW)
         assert view.entries == ()
         assert view.snapshot_id == "proj-0"
+
+
+class TestExecutionPlanQuoteProvenance:
+    """v5.0 T2（AC-04）：quote provenance 与 plan 的关联走既有 ledger JSON
+    payload 字段（自由 key，无 schema migration），可序列化且往返不丢失。"""
+
+    def test_plan_payload_carries_quote_block_through_ledger(self) -> None:
+        import json as _json
+
+        ledger = _FakeLedger()
+        plan_payload: dict[str, object] = {
+            "plan_id": "plan-it-1",
+            "run_id": "run-1",
+            "quote": {
+                "symbol": "BTCUSDT",
+                "source": "rest",
+                "received_at_ms": NOW - 10,
+                "spot_received_ms": NOW - 10,
+                "perp_received_ms": NOW - 5,
+                "spot_exchange_ts_ms": None,
+                "perp_exchange_ts_ms": None,
+                "connection_generation": None,
+                "gate_now_ms": NOW,
+                "gate_quality": "FRESH",
+                "gate_reason": "ok",
+            },
+        }
+        assert ledger.append_execution_plan(plan_payload) is True
+        assert len(ledger.plans) == 1
+        # JSON 往返（账本 payload_json 同构）不丢失 quote 块与 None 语义
+        roundtripped = _json.loads(_json.dumps(ledger.plans[0], default=str))
+        assert roundtripped["quote"]["source"] == "rest"
+        assert roundtripped["quote"]["gate_quality"] == "FRESH"
+        assert roundtripped["quote"]["spot_exchange_ts_ms"] is None

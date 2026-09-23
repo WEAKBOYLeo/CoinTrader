@@ -1012,4 +1012,101 @@ class TestPagination:
         client.close()
 
 
+class TestHistoricalCacheStats:
+    """T1（AC-01）：历史覆盖缓存与短 TTL 实时缓存的统计分离 + 兼容。
+
+    完整的行为矩阵（缺口复用/闭合边界/损坏恢复/并发单飞）见
+    ``tests/test_cache_coverage.py``；这里只锁住公开客户端层面的兼容契约。
+    """
+
+    BASE = 1_700_006_400_000  # 8h 对齐
+    STEP = 28_800_000  # 8h（毫秒）
+
+    def _candles(self, count: int) -> list[list[Any]]:
+        base, step = self.BASE, self.STEP
+        return [
+            [
+                base + i * step, "100.5", "110.5", "90.5", "105.5", "1000.5",
+                base + i * step + step - 1, "100000.5", 10, "500.5", "50000.5", "0",
+            ]
+            for i in range(count)
+        ]
+
+    def _handler(self, candles: list[list[Any]], now_ms: int) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/fapi/v1/time":
+                return httpx.Response(200, json={"serverTime": now_ms})
+            if request.url.path == "/fapi/v1/klines":
+                params = dict(request.url.params)
+                start = int(params.get("startTime", 0))
+                end = int(params.get("endTime", 10**16))
+                limit = int(params.get("limit", 1500))
+                window = [c for c in candles if start <= c[0] <= end][:limit]
+                return httpx.Response(200, json=window)
+            return httpx.Response(404, json={"code": -1, "msg": "unknown path"})
+
+        return handler
+
+    def test_stats_as_dict_keeps_old_and_adds_historical_keys(self, tmp_cache_dir: Path) -> None:
+        """as_dict 向后兼容：旧键保留，新增历史/IO 计数器初始为 0。"""
+        data_config = DataConfig(
+            cache_dir=tmp_cache_dir,
+            rate_limit=RateLimitConfig(
+                base_backoff_seconds=0.001, max_backoff_seconds=0.01, max_retries=2
+            ),
+        )
+        client = make_client(lambda r: httpx.Response(200, json={}), data_config=data_config)
+        d = client.stats.as_dict()
+        for old_key in ("requests", "cache_hits", "retries", "throttled_seconds", "errors"):
+            assert old_key in d, f"旧统计键 {old_key} 不得丢失"
+        assert d["historical_cache_hits"] == 0
+        assert d["cache_write_failures"] == 0
+        assert d["cache_read_failures"] == 0
+        client.close()
+
+    def test_historical_hit_is_zero_request_and_separate_counter(self, tmp_cache_dir: Path) -> None:
+        """重复相同历史范围：零新网络请求；命中计 historical_cache_hits，
+        不污染短 TTL 的 cache_hits（AC-01 可区分性）。"""
+        candles = self._candles(6)
+        now = self.BASE + 10 * self.STEP
+        data_config = DataConfig(
+            cache_dir=tmp_cache_dir,
+            rate_limit=RateLimitConfig(
+                base_backoff_seconds=0.001, max_backoff_seconds=0.01, max_retries=2
+            ),
+        )
+        client = make_client(self._handler(candles, now), data_config=data_config)
+        start, end = self.BASE, self.BASE + 4 * self.STEP
+        first = client.futures_klines("BTCUSDT", "8h", start_ms=start, end_ms=end)
+        assert len(first) == 4
+        before = client.stats.as_dict()
+        second = client.futures_klines("BTCUSDT", "8h", start_ms=start, end_ms=end)
+        assert second == first
+        after = client.stats.as_dict()
+        assert after["requests"] == before["requests"], "命中后不得再发网络请求"
+        assert after["historical_cache_hits"] == before["historical_cache_hits"] + 1
+        assert after["cache_hits"] == before["cache_hits"], "短 TTL 计数器不受历史命中影响"
+        client.close()
+
+    def test_single_bound_still_uses_short_ttl_cache(self, tmp_cache_dir: Path) -> None:
+        """单边界调用仍走原短 TTL 缓存路径（legacy 行为不变）。"""
+        candles = self._candles(6)
+        now = self.BASE + 10 * self.STEP
+        data_config = DataConfig(
+            cache_dir=tmp_cache_dir,
+            rate_limit=RateLimitConfig(
+                base_backoff_seconds=0.001, max_backoff_seconds=0.01, max_retries=2
+            ),
+        )
+        client = make_client(self._handler(candles, now), data_config=data_config)
+        first = client.futures_klines("BTCUSDT", "8h", end_ms=self.BASE + 4 * self.STEP)
+        before = client.stats.as_dict()
+        second = client.futures_klines("BTCUSDT", "8h", end_ms=self.BASE + 4 * self.STEP)
+        assert second == first
+        after = client.stats.as_dict()
+        assert after["cache_hits"] == before["cache_hits"] + 1
+        assert after["historical_cache_hits"] == before["historical_cache_hits"] == 0
+        client.close()
+
+
 __all__: list[str] = []

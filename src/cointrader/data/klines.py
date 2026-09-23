@@ -22,6 +22,7 @@ import pandas as pd
 
 from ..errors import DataUnavailableError, ParseError
 from .binance import BinancePublicClient
+from .coverage import INTERVAL_MS  # re-export：保持既有 import 路径
 
 logger = logging.getLogger(__name__)
 
@@ -58,20 +59,8 @@ _NUMERIC_INDEX: dict[str, int] = {
     "taker_buy_quote": 10,
 }
 
-#: 常被使用的 K 线周期 → 毫秒数。回测对齐资金费结算时间时要用。
-INTERVAL_MS: dict[str, int] = {
-    "1m": 60_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "30m": 1_800_000,
-    "1h": 3_600_000,
-    "2h": 7_200_000,
-    "4h": 14_400_000,
-    "6h": 21_600_000,
-    "8h": 28_800_000,
-    "12h": 43_200_000,
-    "1d": 86_400_000,
-}
+#: 常被使用的 K 线周期 → 毫秒数（定义已迁入 ``data/coverage.py``，上方 re-export；
+#: 闭合判定/区间覆盖与 K 线周期强耦合，与覆盖元数据同处一模块）。
 
 
 def klines_to_frame(raw: list[list[Any]], symbol: str) -> pd.DataFrame:
@@ -143,7 +132,13 @@ def fetch_futures_klines(
     start_ms: int | None = None,
     end_ms: int | None = None,
 ) -> pd.DataFrame:
-    """拉取永续 K 线并规范化。"""
+    """拉取永续 K 线并规范化。
+
+    ``start_ms`` 与 ``end_ms`` 均给定时，客户端走历史区间仓库
+    （``data/coverage.py``）：仅返回**已闭合** candle（open time 半开区间
+    ``[start_ms, end_ms)``，未闭合 K 线不进入可复用历史），且已覆盖区间
+    零重复请求。DataFrame 公开 schema 不变。
+    """
     raw = client.futures_klines(symbol, interval, start_ms=start_ms, end_ms=end_ms)
     return klines_to_frame(raw, symbol)
 

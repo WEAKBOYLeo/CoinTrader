@@ -68,6 +68,12 @@ def test_build_payload_with_empty_store(webui_config, tmp_path: Path):
     # T4：payload 含数据状态区键（服务未运行时为 None，不是 0）
     assert payload["market_data"] is None
     assert payload["rate_limits"] is None
+    # v5.0 T3：诊断信封/cache 健康同样为 None（UNKNOWN），不是 0/RUNNING
+    assert payload["market_data_envelope"] is None
+    assert payload["rate_limits_envelope"] is None
+    assert payload["freshness_envelope"] is None
+    assert payload["cache_stats"] is None
+    assert payload["cache_stats_envelope"] is None
     assert "positions_state" in payload["freshness"]
 
 
@@ -188,6 +194,42 @@ def test_live_webui_port_in_use(webui_config, tmp_path: Path):
         blocker.close()
 
 
+def test_payload_contains_no_credential_material(webui_config):
+    """v5.0 T3（AC-06）：payload 不得含 URL/签名/密钥/listen key/请求参数。"""
+    svc = {
+        "state": "RUNNING",
+        "rate_limits": {
+            "futures": {
+                "limit": 2400, "observed_used": 1200, "local_used": 30,
+                "header_age_ms": 5000, "external_usage_uncertain": True,
+                "external_usage_note": "同出口 IP 其他进程不可归因",
+                "frozen": False, "banned": False, "freezes": 1, "bans": 0,
+                "quality": "OK",
+            }
+        },
+        "rate_limits_envelope": {"source": "coordinator（诊断）",
+                                 "as_of_ms": 1, "quality": "OK"},
+        "cache_stats": {"cache_hits": 2, "cache_write_failures": 0,
+                        "cache_enabled": True},
+        "cache_stats_envelope": {"source": "client.stats（诊断）",
+                                 "as_of_ms": 1, "quality": "OK"},
+    }
+    store = StateStore(webui_config.execution.state_db)
+    store.close()
+    payload = build_payload(webui_config, state_provider=lambda: svc)
+    text = json.dumps(payload, ensure_ascii=False, default=str)
+    for forbidden in (
+        "api_key", "apiKey", "api_secret", "listenKey", "listen_key",
+        "signature", "https://", "X-MBX-APIKEY", "accessKey",
+    ):
+        assert forbidden not in text, f"payload 泄漏敏感字段: {forbidden}"
+    # observed vs estimated 分离可见；write failure 计数不伪装成功
+    assert payload["rate_limits"]["futures"]["external_usage_uncertain"] is True
+    assert payload["cache_stats"]["cache_write_failures"] == 0
+
+
+
+
 class TestT4CurrentProjectionAndStatus:
     """T4/AC-12：Web 从 current projection 展示真实状态，UNKNOWN/STALE 明确。"""
 
@@ -253,8 +295,20 @@ class TestT4CurrentProjectionAndStatus:
             "market_data": {"epoch_id": "e-1", "status": "READY", "can_rank": True,
                             "expected": 3, "completed": 3, "failed_count": 0,
                             "age_ms": 1000, "decision_cutoff_ms": 123},
+            "market_data_envelope": {"source": "test-sync（诊断）", "as_of_ms": 1234,
+                                     "quality": "OK"},
             "rate_limits": {"spot": {"limit": 6000, "in_flight": 1,
-                                     "local_used": 100, "frozen": False, "bans": 0}},
+                                     "local_used": 100, "frozen": False, "bans": 0,
+                                     "observed_used": 100, "header_age_ms": 500,
+                                     "external_usage_uncertain": True, "quality": "OK"}},
+            "rate_limits_envelope": {"source": "test-coordinator（诊断）",
+                                     "as_of_ms": 1234, "quality": "OK"},
+            "freshness_envelope": {"source": "test-svc（诊断）", "as_of_ms": 1234,
+                                   "quality": "OK"},
+            "cache_stats": {"requests": 3, "cache_hits": 1, "cache_enabled": True,
+                            "cache_write_failures": 0, "cache_read_failures": 0},
+            "cache_stats_envelope": {"source": "test-cache（诊断）", "as_of_ms": 1234,
+                                     "quality": "OK"},
             "freshness": {"account_age_ms": 100, "reconcile_age_ms": 200,
                           "heartbeat_age_ms": 5, "ledger_sync_ok": True,
                           "positions_state": "OK"},
@@ -263,6 +317,45 @@ class TestT4CurrentProjectionAndStatus:
         assert payload["market_data"]["status"] == "READY"
         assert payload["rate_limits"]["spot"]["in_flight"] == 1
         assert payload["freshness"]["ledger_sync_ok"] is True
+        # v5.0 T3：诊断信封透传（source/as_of/quality + cache 健康）
+        assert payload["market_data_envelope"]["quality"] == "OK"
+        assert payload["market_data_envelope"]["as_of_ms"] > 0
+        assert payload["rate_limits_envelope"]["source"]
+        assert payload["cache_stats"]["cache_write_failures"] == 0
+        assert payload["cache_stats_envelope"]["quality"] == "OK"
+        # 同出口 IP 不确定性必须随 payload 可见（不伪装精准分摊）
+        assert payload["rate_limits"]["spot"]["external_usage_uncertain"] is True
+        json.dumps(payload)  # 全 JSON 可序列化
+
+    def test_stale_quote_health_still_returns_ledger_positions(self, webui_config):
+        """v5.0 T4 交叉故障：报价/行情诊断信封 STALE，但 /api/state 照常返回
+        账本 authoritative 持仓；诊断与账本事实分块，互不阻塞。"""
+        import time as _time
+
+        store = StateStore(webui_config.execution.state_db)
+        now = int(_time.time() * 1000)
+        self._group(store, "snap-t4", now - 1000,
+                    [{"symbol": "BTCUSDT", "spot_qty": "0.01", "perp_qty": "-0.01"}])
+        store.close()
+
+        svc = {
+            "state": "RUNNING",
+            "market_data": {"epoch_id": "e-1", "status": "READY", "age_ms": 999_999},
+            "market_data_envelope": {"source": "test-sync（诊断）", "as_of_ms": now - 60_000,
+                                     "quality": "STALE"},
+            "freshness_envelope": {"source": "test-svc（诊断）", "as_of_ms": now,
+                                   "quality": "STALE"},
+            "rate_limits_envelope": {"source": "test-coordinator（诊断）",
+                                     "as_of_ms": now, "quality": "OK"},
+        }
+        payload = build_payload(webui_config, state_provider=lambda: svc)
+        # 账本 authoritative 持仓不受诊断 stale 影响
+        assert payload["store_available"] is True
+        assert [p["symbol"] for p in payload["positions"]] == ["BTCUSDT"]
+        assert payload["positions_state"] == "OK"
+        # 诊断信封独立可见 STALE（不被吞掉、不渲染为 0/RUNNING）
+        assert payload["market_data_envelope"]["quality"] == "STALE"
+        assert payload["freshness_envelope"]["quality"] == "STALE"
         json.dumps(payload)  # 全 JSON 可序列化
 
     def test_pnl_block_all_runs_default(self, webui_config):

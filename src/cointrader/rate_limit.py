@@ -95,6 +95,10 @@ class RateLimitSnapshot:
     freezes: int
     bans: int
     diagnostic_errors: int
+    # v5.0 T3：最近一次服务端 header 观测时刻（注入时钟单调秒）；
+    # observed_used 为 None 时恒为 None。仅诊断展示用，不参与调度。
+    observed_at: float | None = None
+
 
 
 @dataclass
@@ -375,6 +379,7 @@ class RateLimitCoordinator:
                     freezes=st.freezes,
                     bans=st.bans,
                     diagnostic_errors=st.diagnostic_errors,
+                    observed_at=st.observed_at if st.observed_used is not None else None,
                 )
         return result
 
@@ -482,6 +487,65 @@ def endpoint_weight(
     return weight
 
 
+def rate_limit_diagnostics_to_dict(
+    snap: RateLimitSnapshot,
+    *,
+    now_mono: float,
+    header_fresh_ms: int = 65_000,
+) -> dict[str, Any]:
+    """把一个 scope 快照序列化为 JSON 安全的诊断 dict（v5.0 T3）。
+
+    只读展示层：不触碰 acquire/wait/cap/freeze 语义。口径：
+
+    - ``observed_used`` = 服务端响应头观测（含同出口 IP 其他进程流量）；
+      ``local_used`` = 本进程本地估算 —— 两者分开展示，禁止混用。
+    - ``external_usage_uncertain`` 恒为 True：进程内无法把同出口 IP
+      其他进程的流量精准归因，实际余量不确定。
+    - ``quality``: 观测新鲜（header 年龄 ≤ ``header_fresh_ms``）= OK；
+      观测过旧 = STALE；从未观测 = UNKNOWN（展示层必须用本地估算
+      标注 estimate，不得冒充服务端事实）。
+
+    不含 URL、签名、API key、listen key 或请求参数。
+    """
+    observed = int(snap.observed_used) if snap.observed_used is not None else None
+    if observed is None or snap.observed_at is None:
+        header_age_ms: int | None = None
+        quality = "UNKNOWN"
+    else:
+        header_age_ms = max(0, int(round((now_mono - snap.observed_at) * 1000)))
+        quality = "OK" if header_age_ms <= header_fresh_ms else "STALE"
+    return {
+        "scope": snap.scope.value,
+        "limit": int(snap.limit),
+        "soft_limit": float(snap.soft_limit),
+        "low_limit": float(snap.low_limit),
+        "observed_used": observed,
+        "observed_usage_kind": "server_header" if observed is not None else "estimate",
+        "local_used": int(snap.local_used),
+        "in_flight": int(snap.in_flight),
+        "header_age_ms": header_age_ms,
+        "external_usage_uncertain": True,
+        "external_usage_note": (
+            "observed_used 含同出口 IP 其他进程流量，本进程无法精准归因；"
+            "实际剩余配额不确定，local_used 仅是本地估算"
+        ),
+        "frozen": bool(snap.frozen_until is not None and now_mono < snap.frozen_until),
+        "banned": bool(snap.ban_until is not None and now_mono < snap.ban_until),
+        "seconds_to_unfreeze": (
+            int(max(0, snap.frozen_until - now_mono))
+            if snap.frozen_until is not None and now_mono < snap.frozen_until
+            else None
+        ),
+        "waiting_by_priority": [
+            {"priority": p.name, "count": int(c)} for p, c in snap.waiting_by_priority
+        ],
+        "freezes": int(snap.freezes),
+        "bans": int(snap.bans),
+        "diagnostic_errors": int(snap.diagnostic_errors),
+        "quality": quality,
+    }
+
+
 __all__ = [
     "DEFAULT_ENDPOINT_WEIGHT",
     "RateLimitBannedError",
@@ -492,4 +556,5 @@ __all__ = [
     "RequestPriority",
     "endpoint_weight",
     "klines_weight",
+    "rate_limit_diagnostics_to_dict",
 ]

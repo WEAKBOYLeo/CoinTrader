@@ -382,3 +382,152 @@ class TestT4WebSnapshot:
         assert snap["market_data"]["status"] == "READY"
         assert snap["market_data"]["can_rank"] is True
         assert snap["market_data"]["expected"] == 3
+
+
+class TestV5T3DiagnosticEnvelopes:
+    """v5.0 T3（AC-06/07）：web_snapshot 对 rate limits / market readiness /
+    cache 健康统一带 {source, as_of_ms, quality} 信封；诊断不可用 → None
+    （UNKNOWN），不渲染为 0/healthy；as_of 是墙钟 UTC ms。"""
+
+    def _stub_client(self, tmp_path: Path):
+        from cointrader.data.binance import ClientStats
+        from cointrader.rate_limit import RateLimitCoordinator, RateLimitScope
+
+        class _Clock:
+            value = 1000.0
+
+            def __call__(self) -> float:
+                return self.value
+
+            def sleep(self, _s: float) -> None:
+                pass
+
+        clock = _Clock()
+        coordinator = RateLimitCoordinator(
+            {RateLimitScope.FUTURES: 2400, RateLimitScope.SPOT: 6000},
+            clock=clock, sleep=clock.sleep,
+        )
+
+        class _Cache:
+            enabled = True
+
+            def stats(self) -> dict[str, int]:
+                return {"futures_klines": 3}
+
+            def total_bytes(self) -> int:
+                return 1234
+
+        class _Client:
+            coordinator: RateLimitCoordinator
+            stats: ClientStats
+            cache: _Cache
+
+        client = _Client()
+        client.coordinator = coordinator
+        client.stats = ClientStats()
+        client.cache = _Cache()
+        return client, coordinator, clock
+
+    def test_rate_limits_envelope_and_cache_stats(self, tmp_path: Path):
+        env = _env(tmp_path)
+        svc = env["svc"]
+        clock_t = {"t": NOW}
+        svc._now = lambda: clock_t["t"]  # noqa: SLF001
+        from cointrader.rate_limit import RateLimitScope
+
+        client, coordinator, _ = self._stub_client(tmp_path)
+        env["spot"].client = client  # type: ignore[attr-defined]
+        svc.exch_sync = object()  # type: ignore[assignment]
+        coordinator.observe(RateLimitScope.FUTURES, 1200, 200)
+        snap = svc.web_snapshot()
+
+        # rate_limits 每 scope 带观测/估算分离 + 外部不确定性 + quality
+        spot_scope = snap["rate_limits"]["spot"]
+        futures_scope = snap["rate_limits"]["futures"]
+        for scope in (spot_scope, futures_scope):
+            assert scope["external_usage_uncertain"] is True
+            assert "其他进程" in scope["external_usage_note"]
+            assert scope["limit"] > 0
+        assert futures_scope["observed_used"] == 1200
+        assert futures_scope["quality"] == "OK"
+        assert futures_scope["header_age_ms"] == 0
+        assert spot_scope["quality"] == "UNKNOWN"
+        assert spot_scope["observed_used"] is None  # 不得渲染为 0
+
+        # 块级信封：source/as_of/quality（as_of = 墙钟 ms，随注入时钟走）
+        env = snap["rate_limits_envelope"]
+        # 重命名避免与上方局部变量 env 混淆
+        rate_env = env
+        assert rate_env["as_of_ms"] == int(NOW * 1000)
+        assert rate_env["quality"] == "OK"  # 任一 scope 新鲜 → 块 OK
+        assert "RateLimitCoordinator" in rate_env["source"]
+        clock_t["t"] = NOW + 42
+        snap2 = svc.web_snapshot()
+        assert snap2["rate_limits_envelope"]["as_of_ms"] == int((NOW + 42) * 1000)
+
+        # freshness / cache_stats 信封
+        fenv = snap["freshness_envelope"]
+        assert fenv["as_of_ms"] == int(NOW * 1000)
+        assert fenv["quality"] in ("OK", "DEGRADED", "UNKNOWN")
+        assert "source" in fenv
+
+        cache = snap["cache_stats"]
+        cenv = snap["cache_stats_envelope"]
+        assert cache["cache_enabled"] is True
+        assert cache["cache_write_failures"] == 0
+        assert cache["namespaces"] == {"futures_klines": 3}
+        assert cache["total_bytes"] == 1234
+        assert cenv["quality"] == "OK"
+        assert cenv["as_of_ms"] == int(NOW * 1000)
+
+        json.dumps(snap)  # 全 JSON 可序列化，无凭据/异常对象
+
+    def test_cache_write_failure_degraded_not_ok(self, tmp_path: Path):
+        """cache 写失败不得计作保存成功：quality 必须 DEGRADED。"""
+        env = _env(tmp_path)
+        svc = env["svc"]
+        client, coordinator, _ = self._stub_client(tmp_path)
+        env["spot"].client = client  # type: ignore[attr-defined]
+        client.stats.cache_write_failures = 2  # type: ignore[attr-defined]
+        svc.exch_sync = object()  # type: ignore[assignment]
+        snap = svc.web_snapshot()
+        assert snap["cache_stats"]["cache_write_failures"] == 2
+        assert snap["cache_stats_envelope"]["quality"] == "DEGRADED"
+
+    def test_diagnostics_unavailable_is_none_not_zero(self, tmp_path: Path):
+        """fake adapter 无 client → 诊断块为 None（展示层渲染 UNKNOWN/null）。"""
+        env = _env(tmp_path)
+        snap = env["svc"].web_snapshot()
+        assert snap["rate_limits"] is None
+        assert snap["rate_limits_envelope"] is None
+        assert snap["cache_stats"] is None
+        assert snap["cache_stats_envelope"] is None
+        # freshness 信封恒在（服务内存自身事实），账户缺失 → UNKNOWN
+        assert snap["freshness_envelope"]["quality"] in (
+            "OK", "DEGRADED", "UNKNOWN",
+        )
+        json.dumps(snap)
+
+    def test_market_data_envelope_quality(self, tmp_path: Path):
+        from cointrader.live.market_sync import DataReadiness, ScanEpochStatus
+
+        env = _env(tmp_path)
+        svc = env["svc"]
+
+        class _StubSync:
+            def readiness(self, now_ms: int | None = None) -> DataReadiness:
+                return DataReadiness(
+                    epoch_id="ep-1", status=ScanEpochStatus.READY,
+                    expected=3, completed=3, excluded_count=0, failed_count=0,
+                    missing=(), failed={}, age_ms=1000, reason="",
+                )
+
+            def latest_ready(self) -> object:
+                return None
+
+        svc.synchronizer = _StubSync()  # type: ignore[assignment]
+        snap = svc.web_snapshot()
+        assert snap["market_data"]["status"] == "READY"
+        assert snap["market_data_envelope"]["quality"] == "OK"
+        assert "source" in snap["market_data_envelope"]
+        assert snap["market_data_envelope"]["as_of_ms"] > 0

@@ -850,6 +850,9 @@ def cmd_live_status(args: argparse.Namespace) -> int:
             ),
             "current_positions_state": _current_positions_state(store, now_ms, config),
             "schema_version": store.schema_version(),
+            # v5.0 T3：服务内存诊断（限流/coordinator 在 live run 进程内，
+            # CLI 只读查询不触交易进程 → 统一 UNKNOWN/null，不得渲染为 0）
+            "service_diagnostics": _live_status_diagnostics(),
         }
     finally:
         store.close()
@@ -876,6 +879,7 @@ def cmd_live_status(args: argparse.Namespace) -> int:
     hb_age = payload["heartbeat_age_ms"]
     print(f"  心跳年龄     : {hb_age if hb_age is not None else '无'} ms"
           f"   current projection: {payload['current_positions_state']}")
+    _print_service_diagnostics(payload["service_diagnostics"])
     cont = payload["run_continuity"]
     print("  运行连续性   :")
     if not cont["has_any_session"]:
@@ -907,6 +911,50 @@ def cmd_live_status(args: argparse.Namespace) -> int:
         for alert in payload["recent_alerts"][:5]:
             print(f"    - [{alert['ts_ms']}] {alert['payload']}")
     return 0
+
+
+def _live_status_diagnostics() -> dict[str, Any]:
+    """v5.0 T3：CLI 的服务内存诊断离线口径。
+
+    限流 coordinator / cache 统计位于 live run 进程内存；CLI 查询
+    （只读账本）不得连接/依赖交易进程，因此统一返回 UNKNOWN/null，
+    不得渲染为 0/healthy（服务在跑时请走 WebUI ``/api/state``）。
+    """
+    return {
+        "available": False,
+        "quality": "UNKNOWN",
+        "source": "ledger only（服务内存诊断需 live run 进程内获取，CLI 查询不触交易进程）",
+        "as_of_ms": None,
+        "rate_scope": None,
+        "observed_used": None,
+        "local_used_estimate": None,
+        "header_age_ms": None,
+        "external_usage_uncertain": None,
+    }
+
+
+def _print_service_diagnostics(diag: dict[str, Any]) -> None:
+    """v5.0 T3：渲染服务诊断块；无诊断时明确显示 UNKNOWN，不显示为 0/正常。"""
+    if not diag.get("available"):
+        print(f"  服务诊断     : {diag.get('quality') or 'UNKNOWN'}"
+              f"（as_of=UNKNOWN，source={diag.get('source') or 'unknown'}）")
+        print("    限流观测   : observed(server)=UNKNOWN estimated(local)=UNKNOWN"
+              " header_age=UNKNOWN external_usage_uncertain=UNKNOWN（诊断不可用，CLI 不触服务进程）")
+        return
+    scope = diag.get("rate_scope") or "UNKNOWN"
+    observed = diag.get("observed_used")
+    estimated = diag.get("local_used_estimate")
+    header_age = diag.get("header_age_ms")
+    uncertain = diag.get("external_usage_uncertain")
+    print(f"  服务诊断     : quality={diag.get('quality') or 'UNKNOWN'}"
+          f" as_of={diag.get('as_of_ms') or 'UNKNOWN'}"
+          f" source={diag.get('source') or 'unknown'}")
+    print(f"    限流观测   : scope={scope}"
+          f" observed(server)={observed if observed is not None else 'UNKNOWN'}"
+          f" estimated(local)={estimated if estimated is not None else 'UNKNOWN'}"
+          f" header_age={header_age if header_age is not None else 'UNKNOWN'} ms"
+          f" external_usage_uncertain={uncertain if uncertain is not None else 'UNKNOWN'}"
+          "（同出口 IP 其他进程流量不可精准归因）")
 
 
 def _current_positions_state(store: Any, now_ms: int, config: Any) -> str:

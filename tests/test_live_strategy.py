@@ -245,3 +245,61 @@ class TestDedup:
         ctx = make_context(held=held, quotes={s: make_quote() for s in held})
         decision = strat.can_open("SOLUSDT", ctx)
         assert decision.reason_code is ReasonCode.MAX_POSITIONS
+
+
+class TestQuoteProvenanceGateCompat:
+    """v5.0 T2（AC-04）：共享测试 fixture 与订单前 gate 的兼容性。
+
+    策略层数学不检查 source/symbol provenance（由 runner 的 gate 负责）；
+    这里锁定 fixture 默认 provenance（source="fake"）能通过 gate，避免
+    fixture 回归时 runner 开仓路径被 fail-closed 误拒。
+    """
+
+    def test_fixture_quote_passes_entry_gate(self):
+        from cointrader.domain.market import DataQuality
+        from cointrader.live.strategy import evaluate_quote_gate
+
+        verdict = evaluate_quote_gate(
+            make_quote(),
+            intent_symbol=SYMBOL,
+            now_ms=NOW_MS,
+            max_age_ms=5_000,
+            max_skew_ms=500,
+        )
+        assert verdict.quality is DataQuality.FRESH
+
+    def test_fixture_quote_symbol_follows_intent(self):
+        from cointrader.domain.market import DataQuality
+        from cointrader.live.strategy import evaluate_quote_gate
+
+        verdict = evaluate_quote_gate(
+            make_quote(symbol="ETHUSDT"),
+            intent_symbol="ETHUSDT",
+            now_ms=NOW_MS,
+            max_age_ms=5_000,
+            max_skew_ms=500,
+        )
+        assert verdict.quality is DataQuality.FRESH
+        # 同一 fixture 报价与不匹配 intent → 拒绝
+        wrong = evaluate_quote_gate(
+            make_quote(symbol="ETHUSDT"),
+            intent_symbol=SYMBOL,
+            now_ms=NOW_MS,
+            max_age_ms=5_000,
+            max_skew_ms=500,
+        )
+        assert wrong.quality is not DataQuality.FRESH
+
+    def test_unregistered_source_fixture_quote_rejected(self):
+        from cointrader.domain.market import DataQuality
+        from cointrader.live.strategy import evaluate_quote_gate
+
+        # 未知来源（空串）不得 FRESH：这是 fixture 必须带 source="fake" 的原因
+        verdict = evaluate_quote_gate(
+            make_quote(source=""),
+            intent_symbol=SYMBOL,
+            now_ms=NOW_MS,
+            max_age_ms=5_000,
+            max_skew_ms=500,
+        )
+        assert verdict.quality is DataQuality.INCOMPLETE

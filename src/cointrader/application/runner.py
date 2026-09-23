@@ -20,6 +20,7 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from ..domain.market import DataQuality
 from ..domain.risk import ApprovedIntent
 from ..execution.pair_executor import PairPrecheckFailed
 from ..execution.planner import PlanError
@@ -308,6 +309,27 @@ class ServiceRunner:
             if quote is None:
                 skipped.append(f"{symbol}: 提交前报价获取失败")
                 continue
+            # v5.0 T2（AC-04）：OrderPlanner/submit 紧邻处重验双腿报价
+            # （time-of-check == time-of-use，消除检查/使用间隙）。
+            # OPEN/增加风险：非 FRESH 不建 plan、不调用 executor（broker 提交 0）；
+            # CLOSE/reduce-only：不被 entry freshness gate 阻塞，仅记录报价质量。
+            verdict = svc._entry_quote_verdict(quote, symbol)
+            if not intent.is_closing and verdict.quality is not DataQuality.FRESH:
+                skipped.append(
+                    f"{symbol}: 入场报价被拒 ({verdict.quality.value}): {verdict.reason}"
+                )
+                svc._on_alert(
+                    "QUOTE_GATE_REJECTED",
+                    f"{symbol} 入场报价被拒 ({verdict.quality.value}, "
+                    f"source={quote.source!r}, {verdict.reason})",
+                )
+                continue
+            if intent.is_closing and verdict.quality is not DataQuality.FRESH:
+                # 平仓不受 entry gate 阻塞；保留可观测性（计划 payload 同步记录）
+                logger.info(
+                    "平仓报价非 FRESH（不阻塞 reduce-only）: %s %s: %s",
+                    symbol, verdict.quality.value, verdict.reason,
+                )
             close_spot_qty: Decimal | None = None
             close_perp_qty: Decimal | None = None
             if intent.is_closing:
@@ -342,6 +364,22 @@ class ServiceRunner:
                 continue
             plan_payload = dict(plan.to_dict())
             plan_payload["run_id"] = svc.run_id or ""
+            # v5.0 T2（AC-04）：quote snapshot provenance 与 intent/plan 关联
+            # （plan_id = plan-<intent_id> 已绑定 intent；payload 为自由 JSON，
+            # 无需 schema migration）。
+            plan_payload["quote"] = {
+                "symbol": quote.symbol,
+                "source": quote.source,
+                "received_at_ms": quote.received_at_ms,
+                "spot_received_ms": quote.spot_received_ms,
+                "perp_received_ms": quote.perp_received_ms,
+                "spot_exchange_ts_ms": quote.spot_exchange_ts_ms,
+                "perp_exchange_ts_ms": quote.perp_exchange_ts_ms,
+                "connection_generation": quote.connection_generation,
+                "gate_now_ms": int(svc._now() * 1000),
+                "gate_quality": verdict.quality.value,
+                "gate_reason": verdict.reason,
+            }
             svc.store.append_execution_plan(plan_payload)
 
             # 杠杆/保证金：固定池启动预检已验证；动态池 symbol 首次开仓时验证一次

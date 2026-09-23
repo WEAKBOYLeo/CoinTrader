@@ -154,7 +154,14 @@ def build_payload(
         "pnl": None,
         # T4：来自服务内存快照的数据状态区（服务未运行时为 None，不得渲染成 0）
         "market_data": service.get("market_data"),
+        # v5.0 T3：诊断信封（source/as_of/quality）与 cache 健康；
+        # 服务未运行/诊断不可用时为 None（UNKNOWN），不得渲染为 0/RUNNING
+        "market_data_envelope": service.get("market_data_envelope"),
         "rate_limits": service.get("rate_limits"),
+        "rate_limits_envelope": service.get("rate_limits_envelope"),
+        "freshness_envelope": service.get("freshness_envelope"),
+        "cache_stats": service.get("cache_stats"),
+        "cache_stats_envelope": service.get("cache_stats_envelope"),
         "freshness": {},
         "store_available": False,
     }

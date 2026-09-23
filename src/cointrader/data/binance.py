@@ -50,6 +50,7 @@ from ..rate_limit import (
 )
 from ..redact import redact_url
 from .cache import DiskCache, json_or_raise, make_key
+from .coverage import INTERVAL_MS, HistoricalRepository
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,11 @@ class ClientStats:
     retries: int = 0
     throttled_seconds: float = 0.0
     errors: int = 0
+    # 历史区间复用（v5.0 T1）：与短 TTL 实时缓存的 cache_hits 分开计数，
+    # 让调用方区分“命中已验证历史段”和“命中短 TTL 快照”。
+    historical_cache_hits: int = 0
+    cache_write_failures: int = 0
+    cache_read_failures: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +111,9 @@ class ClientStats:
             "retries": self.retries,
             "throttled_seconds": round(self.throttled_seconds, 2),
             "errors": self.errors,
+            "historical_cache_hits": self.historical_cache_hits,
+            "cache_write_failures": self.cache_write_failures,
+            "cache_read_failures": self.cache_read_failures,
         }
 
 
@@ -134,6 +143,7 @@ class BinancePublicClient:
         self.cache = DiskCache(data.cache_dir)
         self.stats = ClientStats()
         self._sleep = sleep_fn
+        self._historical_repository: HistoricalRepository | None = None
 
         if rate_limiter is not None:
             self.coordinator = rate_limiter
@@ -335,6 +345,58 @@ class BinancePublicClient:
 
     # -- 内部：带缓存的分页拉取 ---------------------------------------------
 
+    @property
+    def historical_repository(self) -> HistoricalRepository:
+        """历史区间仓库（v5.0 T1）：覆盖索引 + 只拉缺口。
+
+        懒加载；共享本实例的 cache 与 RateLimitCoordinator。
+        """
+        if self._historical_repository is None:
+            self._historical_repository = HistoricalRepository(self, self.cache)
+        return self._historical_repository
+
+    def _klines_page(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+        limit: int,
+    ) -> list[Any]:
+        """拉取一页永续 K 线（单页 limit ≤ KLINES_MAX_LIMIT，经 _request 限流/重试）。"""
+        limit = min(limit, KLINES_MAX_LIMIT)
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+            "startTime": start_ms,
+            "endTime": end_ms,
+        }
+        page = self._request(self.api.futures_base, FAPI_KLINES, params, scope=RateLimitScope.FUTURES)
+        if not isinstance(page, list):
+            raise ParseError(f"klines 返回非列表: {type(page).__name__}")
+        return page
+
+    def _funding_page(
+        self,
+        symbol: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[Any]:
+        """拉取一页资金费历史（固定 FUNDING_PAGE_SIZE，防 WAF 403，经 _request）。"""
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "limit": FUNDING_PAGE_SIZE,
+            "startTime": start_ms,
+            "endTime": end_ms,
+        }
+        page = self._request(self.api.futures_base, FAPI_FUNDING_RATE, params, scope=RateLimitScope.FUTURES)
+        if not isinstance(page, list):
+            raise ParseError(f"fundingRate 返回非列表: {type(page).__name__}")
+        return page
+
     def _cached_get(
         self,
         namespace: str,
@@ -511,6 +573,14 @@ class BinancePublicClient:
         if limit < 1:
             raise ValueError(f"limit 必须 >= 1，当前 {limit}")
 
+        # v5.0 T1：显式历史区间（start+end 都给）走覆盖仓库——只拉缺口、
+        # 半开 [start,end) 语义、仅已结算事件；返回形状不变。
+        if start_ms is not None and end_ms is not None and start_ms < end_ms:
+            result = self.historical_repository.fetch_funding_history(
+                symbol, start_ms, end_ms, limit=limit
+            )
+            return result.records
+
         def loader() -> list[dict[str, Any]]:
             all_records: list[dict[str, Any]] = []
             cursor = start_ms
@@ -581,7 +651,22 @@ class BinancePublicClient:
         end_ms: int | None = None,
         limit: int = KLINES_MAX_LIMIT,
     ) -> list[list[Any]]:
-        """永续合约 K 线。"""
+        """永续合约 K 线。
+
+        v5.0 T1：``start_ms`` 与 ``end_ms`` 均给定（且 interval 已知）时走历史
+        区间仓库——覆盖索引命中零请求、只拉缺口、仅返回**已闭合** candle
+        （open time 半开 ``[start_ms, end_ms)``）；返回类型不变。
+        """
+        if (
+            start_ms is not None
+            and end_ms is not None
+            and start_ms < end_ms
+            and interval in INTERVAL_MS
+        ):
+            result = self.historical_repository.fetch_futures_klines(
+                symbol, interval, start_ms, end_ms, limit=limit
+            )
+            return result.records
         return self._klines(
             self.api.futures_base,
             FAPI_KLINES,

@@ -128,6 +128,13 @@ def fetch_funding_history(
     Raises:
         InsufficientDataError: 该合约没有任何资金费记录。
         ParseError: 字段缺失或格式异常。
+
+    Notes:
+        ``start_ms`` 与 ``end_ms`` 均给定时，客户端走历史区间仓库
+        （``data/coverage.py``）：记录身份 = ``fundingTime``，半开区间
+        ``[start_ms, end_ms)``，已覆盖区间零重复请求（增量复用），
+        仅已结算事件（``fundingTime <`` 交易所当前时间）进入可复用历史。
+        不改变任何年化/8h 桶计算口径。
     """
     records = client.funding_history(symbol, start_ms=start_ms, end_ms=end_ms, limit=limit)
     if not records:

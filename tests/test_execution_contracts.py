@@ -345,3 +345,28 @@ def test_domain_plan_order_requires_positive_quantity():
             price=None,
             reduce_only=True,
         )
+
+
+# -- v5.0 T2 边界：planner 是 consumer，不是 freshness 权威 -------------------
+
+
+def test_planner_does_not_enforce_quote_freshness(planner):
+    """OrderPlanner 只消费给定的价格/规则，不校验报价年龄（AC-04 边界）。
+
+    报价新鲜度 gate 在上游（runner/service 的 ``evaluate_quote_gate``）：
+    越期报价在到达 planner 之前即被拒绝（broker 调用 0）。这里锁定
+    planner 不因「报价陈旧」而改变规划行为，职责不重叠。
+    """
+    approved = make_approved(make_intent())
+    # now 距报价产生远超 max_market_data_age（5s），但在审批有效期内
+    plan = planner.plan(
+        approved,
+        spot_price=PRICE,
+        perp_price=PRICE,
+        spot_rules=make_rule("spot"),
+        perp_rules=make_rule("perp"),
+        now_ms=NOW + 20_000,
+        plan_id="plan-stale-quote",
+    )
+    assert len(plan.orders) == 2
+    assert all(o.quantity > 0 for o in plan.orders)

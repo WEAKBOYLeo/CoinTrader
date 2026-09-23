@@ -50,6 +50,7 @@ from ..execution.user_stream import PollingUserStream, UserStream
 from ..market_data.service import MarketDataService
 from ..observability.control import ControlPublisher
 from ..portfolio.planner import PortfolioPlanner
+from ..rate_limit import rate_limit_diagnostics_to_dict
 from ..reporting.pnl import PnlAggregator
 from ..risk.state_machine import SafetyStateMachine
 from ..strategy.adapter import decisions_to_proposal
@@ -62,6 +63,8 @@ from .strategy import (
     LiveStrategy,
     PublicDataStrategyProvider,
     Quote,
+    QuoteGateVerdict,
+    evaluate_quote_gate,
 )
 
 #: 用户流对象：WebSocket 流或 demo 用的 REST 轮询流（共享 market/is_fresh/start/stop 接口）
@@ -384,14 +387,41 @@ class LiveService:
             gate_state = self.gate.state.value
         except Exception:  # noqa: BLE001
             gate_state = None
-        # T4：限流器快照（JSON 可序列化，不含 URL/密钥）
+        # T4：限流器快照（JSON 可序列化，不含 URL/密钥）；
+        # v5.0 T3：source/as_of/quality 信封 + 同出口 IP 不确定性显式呈现
         rate_limits: dict[str, Any] | None = None
         if self.exch_sync is not None:
             rate_limits = self._rate_limits_snapshot()
+        rate_limits_envelope: dict[str, Any] | None = None
+        if rate_limits is not None:
+            qualities = [str(v.get("quality")) for v in rate_limits.values()]
+            if any(q == "OK" for q in qualities):
+                rate_block_quality = "OK"
+            elif any(q == "STALE" for q in qualities):
+                rate_block_quality = "STALE"
+            else:
+                rate_block_quality = "UNKNOWN"
+            rate_limits_envelope = {
+                "source": "RateLimitCoordinator.snapshot（服务内存，仅诊断，非事实源）",
+                "as_of_ms": now_ms,
+                "quality": rate_block_quality,
+            }
         # T4：市场数据就绪度（epoch status/coverage/cutoff）
         market_data: dict[str, Any] | None = None
         if self.strategy is not None and self.synchronizer is not None:
             market_data = self._market_data_readiness(now_ms)
+        market_data_envelope: dict[str, Any] | None = None
+        if market_data is not None:
+            market_data_envelope = {
+                "source": "MarketDataSynchronizer.readiness（服务内存，仅诊断）",
+                "as_of_ms": now_ms,
+                "quality": {
+                    "READY": "OK",
+                    "STALE": "STALE",
+                }.get(str(market_data.get("status")), "DEGRADED"),
+            }
+        # v5.0 T3：数据层 cache 健康（ClientStats；写失败不得计作保存成功）
+        cache_stats, cache_stats_envelope = self._cache_stats_snapshot(now_ms)
         # T4：新鲜度块（账户/对账/心跳年龄，供 Web/CLI 统一展示）
         acct_ts = None if acct is None else int(getattr(acct, "ts_ms", 0) or 0)
         freshness = {
@@ -435,8 +465,25 @@ class LiveService:
                 now_ms - self._last_reconcile_ms if self._last_reconcile_ms else None
             ),
             "rate_limits": rate_limits,
+            "rate_limits_envelope": rate_limits_envelope,
             "market_data": market_data,
+            "market_data_envelope": market_data_envelope,
             "freshness": freshness,
+            "freshness_envelope": {
+                "source": "LiveService.web_snapshot（服务内存，仅诊断）",
+                "as_of_ms": now_ms,
+                "quality": (
+                    "UNKNOWN"
+                    if acct_ts is None
+                    else (
+                        "DEGRADED"
+                        if (not self._reconcile_ok or self._ledger_sync_error)
+                        else "OK"
+                    )
+                ),
+            },
+            "cache_stats": cache_stats,
+            "cache_stats_envelope": cache_stats_envelope,
             # T4：安全状态机（owner）+ 控制命令审计（状态迁移可追溯）
             "safety": self._safety_sm.state.to_dict(),
             "control_events": [c.to_dict() for c in self._control.recent[-20:]],
@@ -445,7 +492,8 @@ class LiveService:
         }
 
     def _rate_limits_snapshot(self) -> dict[str, Any] | None:
-        """共享限流协调器的只读快照（T4：Web 展示 used/in-flight/frozen）。"""
+        """共享限流协调器的只读快照（v5.0 T3：服务端观测 vs 本地估算分离 +
+        header 年龄 + 同出口 IP 不确定性；不触碰调度语义）。"""
         try:
             client = getattr(self.spot, "client", None)
             limiter = getattr(client, "coordinator", None)
@@ -455,26 +503,53 @@ class LiveService:
             snap = limiter.snapshot()
             out: dict[str, Any] = {}
             for scope, s in snap.items():
-                frozen = bool(s.frozen_until is not None and t < s.frozen_until)
-                banned = bool(s.ban_until is not None and t < s.ban_until)
-                out[str(getattr(scope, "value", scope))] = {
-                    "limit": int(s.limit),
-                    "soft_limit": float(s.soft_limit),
-                    "observed_used": int(s.observed_used) if s.observed_used is not None else None,
-                    "in_flight": int(s.in_flight),
-                    "local_used": int(s.local_used),
-                    "frozen": frozen,
-                    "banned": banned,
-                    "seconds_to_unfreeze": (
-                        int(max(0, s.frozen_until - t)) if frozen else None
-                    ),
-                    "freezes": int(s.freezes),
-                    "bans": int(s.bans),
-                }
+                out[str(getattr(scope, "value", scope))] = rate_limit_diagnostics_to_dict(
+                    s, now_mono=t
+                )
             return out or None
         except Exception:  # noqa: BLE001 —— 诊断块失败不影响快照主体
             logger.debug("限流器快照失败", exc_info=True)
             return None
+
+    def _cache_stats_snapshot(
+        self, now_ms: int
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """数据层 cache 健康（v5.0 T3）：复用 T1 的 ClientStats 计数。
+
+        Returns:
+            ``(cache_stats, envelope)``；客户端/缓存不可用 → 双 None
+            （展示层渲染 UNKNOWN/null，不得渲染为 0/healthy）。
+            写/读失败计数 > 0 → quality DEGRADED（失败不得计作保存成功）。
+        """
+        try:
+            client = getattr(self.spot, "client", None)
+            stats = getattr(client, "stats", None)
+            cache = getattr(client, "cache", None)
+            if stats is None or cache is None:
+                return None, None
+            data: dict[str, Any] = stats.as_dict()
+            data["cache_enabled"] = bool(getattr(cache, "enabled", False))
+            try:
+                data["namespaces"] = cache.stats()
+                data["total_bytes"] = int(cache.total_bytes())
+            except Exception:  # noqa: BLE001 —— 磁盘统计失败不阻塞诊断主体
+                logger.debug("cache 磁盘统计失败", exc_info=True)
+            quality = "OK"
+            if int(data.get("cache_write_failures", 0)) > 0 or int(
+                data.get("cache_read_failures", 0)
+            ) > 0:
+                quality = "DEGRADED"
+            if not data["cache_enabled"]:
+                quality = "UNKNOWN"
+            envelope = {
+                "source": "BinancePublicClient.stats（服务内存，仅诊断）",
+                "as_of_ms": now_ms,
+                "quality": quality,
+            }
+            return data, envelope
+        except Exception:  # noqa: BLE001
+            logger.debug("cache 统计快照失败", exc_info=True)
+            return None, None
 
     def _market_data_readiness(self, now_ms: int) -> dict[str, Any] | None:
         """epoch 就绪度 → 可序列化 dict（T4：Web 数据状态区）。"""
@@ -1167,11 +1242,24 @@ class LiveService:
             available=res.spot_available + res.futures_available,
         )
 
+    def _entry_quote_verdict(self, quote: Quote, symbol: str) -> QuoteGateVerdict:
+        """v5.0 T2（AC-04）：双腿报价 gate（纯函数；边界取自 execution 配置，
+        时钟 = ``self._now()``，即下单前最后一刻的当前时间）。"""
+        exc = self.config.execution
+        return evaluate_quote_gate(
+            quote,
+            intent_symbol=symbol,
+            now_ms=int(self._now() * 1000),
+            max_age_ms=int(exc.max_market_data_age_seconds * 1000),
+            max_skew_ms=int(exc.max_quote_skew_ms),
+        )
+
     def _market_snapshot_for(self, symbol: str, now_ms: int) -> MarketSnapshot:
         """单 symbol 市场事实（T3：新增风险审批用）。
 
         报价缺失/过期/未来时间 → INCOMPLETE（风险层禁止新增风险）；
-        不伪造价格。
+        不伪造价格。v5.0 T2（AC-04）：报价经 gate 判非 FRESH（陈旧/来源
+        未知/skew 超限）时不得映射为 FRESH 市场事实（no stale-as-fresh）。
         """
         from ..domain.market import InstrumentQuote, MarketKind
 
@@ -1190,6 +1278,16 @@ class LiveService:
                 generated_at_ms=now_ms,
                 decision_cutoff_ms=0,
                 quality=DataQuality.INCOMPLETE,
+                quotes=(),
+            )
+        verdict = self._entry_quote_verdict(quote, symbol)
+        if verdict.quality is not DataQuality.FRESH:
+            # 陈旧/不可证明新鲜的报价只能降低风险，不得作为 FRESH 市场事实
+            return MarketSnapshot(
+                snapshot_id=f"quote-rejected-{symbol}-{quote.ts_ms}",
+                generated_at_ms=now_ms,
+                decision_cutoff_ms=0,
+                quality=verdict.quality,
                 quotes=(),
             )
         return MarketSnapshot(
@@ -1393,18 +1491,28 @@ def _make_quote_fetcher(public_client: Any) -> Callable[[str], Quote | None]:
     """新鲜报价获取器：提交开仓前必须重新获取（§6.2）。
 
     行情源为公开只读接口；失败返回 None（本轮 STALE_QUOTE，不下单）。
+
+    v5.0 T2（AC-04）provenance：两腿各自的本地接收时间 + symbol +
+    ``source="rest"``；REST 报价不提供交易所时间戳 → 记 None（不得用本地
+    时刻冒充）。
     """
 
     def fetch(symbol: str) -> Quote | None:
         try:
             spot_price = public_client.spot_price(symbol)
+            spot_received_ms = int(time.time() * 1000)
             perp_payload = public_client.premium_index(symbol)
             # premiumIndex 无 lastPrice；用永续标记价（markPrice，标准参考价）
             perp_price = Decimal(str(perp_payload["markPrice"]))
+            perp_received_ms = int(time.time() * 1000)
             return Quote(
                 spot_price=Decimal(str(spot_price)),
                 perp_price=perp_price,
-                ts_ms=int(time.time() * 1000),
+                ts_ms=spot_received_ms,
+                spot_ts_ms=spot_received_ms,
+                perp_ts_ms=perp_received_ms,
+                symbol=symbol,
+                source="rest",
             )
         except Exception:  # noqa: BLE001
             logger.warning("报价获取失败: %s", symbol, exc_info=True)

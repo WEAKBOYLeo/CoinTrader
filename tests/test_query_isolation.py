@@ -367,3 +367,75 @@ def test_build_payload_pnl_block_uses_queries_not_binance(tmp_path: Path) -> Non
     assert payload["pnl"] is None or "error" not in payload["pnl"] or isinstance(
         payload["pnl"], dict
     )
+
+
+class TestV5T3QueryDiagnosticsIsolation:
+    """v5.0 T3（AC-07）：诊断信封/ cache 健康的查询侧行为。
+
+    - 服务内存诊断缺失（state_provider 空）→ 渲染 null/UNKNOWN，不渲染 0；
+    - build_payload 全程不触 broker/exchange（纯本地 ledger + 注入 provider）。
+    """
+
+    def test_missing_service_diagnostics_render_null_not_zero(self, tmp_path: Path) -> None:
+        from dataclasses import replace
+
+        from cointrader.config import load_config
+        from cointrader.webui.server import build_payload
+
+        config = load_config(None)
+        db = tmp_path / "ledger.sqlite3"
+        db.touch()
+        config = replace(config, execution=replace(config.execution, state_db=db))
+        payload = build_payload(
+            config,
+            state_provider=lambda: {},  # 服务在跑但无任何诊断数据
+            queries_factory=lambda: LedgerQueryService(_FakeLedger(calls=[])),
+        )
+        # 诊断块保持 null（UNKNOWN），不得渲染成 0/RUNNING/healthy
+        assert payload["rate_limits"] is None
+        assert payload["rate_limits_envelope"] is None
+        assert payload["market_data_envelope"] is None
+        assert payload["cache_stats"] is None
+        assert payload["cache_stats_envelope"] is None
+        assert payload["store_available"] is True
+        import json
+
+        json.dumps(payload)  # 可序列化
+
+    def test_build_payload_does_not_touch_broker_or_exchange(self, tmp_path: Path) -> None:
+        """查询/health 渲染路径不 acquire permit、不发交易所请求（调用面证据：
+        webui 模块仅允许依赖 config/execution.store/ledger/reporting/stdlib）。"""
+        from dataclasses import replace
+
+        from cointrader.config import load_config
+        from cointrader.webui.server import build_payload
+
+        config = load_config(None)
+        db = tmp_path / "ledger.sqlite3"
+        db.touch()
+        config = replace(config, execution=replace(config.execution, state_db=db))
+
+        calls: list[str] = []
+
+        class _CountingLedger(_FakeLedger):
+            def current_positions(self, *, include_tombstones: bool = False):
+                calls.append("current_positions")
+                return []
+
+        svc = {
+            "state": "RUNNING",
+            "rate_limits": {"futures": {"observed_used": 100, "local_used": 5,
+                                        "external_usage_uncertain": True,
+                                        "quality": "OK"}},
+            "rate_limits_envelope": {"source": "coordinator（诊断）", "as_of_ms": 1,
+                                     "quality": "OK"},
+        }
+        payload = build_payload(
+            config,
+            state_provider=lambda: svc,
+            queries_factory=lambda: LedgerQueryService(_CountingLedger(calls=calls)),
+        )
+        # 只走了 ledger 只读端口；诊断块原样透传（无网络往返）
+        assert "current_positions" in calls
+        assert payload["rate_limits"]["futures"]["external_usage_uncertain"] is True
+        assert payload["rate_limits_envelope"]["quality"] == "OK"

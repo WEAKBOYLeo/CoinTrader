@@ -86,11 +86,16 @@ def make_live_config(
     )
 
 
-def make_quote(spot: str = "100", perp: str = "100", ts: float | None = None) -> Quote:
+def make_quote(spot: str = "100", perp: str = "100", ts: float | None = None,
+               symbol: str = "BTCUSDT", source: str = "fake") -> Quote:
+    """测试 fake 报价（v5.0 T2：默认携带 provenance，source="fake" 为已注册
+    测试来源；需要验证 fail-closed 的场景显式传 source=""/未注册值）。"""
     return Quote(
         spot_price=Decimal(spot),
         perp_price=Decimal(perp),
         ts_ms=int((ts or NOW) * 1000),
+        symbol=symbol,
+        source=source,
     )
 
 
@@ -425,7 +430,7 @@ def make_service(tmp_path: Path, data: FakeStrategyData, *,
         now_fn=clock,
         spot=spot,  # type: ignore[arg-type]
         futures=futures,  # type: ignore[arg-type]
-        quote_fetcher=lambda _sym: make_quote(),
+        quote_fetcher=lambda _sym: make_quote(symbol=_sym),
         on_alert=lambda kind, msg: None,
     )
     # 测试直接驱动 run_once：跳过 start() 的完整预检，经控制面回 RUNNING（T4）
