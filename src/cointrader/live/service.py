@@ -412,6 +412,8 @@ class LiveService:
         状态机 RUNNING && state==RUNNING && streams 新鲜 && 账户完整 &&
         账本同步 && 对账 && epoch READY && 风控闸门 NORMAL。
         任一 false 禁止新增风险。旧 ServiceState 不再独立决定开仓。"""
+        if not self.config.execution.order_submission_enabled:
+            return False
         if not self._safety_sm.state.allows_new_risk:
             return False
         if self._state is not ServiceState.RUNNING:
@@ -512,6 +514,8 @@ class LiveService:
             "run_id": self.run_id or None,
             "mode": self.mode,
             "can_open": self.can_open,
+            "order_submission_enabled": self.config.execution.order_submission_enabled,
+            "observation_only": not self.config.execution.order_submission_enabled,
             "gates": {
                 "running": self._state is ServiceState.RUNNING,
                 "gate_normal": self.gate.state is HaltState.NORMAL,
@@ -695,6 +699,8 @@ class LiveService:
                     "candidates": [],
                     "quality": "UNKNOWN",
                     "error": "尚无 scan epoch",
+                    "order_submission_enabled": self.config.execution.order_submission_enabled,
+                    "observation_only": not self.config.execution.order_submission_enabled,
                 }
             epoch_status = readiness.status.value
             epoch = {
@@ -727,6 +733,8 @@ class LiveService:
                 "candidates": candidates,
                 "quality": quality,
                 "error": readiness.reason if not readiness.can_rank else "",
+                "order_submission_enabled": self.config.execution.order_submission_enabled,
+                "observation_only": not self.config.execution.order_submission_enabled,
             }
         except Exception as exc:  # noqa: BLE001 —— 币池块局部降级
             logger.debug("币池 projection 构建失败", exc_info=True)
@@ -739,6 +747,8 @@ class LiveService:
                 "candidates": [],
                 "quality": "UNKNOWN",
                 "error": f"币池诊断不可用: {type(exc).__name__}",
+                "order_submission_enabled": self.config.execution.order_submission_enabled,
+                "observation_only": not self.config.execution.order_submission_enabled,
             }
 
     def _pool_api_sources(self, now_ms: int) -> list[dict[str, Any]] | None:
@@ -844,6 +854,8 @@ class LiveService:
             blockers.append("账户快照未知/不完整")
         if self.gate.state is not HaltState.NORMAL:
             blockers.append(f"风控闸门 {self.gate.state.value}")
+        if not self.config.execution.order_submission_enabled:
+            blockers.append("当前为只观测模式，订单提交已暂停")
         if not all(s.is_fresh for s in self.streams):
             blockers.append("用户流/账户数据不新鲜")
         return blockers
@@ -1168,7 +1180,11 @@ class LiveService:
             self.store.set_runtime_state(
                 "account_snapshot_ms", str(self._account_result.ts_ms if self._account_result else 0)
             )
-            self.store.set_runtime_state("can_open", "1" if (self._reconcile_ok and self._state is ServiceState.RUNNING) else "0")
+            self.store.set_runtime_state("can_open", "1" if self.can_open else "0")
+            self.store.set_runtime_state(
+                "order_submission_enabled",
+                "1" if self.config.execution.order_submission_enabled else "0",
+            )
             if self._recovery_since_ms is not None:
                 self.store.set_runtime_state("recovery_since_ms", str(self._recovery_since_ms))
             else:

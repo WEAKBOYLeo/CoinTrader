@@ -214,9 +214,12 @@ def test_live_webui_lifecycle(webui_config):
         code, body = get("/")
         assert code == 200
         assert b"CoinTrader" in body
-        # T4：前端含数据状态区（epoch/限流/新鲜度）与 projection 状态
-        assert b"data-status" in body
-        assert b"positions-state" in body
+        # 前端只保留信息源、epoch 与筛选链监控；不渲染交易栏目
+        assert b"pool-health" in body
+        assert b"pool-stages" in body
+        assert b"order-badge" in body
+        assert b"positions-content" not in body
+        assert b"orders-count" not in body
 
         code, body = get("/api/state")
         assert code == 200

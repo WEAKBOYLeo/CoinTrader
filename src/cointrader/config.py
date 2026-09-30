@@ -433,6 +433,8 @@ class ExecutionConfig:
     recovery_escalation_seconds: float = 900.0
     # WebUI 实时仪表盘（live run 进程内独立守护线程；只读，故障与主循环隔离）
     webui_enabled: bool = True
+    # False = 只拉取/筛选/记录数据，不进入风险审批、执行计划或下单。
+    order_submission_enabled: bool = True
     webui_host: str = "0.0.0.0"  # noqa: S104 —— 需局域网/tailscale 访问，见 config.yaml 注释
     webui_port: int = 8888
     # 实时策略候选池（§7.1）：
@@ -708,6 +710,7 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         watchdog_timeout_seconds=float(sec.get("watchdog_timeout_seconds", 300.0)),
         recovery_escalation_seconds=float(sec.get("recovery_escalation_seconds", 900.0)),
         webui_enabled=bool(sec.get("webui_enabled", True)),
+        order_submission_enabled=bool(sec.get("order_submission_enabled", True)),
         webui_host=str(sec.get("webui_host", "0.0.0.0")),  # noqa: S104
         webui_port=int(sec.get("webui_port", 8888)),
         report_dir=Path(sec.get("report_dir", "reports/live")),

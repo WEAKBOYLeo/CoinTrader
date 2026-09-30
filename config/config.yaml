@@ -228,6 +228,8 @@ execution:
   # WebUI 实时仪表盘：随 live run 启动，只读、独立线程、故障不影响主循环
   # 浏览器访问 http://<本机IP>:8888/
   webui_enabled: true
+  # 当前阶段只观测信息源与筛选链；禁止风险审批、执行计划、下单/撤单。
+  order_submission_enabled: false
   webui_host: 0.0.0.0
   webui_port: 8888
   leverage: 1                    # 只允许 1 或 2，禁止动态加杠杆

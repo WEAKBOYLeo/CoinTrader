@@ -382,6 +382,8 @@ def _ledger_pool_payload(config: Config, now_ms: int) -> dict[str, Any] | None:
                 "candidates": [],
                 "quality": "STALE",
                 "error": raw_epoch.get("error") or "最近 epoch 非 READY",
+                "order_submission_enabled": config.execution.order_submission_enabled,
+                "observation_only": not config.execution.order_submission_enabled,
             }
         entry = config.strategy.entry
         selection = config.strategy.selection
@@ -452,6 +454,8 @@ def _ledger_pool_payload(config: Config, now_ms: int) -> dict[str, Any] | None:
             "api_sources": None, "stages": [], "stages_freshness": "UNKNOWN",
             "candidates": candidates, "quality": "STALE",
             "error": "API 健康与实时当前费率在服务未运行时 UNKNOWN",
+            "order_submission_enabled": config.execution.order_submission_enabled,
+            "observation_only": not config.execution.order_submission_enabled,
         }
     except Exception:  # noqa: BLE001 —— 只读恢复失败返回 UNKNOWN
         logger.debug("从账本恢复币池 projection 失败", exc_info=True)
@@ -481,6 +485,8 @@ def build_pool_payload(
             "candidates": [],
             "quality": "UNKNOWN",
             "error": f"币池诊断不可用: {type(exc).__name__}",
+            "order_submission_enabled": config.execution.order_submission_enabled,
+            "observation_only": not config.execution.order_submission_enabled,
         }
     if isinstance(pool, dict):
         return pool
@@ -496,6 +502,8 @@ def build_pool_payload(
         "candidates": [],
         "quality": "UNKNOWN",
         "error": "服务未运行或尚无币池快照",
+        "order_submission_enabled": config.execution.order_submission_enabled,
+        "observation_only": not config.execution.order_submission_enabled,
     }
 
 

@@ -271,6 +271,7 @@ class TestSchedulerAndEpochConfig:
         assert config.execution.max_quote_skew_ms == 500
         assert config.execution.recovery_backfill_days == 30
         assert config.execution.exchange_snapshot_reuse_seconds == pytest.approx(2.0)
+        assert config.execution.order_submission_enabled is False
 
     def test_project_config_has_no_deprecated_refetch_key(self, project_root: Path) -> None:
         text = (project_root / "config" / "config.yaml").read_text(encoding="utf-8")

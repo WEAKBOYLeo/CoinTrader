@@ -298,6 +298,21 @@ class ServiceRunner:
             svc.enter_recovery(f"signal_decision 写账本失败: {exc}")
             return {"state": "RECOVERY", "reason": svc._recovery_reason}
 
+        if not svc.config.execution.order_submission_enabled:
+            # 只观测模式：数据同步、策略筛选和决策证据照常运行；
+            # 从这里开始不创建 intent，不做风险审批/执行计划，不触碰 executor。
+            skipped.append("只观测模式：风险审批、执行计划与订单提交已暂停")
+            svc._persist_runtime_state()
+            return {
+                "state": "RUNNING",
+                "opened": [],
+                "skipped": skipped,
+                "closed": [],
+                "intents": [],
+                "observation_only": True,
+                "orders_paused": True,
+            }
+
         # 1) 领域生产流水线（计划 4.0 T2/T3）：
         #    proposal → intent（先落账 + 指纹幂等）→ RiskKernel 审批（RiskDecision
         #    先落账）→ ApprovedIntent → ExecutionPlan（落账）→ 计划化执行入口

@@ -292,6 +292,26 @@ def _plan_payloads(store: Any) -> list[dict[str, Any]]:
 
 
 class TestRunnerQuoteGate:
+    def test_observation_only_stops_before_intent_and_execution(self, tmp_path) -> None:
+        """只观测模式保留数据评估，但不创建 intent/plan，也不触碰 executor。"""
+        env = _env(tmp_path)
+        svc = env["svc"]
+        svc.config = replace(
+            svc.config,
+            execution=replace(svc.config.execution, order_submission_enabled=False),
+        )
+        svc.run_id = "run-observe-only"
+
+        result = svc.run_once()
+
+        assert result["state"] == "RUNNING"
+        assert result["observation_only"] is True
+        assert result["orders_paused"] is True
+        assert env["executor"].open_calls == []
+        assert env["executor"].close_calls == []
+        assert _plan_payloads(env["store"]) == []
+        assert env["store"].pipeline_records("portfolio_intent") == []
+
     def test_fresh_quote_opens_and_plan_carries_provenance(self, tmp_path) -> None:
         """正常 quote 等价性：开仓一次；执行计划 payload 携带 quote provenance
         并与 intent 关联（plan_id = plan-<intent_id>），走既有 JSON 字段。"""

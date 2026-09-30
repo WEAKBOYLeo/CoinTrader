@@ -3,30 +3,30 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#080c14">
-<title>CoinTrader · Operations Console</title>
+<meta name="theme-color" content="#101820">
+<title>CoinTrader · 数据链路监控</title>
 <style>
 :root {
-  --bg: #080c14;
-  --bg-2: #0b111c;
-  --surface: #101824;
-  --surface-2: #141e2d;
-  --surface-3: #192537;
-  --line: rgba(139, 164, 202, .15);
-  --line-strong: rgba(139, 164, 202, .29);
-  --text: #e9eff8;
-  --muted: #8795aa;
-  --dim: #5f6e84;
-  --cyan: #55c9ef;
-  --cyan-bg: rgba(85, 201, 239, .11);
-  --green: #38d88a;
-  --green-bg: rgba(56, 216, 138, .11);
-  --red: #ff6672;
-  --red-bg: rgba(255, 102, 114, .11);
-  --amber: #f6b955;
-  --amber-bg: rgba(246, 185, 85, .11);
-  --purple: #ad9bff;
-  --purple-bg: rgba(173, 155, 255, .11);
+  --bg: #101820;
+  --bg-2: #15212a;
+  --surface: #1a2830;
+  --surface-2: #22343b;
+  --surface-3: #2c4045;
+  --line: rgba(190, 208, 199, .14);
+  --line-strong: rgba(190, 208, 199, .28);
+  --text: #edf2eb;
+  --muted: #b2c1bb;
+  --dim: #82958e;
+  --cyan: #61c5d8;
+  --cyan-bg: rgba(97, 197, 216, .11);
+  --green: #63cf9a;
+  --green-bg: rgba(99, 207, 154, .11);
+  --red: #f07878;
+  --red-bg: rgba(240, 120, 120, .11);
+  --amber: #e8bb60;
+  --amber-bg: rgba(232, 187, 96, .11);
+  --purple: #b7a7e8;
+  --purple-bg: rgba(183, 167, 232, .11);
   --radius: 12px;
   --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
@@ -38,10 +38,7 @@ body {
   margin: 0;
   min-width: 320px;
   color: var(--text);
-  background:
-    radial-gradient(900px 500px at 90% -15%, rgba(57, 117, 255, .12), transparent 66%),
-    radial-gradient(900px 480px at -15% 28%, rgba(45, 206, 160, .055), transparent 62%),
-    var(--bg);
+  background: var(--bg);
   font: 13px/1.5 var(--sans);
 }
 ::selection { color: #061018; background: var(--cyan); }
@@ -49,52 +46,18 @@ button, a { font: inherit; }
 a { color: inherit; text-decoration: none; }
 
 /* shell */
-.topbar {
-  position: sticky; top: 0; z-index: 20;
-  height: 64px;
-  border-bottom: 1px solid var(--line);
-  background: rgba(8, 12, 20, .88);
-  backdrop-filter: blur(18px);
-}
-.topbar-inner {
-  height: 100%; max-width: 1600px; margin: 0 auto; padding: 0 24px;
-  display: flex; align-items: center; gap: 14px;
-}
+.topbar { height: 64px; border-bottom: 1px solid var(--line); background: var(--bg-2); }
+.topbar-inner { height: 100%; max-width: 1480px; margin: 0 auto; padding: 0 24px; display: flex; align-items: center; gap: 14px; }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 218px; }
-.brand-mark {
-  width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center;
-  color: #04131d; font: 800 16px var(--mono);
-  background: linear-gradient(135deg, #64d7f2, #3985e8 58%, #39d88a);
-  box-shadow: 0 0 22px rgba(85, 201, 239, .26);
-}
-.brand-name { font-size: 15px; font-weight: 750; letter-spacing: .2px; }
-.brand-sub { color: var(--dim); font-size: 10px; letter-spacing: .7px; text-transform: uppercase; }
-.top-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.top-updated {
-  margin-left: auto; display: flex; align-items: center; gap: 8px;
-  color: var(--muted); font: 11px var(--mono); white-space: nowrap;
-}
-.connection-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(56,216,138,.09); }
-.top-updated.offline .connection-dot { background: var(--red); box-shadow: 0 0 0 4px rgba(255,102,114,.09); }
-
-.app-shell { max-width: 1600px; margin: 0 auto; display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: calc(100vh - 64px); }
-.sidebar {
-  position: sticky; top: 64px; align-self: start; height: calc(100vh - 64px);
-  padding: 22px 14px; border-right: 1px solid var(--line);
-}
-.side-label { color: var(--dim); padding: 0 12px 9px; font-size: 10px; font-weight: 750; letter-spacing: 1.1px; text-transform: uppercase; }
-.side-nav { display: grid; gap: 4px; }
-.side-nav a {
-  display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid transparent;
-  border-radius: 9px; color: var(--muted); transition: .15s ease;
-}
-.side-nav a:hover, .side-nav a:focus-visible { color: var(--text); background: var(--surface-2); border-color: var(--line); outline: 0; }
-.side-nav .nav-icon { width: 20px; color: var(--dim); text-align: center; font-family: var(--mono); }
-.side-nav a:hover .nav-icon { color: var(--cyan); }
-.side-note { margin: 30px 10px 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; color: var(--dim); font-size: 11px; }
-.side-note strong { display: block; color: var(--muted); margin-bottom: 4px; }
+.brand-mark { width: 32px; height: 32px; border-radius: 7px; display: grid; place-items: center; color: #10232b; font: 800 16px var(--mono); background: var(--cyan); }
+.brand-name { font-size: 15px; font-weight: 750; }
+.brand-sub { display: block; color: var(--dim); font-size: 10px; }
+.top-updated { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font: 11px var(--mono); white-space: nowrap; }
+.connection-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+.top-updated.offline .connection-dot { background: var(--red); }
+.app-shell { max-width: 1480px; margin: 0 auto; min-height: calc(100vh - 64px); }
 .main { min-width: 0; padding: 24px 26px 38px; }
-.main-inner { max-width: 1340px; margin: 0 auto; }
+.main-inner { max-width: 1360px; margin: 0 auto; }
 
 /* shared */
 .eyebrow { color: var(--dim); font-size: 10px; font-weight: 750; letter-spacing: 1.2px; text-transform: uppercase; }
@@ -174,23 +137,7 @@ a { color: inherit; text-decoration: none; }
 .panel-body { min-width: 0; }
 .panel-body.pad { padding: 15px; }
 
-/* safety */
-.safety-panel { background: linear-gradient(165deg, rgba(18, 29, 43, .95), rgba(13, 19, 29, .95)); }
-.safety-state { padding: 18px 16px 14px; border-bottom: 1px solid var(--line); }
-.safety-state-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.safety-state .state { margin-top: 8px; font: 800 27px var(--mono); letter-spacing: -.8px; }
-.safety-state .reason { min-height: 20px; margin-top: 4px; color: var(--muted); font-size: 11px; }
-.gate-list { padding: 8px 16px 12px; }
-.gate-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid rgba(139,164,202,.08); }
-.gate-row:last-child { border-bottom: 0; }
-.gate-row .gate-name { color: var(--muted); }
-.gate-row .gate-value { font: 700 10px var(--mono); }
-.gate-value.pass { color: var(--green); }
-.gate-value.fail { color: var(--red); }
-.gate-value.unknown { color: var(--dim); }
-.safety-foot { padding: 11px 16px; color: var(--dim); background: rgba(255,255,255,.018); font: 10px var(--mono); }
-
-/* positions */
+/* tables */
 .table-wrap { overflow-x: auto; }
 table { width: 100%; min-width: 680px; border-collapse: collapse; }
 th { padding: 10px 13px; color: var(--dim); background: rgba(20,30,45,.65); border-bottom: 1px solid var(--line); text-align: left; font-size: 10px; font-weight: 700; letter-spacing: .65px; text-transform: uppercase; white-space: nowrap; }
@@ -208,18 +155,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .pill.NEW, .pill.PARTIALLY_FILLED, .pill.OPEN, .pill.STALE { color: var(--amber); background: var(--amber-bg); border-color: rgba(246,185,85,.35); }
 .pill.REJECTED, .pill.CANCELED, .pill.CANCELLED, .pill.FAILED { color: var(--red); background: var(--red-bg); border-color: rgba(255,102,114,.35); }
 
-/* PnL + data */
-.pnl-layout { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(0, 1.5fr); gap: 16px; align-items: center; }
-.pnl-total { padding-right: 16px; border-right: 1px solid var(--line); }
-.pnl-total .label { color: var(--muted); font-size: 11px; font-weight: 650; }
-.pnl-total .value { margin-top: 4px; font: 800 31px var(--mono); letter-spacing: -1.2px; }
-.pnl-total .meta { margin-top: 6px; color: var(--dim); font: 10px var(--mono); }
-.pnl-items { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
-.mini { min-width: 0; padding: 10px 11px; border: 1px solid var(--line); border-radius: 9px; background: rgba(25,37,55,.62); }
-.mini .k { min-height: 17px; color: var(--muted); font-size: 10px; }
-.mini .v { margin-top: 4px; overflow-wrap: anywhere; font: 700 13px var(--mono); }
-.mini.estimate { border-style: dashed; }
-.mini.estimate .k { color: var(--dim); }
+/* data source cards */
 .health-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .health-card { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: rgba(20,30,45,.62); }
 .health-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
@@ -228,36 +164,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .health-line:last-child { border-bottom: 0; }
 .health-line span:last-child { color: var(--text); text-align: right; font: 10px var(--mono); }
 .health-source { margin-top: 10px; overflow: hidden; color: var(--dim); font: 9px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
-.filter-stage-scroll { overflow-x: auto; padding: 0 0 8px; scrollbar-color: var(--line-strong) transparent; }
-.filter-stages { display: flex; align-items: stretch; gap: 8px; min-width: max-content; }
-.filter-stage { position: relative; width: 152px; min-height: 118px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: rgba(20,30,45,.62); }
-.filter-stage:not(:last-child)::after { content: "→"; position: absolute; right: -14px; top: 45px; color: var(--dim); font: 14px var(--mono); }
-.filter-stage-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 12px; }
-.filter-stage-name { overflow: hidden; color: var(--muted); font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.filter-stage-count { color: var(--text); font: 700 18px var(--mono); }
-.filter-stage-meta { display: grid; gap: 4px; color: var(--dim); font: 9px var(--mono); }
-.filter-stage-meta span { display: flex; justify-content: space-between; gap: 6px; }
-.filter-stage-meta b { color: var(--muted); font-weight: 500; }
-.filter-stage.failed { border-color: rgba(255,102,114,.45); background: var(--red-bg); }
-.filter-stage.running { border-color: rgba(85,201,239,.45); background: var(--cyan-bg); }
-.filter-stage.stale { border-color: rgba(246,185,85,.45); }
-.filter-stage-strip { margin-bottom: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: rgba(14,21,32,.72); }
-.filter-stage-strip-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; color: var(--muted); font-size: 11px; }
-.filter-stage-strip-head .mono { color: var(--dim); font-size: 10px; }
 
-/* activity */
-.activity-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-.activity-grid .panel { margin-bottom: 0; }
+/* empty state */
 .empty { display: grid; place-items: center; min-height: 115px; padding: 18px; color: var(--dim); text-align: center; font-size: 11px; }
 .empty .empty-icon { display: block; margin-bottom: 5px; color: var(--green); font: 18px var(--mono); }
-.alert-list { max-height: 260px; overflow-y: auto; }
-.alert-row { display: grid; grid-template-columns: auto auto 1fr; gap: 8px; align-items: start; padding: 10px 13px; border-bottom: 1px solid rgba(139,164,202,.075); border-left: 2px solid var(--amber); background: rgba(246,185,85,.025); font-size: 10px; }
-.alert-row:last-child { border-bottom: 0; }
-.alert-row .t { color: var(--dim); font: 10px var(--mono); white-space: nowrap; }
-.alert-row .m { color: var(--amber); font: 700 10px var(--mono); }
-.alert-row .msg { overflow-wrap: anywhere; color: var(--muted); }
 
-.view[hidden] { display: none; }
 .pool-meta { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
 .pool-meta .mini { min-height: 72px; }
 .pool-toolbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding: 12px 15px; border-bottom: 1px solid var(--line); }
@@ -291,8 +202,6 @@ footer { max-width: 1340px; margin: 0 auto; padding: 5px 0 0; display: flex; jus
 
 @media (max-width: 1240px) {
   .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .pnl-layout { grid-template-columns: 1fr; }
-  .pnl-total { padding: 0 0 12px; border-right: 0; border-bottom: 1px solid var(--line); }
 }
 @media (max-width: 980px) {
   .app-shell { display: block; }
@@ -302,10 +211,8 @@ footer { max-width: 1340px; margin: 0 auto; padding: 5px 0 0; display: flex; jus
   .side-nav a { flex: 0 0 auto; padding: 8px 11px; }
   .main { padding: 20px 18px 32px; }
   .workspace { grid-template-columns: 1fr; }
-  .health-grid, .activity-grid, .pool-health-grid { grid-template-columns: 1fr; }
+  .health-grid, .pool-health-grid { grid-template-columns: 1fr; }
   .pool-stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .pool-meta { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .activity-grid .panel { margin-bottom: 14px; }
 }
 @media (max-width: 620px) {
   .topbar { height: auto; min-height: 64px; }
@@ -325,11 +232,8 @@ footer { max-width: 1340px; margin: 0 auto; padding: 5px 0 0; display: flex; jus
   .panel-head { min-height: 48px; padding: 9px 11px; }
   .panel-head .hint { display: none; }
   .panel-body.pad { padding: 11px; }
-  .pnl-items { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .pool-stage-grid { grid-template-columns: 1fr; padding: 11px; }
-  .pool-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .pool-toolbar .hint { width: 100%; margin-left: 0; }
-  .pnl-total .value { font-size: 26px; }
   footer { padding-top: 4px; flex-direction: column; }
 }
 </style>
@@ -337,116 +241,44 @@ footer { max-width: 1340px; margin: 0 auto; padding: 5px 0 0; display: flex; jus
 <body>
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="#overview" aria-label="CoinTrader 总览">
+    <a class="brand" href="#data-monitor" aria-label="CoinTrader 数据监控">
       <span class="brand-mark">₮</span>
-      <span><span class="brand-name">CoinTrader</span><span class="brand-sub">Funding-rate operations</span></span>
+      <span><span class="brand-name">CoinTrader</span><span class="brand-sub">数据链路监控</span></span>
     </a>
-    <div class="top-status">
-      <span id="state-badge" class="chip unknown"><span class="dot"></span>连接中…</span>
-      <span id="mode-badge" class="chip">模式 -</span>
-      <span id="open-badge" class="chip no"><span class="dot"></span>开仓 -</span>
-    </div>
+    <span id="run-badge" class="chip unknown"><span class="dot"></span>服务 UNKNOWN</span>
+    <span id="order-badge" class="chip no"><span class="dot"></span>订单已暂停</span>
     <div id="updated" class="top-updated offline"><span class="connection-dot"></span><span id="updated-text">等待数据…</span></div>
   </div>
 </header>
-
-<div class="app-shell">
-  <aside class="sidebar" aria-label="页面导航">
-    <div class="side-label">Console</div>
-    <nav class="side-nav">
-      <a href="#overview"><span class="nav-icon">⌂</span>总览</a>
-      <a href="#positions"><span class="nav-icon">◈</span>持仓与 PnL</a>
-      <a href="#health"><span class="nav-icon">◌</span>系统健康</a>
-      <a href="#pool"><span class="nav-icon">▦</span>币池信息</a>
-      <a href="#activity"><span class="nav-icon">≋</span>订单与告警</a>
-    </nav>
-    <div class="side-note"><strong>只读控制台</strong>页面不会发起交易所请求，不含下单、撤单或配置入口。</div>
-  </aside>
-
-  <main class="main" id="overview">
-    <div class="main-inner">
-      <div id="errbar" class="banner error"><span class="banner-icon">!</span><span id="errbar-text"></span></div>
-      <div id="recoverybar" class="banner error"><span class="banner-icon">!</span><span id="recoverybar-text"></span></div>
-      <div id="warmupbar" class="banner warmup"><span class="banner-icon">◌</span><span id="warmupbar-text"></span><div class="warmup-progress"><div class="warmup-track"><div id="warmup-fill" class="warmup-fill" style="width:0%"></div></div></div></div>
-
-      <div class="page-head">
-        <div><div class="eyebrow">Live operations</div><h1>实时交易总览</h1><p>资金费率套利 · 账本事实与服务诊断分层展示</p></div>
-        <span class="read-only">READ ONLY</span>
-      </div>
-
-      <section class="summary-grid" aria-label="核心指标" id="summary"></section>
-
-      <div class="workspace">
-        <div>
-          <section class="panel" id="positions">
-            <div class="panel-head">
-              <span class="panel-icon">◈</span><h2>当前持仓</h2><span id="positions-count" class="count">0</span>
-              <span id="positions-state" class="chip unknown">UNKNOWN</span><span class="hint">current projection · authoritative ledger</span>
-            </div>
-            <div class="panel-body" id="positions-content"></div>
-          </section>
-
-          <section class="panel" id="pnl-panel">
-            <div class="panel-head"><span class="panel-icon">Σ</span><h2>PnL 分项</h2><span id="pnl-count" class="count">ALL</span><span id="pnl-version" class="hint"></span></div>
-            <div class="panel-body pad" id="pnl"></div>
-          </section>
-        </div>
-
-        <div>
-          <section class="panel safety-panel" id="safety">
-            <div class="panel-head"><span class="panel-icon">!</span><h2>安全闸门</h2><span class="hint">new-risk gate</span></div>
-            <div id="safety-content" class="panel-body"></div>
-          </section>
-
-          <section class="panel" id="health">
-            <div class="panel-head"><span class="panel-icon">◌</span><h2>数据状态</h2><span class="hint">source · as_of · quality</span></div>
-            <div class="panel-body pad" id="data-status"></div>
-          </section>
-        </div>
-      </div>
-
-      <section class="view pool-page" id="pool-view" hidden>
-        <div class="page-head">
-          <div><div class="eyebrow">Market data observability</div><h1>币池信息</h1><p>API 信息源健康 · 分级筛选过程 · 最终资金费率候选</p></div>
-          <span class="read-only">READ ONLY</span>
-        </div>
-        <div id="pool-meta" class="pool-meta"></div>
-        <section class="panel">
-          <div class="panel-head"><span class="panel-icon">◌</span><h2>API 信息源健康</h2><span id="pool-health-quality" class="chip unknown">UNKNOWN</span><span class="hint">主动限流等待不计失败；最近成功与数据年龄分开</span></div>
-          <div id="pool-health" class="pool-health-grid"></div>
-        </section>
-        <section class="panel">
-          <div class="panel-head"><span class="panel-icon">≋</span><h2>币池分级筛选</h2><span id="pool-stage-quality" class="chip unknown">UNKNOWN</span><span class="hint">输入 · 输出 · 确定排除 · 失败 · 耗时</span></div>
-          <div id="pool-stages" class="pool-stage-grid"></div>
-        </section>
-        <section class="panel">
-          <div class="panel-head"><span class="panel-icon">◎</span><h2>最终筛选候选</h2><span id="pool-candidate-count" class="count">UNKNOWN</span><span class="hint">按滑窗年化均值降序；筛选通过不保证已可开仓</span></div>
-          <div class="pool-toolbar">
-            <input id="pool-symbol-filter" type="search" placeholder="搜索 Symbol" aria-label="搜索 Symbol">
-            <select id="pool-status-filter" aria-label="候选状态"><option value="READY">READY 候选</option><option value="ALL">全部诊断</option></select>
-            <span id="pool-candidate-hint" class="hint">当前最新完整 READY epoch</span>
-          </div>
-          <div id="pool-candidates" class="pool-candidate-table"></div>
-          <div class="pool-page-nav"><button id="pool-prev" type="button">‹</button><span id="pool-page-label">UNKNOWN</span><button id="pool-next" type="button">›</button></div>
-        </section>
-      </section>
-
-      <section class="panel" id="activity">
-        <div class="panel-head"><span class="panel-icon">≋</span><h2>运行活动</h2><span class="hint">最近事件 · 只读账本</span></div>
-        <div class="panel-body pad">
-          <div class="activity-grid">
-            <section class="panel"><div class="panel-head"><span class="panel-icon">⇅</span><h2>最近订单</h2><span id="orders-count" class="count">0</span></div><div class="panel-body" id="orders"></div></section>
-            <section class="panel"><div class="panel-head"><span class="panel-icon">✓</span><h2>最近成交</h2><span id="fills-count" class="count">0</span></div><div class="panel-body" id="fills"></div></section>
-            <section class="panel"><div class="panel-head"><span class="panel-icon">⚡</span><h2>最近告警</h2><span id="alerts-count" class="count">0</span></div><div class="panel-body alert-list" id="alerts"></div></section>
-          </div>
-        </div>
-      </section>
-
-      <footer><span>CoinTrader WebUI · polling 3s · no trading controls</span><span id="foot-state">offline</span></footer>
+<main class="main" id="data-monitor">
+  <div class="main-inner">
+    <div id="errbar" class="banner error"><span class="banner-icon">!</span><span id="errbar-text"></span></div>
+    <div class="page-head">
+      <div><div class="eyebrow">Market data observability</div><h1>信息源与筛选链</h1><p>检查来源请求状态、数据时效，以及每一步筛选保留与剔除数量</p></div>
+      <span class="read-only">只观测 · 不下单</span>
     </div>
-  </main>
-</div>
-
+    <section class="panel observation-banner">
+      <div class="panel-head"><span class="panel-icon">Ⅱ</span><h2>交易执行已暂停</h2><span id="pause-state" class="chip ok">OBSERVATION ONLY</span></div>
+      <div class="panel-body pad">当前只运行信息拉取、数据校验和筛选统计；不会创建执行计划或提交订单。</div>
+    </section>
+    <section class="summary-grid" id="pool-meta" aria-label="数据轮次摘要"></section>
+    <section class="panel">
+      <div class="panel-head"><span class="panel-icon">◌</span><h2>信息源健康</h2><span id="pool-health-quality" class="chip unknown">UNKNOWN</span><span class="hint">最近成功 · 数据年龄 · 失败与限流</span></div>
+      <div id="pool-health" class="pool-health-grid"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><span class="panel-icon">≋</span><h2>逐步筛选</h2><span id="pool-stage-quality" class="chip unknown">UNKNOWN</span><span class="hint">输入 · 保留 · 剔除 · 失败 · 耗时</span></div>
+      <div class="panel-body pad"><div id="pool-stages" class="pool-stage-grid"></div></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><span class="panel-icon">◎</span><h2>最终保留候选</h2><span id="pool-candidate-count" class="count">UNKNOWN</span><span class="hint">只显示筛选结果，不含交易资格</span></div>
+      <div class="pool-toolbar"><input id="pool-symbol-filter" type="search" placeholder="搜索 Symbol" aria-label="搜索 Symbol"><span id="pool-candidate-hint" class="hint">等待完整筛选轮次</span></div>
+      <div id="pool-candidates" class="pool-candidate-table"></div>
+      <div class="pool-page-nav"><button id="pool-prev" type="button" aria-label="上一页">‹</button><span id="pool-page-label">UNKNOWN</span><button id="pool-next" type="button" aria-label="下一页">›</button></div>
+    </section>
+    <footer><span>CoinTrader WebUI · 每 3 秒刷新</span><span id="foot-state">offline</span></footer>
+  </div>
+</main>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -456,6 +288,7 @@ let lastPool = {};
 let poolRows = [];
 let poolPage = 0;
 const POOL_PAGE_SIZE = 50;
+
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -483,19 +316,7 @@ function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n.toLocaleString("zh-CN", { maximumFractionDigits: 6 }) : esc(v);
 }
-function signed(v) {
-  if (v === null || v === undefined || v === "") return '<span class="unknown">UNKNOWN</span>';
-  const n = Number(v);
-  if (!Number.isFinite(n)) return esc(v);
-  const cls = n > 0 ? "pos" : (n < 0 ? "neg" : "");
-  return `<span class="${cls}">${n > 0 ? "+" : ""}${num(v)}</span>`;
-}
 function text(v, fallback = "UNKNOWN") { return v === null || v === undefined || v === "" ? fallback : esc(v); }
-function stateClass(value) { return String(value || "unknown").toLowerCase().replace(/[^a-z_]/g, ""); }
-function statusChip(value) {
-  const raw = String(value || "UNKNOWN").toUpperCase();
-  return `<span class="pill ${esc(raw)}">${text(value)}</span>`;
-}
 function qualityChip(value) {
   const q = String(value || "UNKNOWN").toUpperCase();
   const kind = q === "OK" || q === "READY" || q === "COMPLETE" || q === "HEALTHY" ? "ok" : (q === "STALE" || q === "DEGRADED" || q === "DOWN" ? "warn" : "unknown");
@@ -515,53 +336,7 @@ function pct(v) {
   const n = Number(v);
   return Number.isFinite(n) ? `${n >= 0 ? "+" : ""}${(n * 100).toFixed(4)}%` : esc(v);
 }
-function healthKind(value) {
-  const raw = String(value || "UNKNOWN").toUpperCase();
-  return raw === "HEALTHY" ? "ok" : ["DEGRADED", "STALE", "DOWN"].includes(raw) ? "warn" : "unknown";
-}
-function recoveryErrorText(error, fallback) {
-  const item = error || {};
-  const lines = [];
-  if (item.code) lines.push(`<b>${esc(item.code)}</b>`);
-  if (item.message || fallback) lines.push(esc(item.message || fallback));
-  const recon = item.last_reconciliation || {};
-  const affected = Array.isArray(item.affected) ? item.affected : [];
-  affected.forEach((row) => lines.push(`${esc(row.symbol)}/${esc(row.market)} 期望 ${esc(row.expected)} · 实际 ${esc(row.actual)} · 差额 ${esc(row.difference)} · 容差 ${esc(row.tolerance == null ? "UNKNOWN" : row.tolerance)}`));
-  if (!affected.length) {
-    const positions = recon.details?.positions || {};
-    Object.entries(positions).forEach(([symbol, legs]) => {
-      Object.entries(legs || {}).forEach(([market, row]) => {
-        if (!row || row.within_tolerance === true) return;
-        lines.push(`${esc(symbol)}/${esc(market)} 期望 ${esc(row.expected)} · 实际 ${esc(row.actual)} · 差额 ${esc(row.difference)} · 容差 ${esc(row.tolerance)}`);
-      });
-    });
-  }
-  if (!lines.length) {
-    const mismatches = [...(item.details?.mismatches || []), ...(recon.mismatches || [])];
-    mismatches.slice(0, 3).forEach((m) => lines.push(esc(m)));
-  }
-  if (item.entered_at_ms) lines.push(`首次 ${fmtTs(item.entered_at_ms)}`);
-  if (item.last_retry_at_ms) lines.push(`最近重试 ${fmtTs(item.last_retry_at_ms)} · ${num(item.retry_count)} 次`);
-  return lines.join("<br>");
-}
-
-function routeView() {
-  const isPool = location.hash.replace(/^#/, "") === "pool";
-  const container = document.querySelector("#overview .main-inner");
-  if (container) {
-    Array.from(container.children).forEach((node) => {
-      if (node.id === "pool-view" || node.tagName === "FOOTER") return;
-      node.hidden = isPool;
-    });
-  }
-  $("pool-view").hidden = !isPool;
-  document.querySelectorAll(".side-nav a").forEach((link) => {
-    const active = link.getAttribute("href") === "#pool" ? isPool : !isPool && link.getAttribute("href") === "#overview";
-    link.style.color = active ? "var(--text)" : "";
-    link.style.background = active ? "var(--surface-2)" : "";
-  });
-}
-
+function stateClass(value) { return String(value || "unknown").toLowerCase().replace(/[^a-z_]/g, ""); }
 function renderPool(p) {
   const pool = p || {};
   lastPool = pool;
@@ -570,6 +345,12 @@ function renderPool(p) {
   const sources = Array.isArray(pool.api_sources) ? pool.api_sources : [];
   const stages = Array.isArray(pool.stages) ? pool.stages : [];
   const candidates = Array.isArray(pool.candidates) ? pool.candidates : [];
+  const submissionEnabled = pool.order_submission_enabled === true;
+  const observationOnly = pool.observation_only === true || !submissionEnabled;
+  $("order-badge").className = "chip " + (observationOnly ? "ok" : "no");
+  $("order-badge").innerHTML = `<span class="dot"></span>${observationOnly ? "订单已暂停" : "订单未暂停"}`;
+  $("pause-state").className = "chip " + (observationOnly ? "ok" : "error");
+  $("pause-state").textContent = observationOnly ? "OBSERVATION ONLY" : "EXECUTION ENABLED";
   $("pool-meta").innerHTML = [
     ["Venue", text(pool.venue), "source: execution.mode"],
     ["Epoch", text(epoch.id), ready ? "最新完整横截面" : text(epoch.status)],
@@ -577,220 +358,45 @@ function renderPool(p) {
     ["Cutoff", epoch.decision_cutoff_ms ? fmtTs(epoch.decision_cutoff_ms) : "UNKNOWN", "决策截止，不是当前费率更新时间"],
     ["数据年龄", ageLabel(epoch.age_ms), "scan epoch"],
     ["覆盖", epoch.expected == null ? "UNKNOWN" : `${num(epoch.completed)} / ${num(epoch.expected)}`, `排除 ${num(epoch.excluded_count)} · 失败 ${num(epoch.failed_count)}`],
-  ].map(([label, value, sub]) => `<div class="mini"><div class="k">${esc(label)}</div><div class="v">${value}</div><div class="s">${esc(String(sub))}</div></div>`).join("");
+  ].map(([label, value, sub]) => `<div class="kpi info"><div class="k">${esc(label)}</div><div class="v">${value}</div><div class="s">${esc(String(sub))}</div></div>`).join("");
 
   $("pool-health-quality").innerHTML = qualityChip(sources.length ? (sources.some((s) => s.status === "DOWN") ? "DOWN" : sources.some((s) => s.status !== "HEALTHY") ? "DEGRADED" : "HEALTHY") : "UNKNOWN");
-  $("pool-health").innerHTML = sources.length ? sources.map((s) => `<div class="pool-source"><div class="health-title"><strong>${esc(s.label || s.id)}</strong>${qualityChip(s.status)}</div><div class="health-line"><span>尝试 / 失败</span><span>${num(s.attempts_window)} / ${num(s.failures_window)}</span></div><div class="health-line"><span>连续失败</span><span>${num(s.consecutive_failures)}</span></div><div class="health-line"><span>429 / 418</span><span>${num(s.rate_limit_errors_window)}</span></div><div class="health-line"><span>调度等待</span><span>${s.wait_ms_window == null ? "UNKNOWN" : fmtAge(Number(s.wait_ms_window))}</span></div><div class="health-line"><span>最近成功</span><span>${fmtTs(s.last_success_ms)}</span></div><div class="health-line"><span>数据年龄</span><span>${ageLabel(s.data_age_ms)}</span></div><div class="source-reason">${esc(text(s.reason))}${s.last_error ? " · " + esc(s.last_error) : ""}</div></div>`).join("") : '<div class="empty"><span class="empty-icon">?</span>UNKNOWN · 服务未运行或尚无 API 采样</div>';
+  $("pool-health").innerHTML = sources.length ? sources.map((s) => `<div class="pool-source"><div class="health-title"><strong>${esc(s.label || s.id)}</strong>${qualityChip(s.status)}</div><div class="health-line"><span>请求 / 失败</span><span>${num(s.attempts_window)} / ${num(s.failures_window)}</span></div><div class="health-line"><span>连续失败 / 重试</span><span>${num(s.consecutive_failures)} / ${num(s.retries_window)}</span></div><div class="health-line"><span>429 / 418</span><span>${num(s.rate_limit_errors_window)}</span></div><div class="health-line"><span>调度等待</span><span>${s.wait_ms_window == null ? "UNKNOWN" : fmtAge(Number(s.wait_ms_window))}</span></div><div class="health-line"><span>最近成功</span><span>${fmtTs(s.last_success_ms)}</span></div><div class="health-line"><span>最近数据</span><span>${fmtTs(s.last_data_event_ms)}</span></div><div class="health-line"><span>数据年龄 / 预期</span><span>${ageLabel(s.data_age_ms)} / ${s.expected_update_ms == null ? "UNKNOWN" : fmtAge(s.expected_update_ms)}</span></div><div class="source-reason">${esc(text(s.reason))}${s.last_error ? " · " + esc(s.last_error) : ""}</div></div>`).join("") : '<div class="empty"><span class="empty-icon">?</span>UNKNOWN · 服务未运行或尚无 API 采样</div>';
 
   $("pool-stage-quality").innerHTML = qualityChip(pool.stages_freshness || "UNKNOWN");
   $("pool-stages").innerHTML = stages.length ? stages.map((s) => {
     const status = String(s.status || "UNKNOWN").toUpperCase();
     const cls = status === "RUNNING" ? "running" : status === "FAILED" ? "failed" : "";
-    const note = s.id === "volume_24h" ? "沿用 min_quote_volume_3d_avg 配置值" : "";
-    return `<div class="pool-stage ${cls}"><div class="stage-top"><span class="stage-name">${esc(s.label || s.id || "阶段")}</span>${qualityChip(status === "DONE" ? "OK" : status)}</div><div class="stage-count">${num(s.output_count)}</div><div class="stage-line"><b>输入</b><span>${num(s.input_count)}</span></div><div class="stage-line"><b>确定排除</b><span>${num(s.excluded_count)}</span></div><div class="stage-line"><b>失败</b><span>${num(s.failed_count)}</span></div><div class="stage-line"><b>耗时</b><span>${s.duration_ms == null ? "UNKNOWN" : fmtDuration(s.duration_ms)}</span></div><div class="stage-line"><b>更新</b><span>${ageLabel(s.age_ms)}</span></div>${note ? `<div class="subline warn-text">${note}</div>` : ""}</div>`;
+    return `<div class="pool-stage ${cls}"><div class="stage-top"><span class="stage-name">${esc(s.label || s.id || "阶段")}</span>${qualityChip(status === "DONE" ? "OK" : status)}</div><div class="stage-count">${num(s.output_count)}</div><div class="stage-line"><b>输入</b><span>${num(s.input_count)}</span></div><div class="stage-line"><b>保留</b><span>${num(s.output_count)}</span></div><div class="stage-line"><b>剔除</b><span>${num(s.excluded_count)}</span></div><div class="stage-line"><b>失败</b><span>${num(s.failed_count)}</span></div><div class="stage-line"><b>耗时</b><span>${s.duration_ms == null ? "UNKNOWN" : fmtDuration(s.duration_ms)}</span></div><div class="stage-line"><b>更新</b><span>${ageLabel(s.age_ms)}</span></div></div>`;
   }).join("") : '<div class="empty"><span class="empty-icon">?</span>UNKNOWN · 暂无阶段数据</div>';
 
   poolRows = candidates.slice();
   const filter = String($("pool-symbol-filter").value || "").trim().toUpperCase();
   if (filter) poolRows = poolRows.filter((row) => String(row.symbol || "").toUpperCase().includes(filter));
-  if ($("pool-status-filter").value !== "ALL") poolRows = poolRows.filter((row) => row.pool_status === "READY");
   const total = poolRows.length;
   const pages = Math.max(1, Math.ceil(total / POOL_PAGE_SIZE));
   poolPage = Math.min(poolPage, pages - 1);
   const pageRows = poolRows.slice(poolPage * POOL_PAGE_SIZE, (poolPage + 1) * POOL_PAGE_SIZE);
   $("pool-candidate-count").textContent = ready ? String(total) : "UNKNOWN";
-  $("pool-candidate-hint").textContent = ready ? `READY epoch · ${fmtTs(epoch.completed_ms)} 完成 · ${total} 条当前页数据` : "暂无完整候选；BUILDING / DEGRADED 不与 READY 混排";
+  $("pool-candidate-hint").textContent = ready ? `READY epoch · ${fmtTs(epoch.completed_ms)} 完成 · ${total} 条当前页数据 · 订单提交暂停` : "暂无完整候选；BUILDING / DEGRADED 不与 READY 混排";
   $("pool-candidates").innerHTML = ready && pageRows.length ? table([
-    { t: "Symbol" }, { t: "当前响应费率", num: 1 }, { t: "最近已结算", num: 1 }, { t: "8h 平均", num: 1 }, { t: "滑窗年化", num: 1 }, { t: "有效门槛", num: 1 }, { t: "距离门槛", num: 1 }, { t: "正费率期数" }, { t: "3日成交额 / 门槛", num: 1 }, { t: "开仓资格" }, { t: "数据时间" }], pageRows.map((r) => `<td><span class="sym">${text(r.symbol)}</span><span class="subline">epoch ${text(r.epoch_id)}</span></td><td class="num">${pct(r.current_funding_rate)}<span class="subline">响应 ${fmtClock(r.premium_fetched_ms)} · 下次 ${fmtClock(r.next_funding_time_ms)}</span></td><td class="num">${pct(r.latest_settled_rate)}<span class="subline">${fmtClock(r.latest_settled_ms)} · ${num(r.settle_interval_hours)}h</span></td><td class="num">${pct(r.average_rate_8h)}</td><td class="num pos">${pct(r.trailing_annualized)}</td><td class="num">${pct(r.effective_threshold)}<span class="subline">min ${pct(r.threshold_min_trailing_annualized)} / ${pct(r.threshold_min_annualized_rate)}</span></td><td class="num">${Number(r.threshold_distance) > 0 ? pct(r.threshold_distance) : `<span class="pos">已达到 · ${pct(r.threshold_excess)}</span>`}</td><td>${num(r.consecutive_positive_periods)} / ${num(r.required_consecutive_positive)}</td><td class="num">${num(r.quote_volume_3d_avg)}<span class="subline">门槛 ${num(r.quote_volume_threshold)} · ${text(r.volume_status)}</span></td><td><span class="pill warn">池内通过</span><span class="subline blockers">${(r.open_blockers || []).map(esc).join(" · ")}</span></td><td><span class="subline">funding ${fmtClock(r.funding_updated_ms)}</span><span class="subline">premium ${fmtClock(r.premium_fetched_ms)}</span><span class="subline">volume 截止 ${fmtClock(r.volume_window_end_ms)}</span></td>`), 1550) : `<div class="empty"><span class="empty-icon">${ready ? "?" : "!"}</span>${ready ? "暂无通过资金费率与 3 日成交额筛选的完整候选" : text(pool.error, "暂无完整候选")}</div>`;
+    { t: "Symbol" }, { t: "最近结算费率", num: 1 }, { t: "8h 平均", num: 1 }, { t: "滑窗年化", num: 1 }, { t: "有效门槛", num: 1 }, { t: "正费率期数" }, { t: "3日成交额 / 门槛", num: 1 }, { t: "资金费数据时间" }], pageRows.map((r) => `<td><span class="sym">${text(r.symbol)}</span></td><td class="num">${pct(r.latest_settled_rate)}<span class="subline">${fmtClock(r.latest_settled_ms)} · ${num(r.settle_interval_hours)}h</span></td><td class="num">${pct(r.average_rate_8h)}</td><td class="num pos">${pct(r.trailing_annualized)}</td><td class="num">${pct(r.effective_threshold)}</td><td>${num(r.consecutive_positive_periods)} / ${num(r.required_consecutive_positive)}</td><td class="num">${num(r.quote_volume_3d_avg)}<span class="subline">门槛 ${num(r.quote_volume_threshold)}</span></td><td><span class="subline">拉取 ${fmtClock(r.funding_updated_ms)}</span><span class="subline">成交额截止 ${fmtClock(r.volume_window_end_ms)}</span></td>`), 1050) : `<div class="empty"><span class="empty-icon">${ready ? "?" : "!"}</span>${ready ? "暂无通过资金费率与 3 日成交额筛选的完整候选" : text(pool.error, "暂无完整候选")}</div>`;
   $("pool-prev").disabled = poolPage <= 0;
   $("pool-next").disabled = poolPage >= pages - 1;
   $("pool-page-label").textContent = total ? `${poolPage + 1} / ${pages}` : "UNKNOWN";
 }
 
 function render(d) {
-  routeView();
   const svc = d.service || {};
-  const st = d.status || {};
-  const state = svc.state || st.service_state || "UNKNOWN";
-  const mode = svc.mode || st.mode || "UNKNOWN";
-  const canOpen = svc.can_open ?? st.can_open;
-  const recon = st.last_reconciliation || {};
-  const recoveryError = d.recovery_error || st.recovery_error || svc.recovery_error || null;
-  const online = st.online || {};
-  const positions = (d.positions || []).filter((p) => !p.error);
-  const posState = d.positions_state || "UNKNOWN";
-  const capital = svc.account?.total_capital ?? st.total_capital;
-  const accountAge = svc.account?.snapshot_ts_ms ? d.now_ms - Number(svc.account.snapshot_ts_ms) : st.account_snapshot_age_ms;
-  const currentOnline = typeof online.current_run_online_ms === "number" ? online.current_run_online_ms : null;
-  const totalOnline = typeof online.total_online_ms === "number" ? online.total_online_ms : null;
-  const runCount = online.run_count ?? "UNKNOWN";
-  const runId = svc.run_id || st.run_id || "UNKNOWN";
-
-  const badge = $("state-badge");
-  badge.className = "chip " + stateClass(state);
-  badge.innerHTML = `<span class="dot"></span>${text(state)}`;
-  $("mode-badge").textContent = "模式 " + mode + (d.store_available ? "" : " · 无账本");
-  $("open-badge").className = "chip " + (canOpen === true ? "ok" : "no");
-  $("open-badge").innerHTML = `<span class="dot"></span>开仓 ${canOpen === true ? "允许" : canOpen === false ? "禁止" : "UNKNOWN"}`;
-
-  $("errbar").classList.remove("show");
-  const reason = recoveryError?.message || svc.recovery_reason || st.recovery_reason || svc.error || "";
-  $("recoverybar").classList.toggle("show", Boolean(reason) || ["RECOVERY", "HALTED", "CLOSE_ONLY", "EMERGENCY_FLATTEN"].includes(String(state)));
-  $("recoverybar-text").innerHTML = recoveryError
-    ? recoveryErrorText(recoveryError, reason)
-    : (reason ? "安全状态：" + esc(reason) : "服务未处于 RUNNING；新风险默认关闭");
-
-  // 预热横幅：scan epoch 构建中（拉 365 天行情数据）→ 进度实时刷新
-  const md0 = d.market_data;
-  const warming = md0 && md0.status === "BUILDING";
-  const waitingEpoch = !md0 && ["STARTING", "RECOVERY"].includes(String(state));
-  $("warmupbar").classList.toggle("show", Boolean(warming || waitingEpoch));
-  if (warming) {
-    const total = Number(md0.expected) || 0;
-    const done = Number(md0.completed) || 0;
-    const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-    const failed = Number(md0.failed_count) || 0;
-    $("warmupbar-text").textContent = `预热中：拉取行情 epoch 数据 ${done} / ${total}（${pct}%）${failed ? ` · 失败 ${failed}` : ""} · 完成后自动放行开仓`;
-    $("warmup-fill").style.width = pct + "%";
-  } else if (waitingEpoch) {
-    $("warmupbar-text").textContent = "预热中：服务启动，正在构建行情 epoch（进度待首个快照）";
-    $("warmup-fill").style.width = "0%";
-  }
-
-  const netPnl = d.pnl?.pnl?.net_pnl;
-  const netPnlNumber = netPnl === null || netPnl === undefined || netPnl === "" ? null : Number(netPnl);
-  const netPnlClass = netPnlNumber === null || !Number.isFinite(netPnlNumber) ? "warn" : netPnlNumber >= 0 ? "good" : "bad";
-  const reconAge = recon.ts_ms ? d.now_ms - Number(recon.ts_ms) : null;
-  $("summary").innerHTML = [
-    kpi("服务状态", text(state), state === "RUNNING" ? "good" : state === "STARTING" ? "warn" : "bad", "source: service memory"),
-    kpi("总资金 USDT", num(capital), "info", "账本账户快照"),
-    kpi("净 PnL", signed(netPnl), netPnlClass, "跨 run · ALL"),
-    kpi("最后对账", reconOkLabel(recon.consistent), recon.consistent === true ? "good" : recon.consistent === false ? "bad" : "warn", ageLabel(reconAge)),
-    kpi("当前持仓", String(positions.length), posState === "OK" ? "good" : "warn", "projection " + esc(posState)),
-    kpi("累计在线", fmtAge(totalOnline), "info", "本次 " + fmtAge(currentOnline) + " · run " + text(runCount)),
-  ].join("");
-
-  renderPositions(d, positions, posState);
-  renderSafety(d, svc, st, canOpen);
-  renderPnl(d, runId);
-  renderDataStatus(d, svc, st, posState);
-  renderActivity(d);
+  const state = svc.state || d.status?.service_state || "UNKNOWN";
+  $("run-badge").className = "chip " + stateClass(state);
+  $("run-badge").innerHTML = `<span class="dot"></span>服务 ${esc(state)}`;
   renderPool(d.pool || svc.pool);
-
   lastTickAt = Date.now();
   $("updated").classList.remove("offline");
   $("foot-state").textContent = "online · " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }
-function reconOkLabel(value) { return value === true ? "一致" : value === false ? "不一致" : "UNKNOWN"; }
 
-function renderPositions(d, positions, posState) {
-  $("positions-count").textContent = String(positions.length);
-  $("positions-state").className = "chip " + (posState === "OK" ? "ok" : posState === "STALE" ? "warn" : "unknown");
-  $("positions-state").textContent = posState;
-  $("positions-content").innerHTML = positions.length ? table(
-    [{ t: "Symbol" }, { t: "现货量", num: 1 }, { t: "永续量", num: 1 }, { t: "对冲比", num: 1 }, { t: "基差 %", num: 1 }, { t: "现货价", num: 1 }, { t: "永续价", num: 1 }, { t: "持仓年龄" }, { t: "未实现 PnL", num: 1 }],
-    positions.map((p) => `<td><span class="sym">${text(p.symbol)}</span><small class="dim">${p.observed_at_ms ? "seen " + fmtClock(p.observed_at_ms) : "projection"}</small></td>` +
-      `<td class="num pos">${num(p.spot_qty)}</td><td class="num neg">${num(p.perp_qty)}</td><td class="num">${num(p.hedge_ratio)}</td>` +
-      `<td class="num">${num(p.basis_pct)}</td><td class="num">${num(p.spot_price)}</td><td class="num">${num(p.perp_price)}</td>` +
-      `<td>${ageLabel(p.age_ms)}</td><td class="num">${p.unrealized_pnl !== undefined ? signed(p.unrealized_pnl) : '<span class="unknown">UNKNOWN</span>'}</td>`), 980
-  ) : `<div class="empty"><span class="empty-icon">${posState === "OK" ? "◈" : "!"}</span>${posState === "OK" ? "当前无持仓" : "current projection " + esc(posState) + " · 不展示历史旧仓"}</div>`;
-}
-
-function renderSafety(d, svc, st, canOpen) {
-  const gates = svc.gates || {};
-  const safety = svc.safety || {};
-  const safetyState = safety.state || svc.state || st.service_state || "UNKNOWN";
-  const reason = safety.reason || svc.recovery_reason || st.recovery_reason || "无状态原因";
-  const rows = [
-    ["安全状态", safetyState === "RUNNING", safetyState],
-    ["允许新增风险", canOpen === true, canOpen === true ? "ALLOW" : canOpen === false ? "BLOCKED" : "UNKNOWN"],
-    ["服务运行", gates.running, boolLabel(gates.running)],
-    ["风控闸门", gates.gate_normal, boolLabel(gates.gate_normal)],
-    ["最后对账", gates.reconcile_ok ?? st.last_reconciliation?.consistent, boolLabel(gates.reconcile_ok ?? st.last_reconciliation?.consistent)],
-    ["账本同步", gates.ledger_sync_ok ?? d.freshness?.ledger_sync_ok, boolLabel(gates.ledger_sync_ok ?? d.freshness?.ledger_sync_ok)],
-    ["行情 READY", gates.market_data_ready ?? d.market_data?.status === "READY", boolLabel(gates.market_data_ready ?? (d.market_data ? d.market_data.status === "READY" : null))],
-    ["账户完整", gates.account_complete ?? d.freshness?.account_complete, boolLabel(gates.account_complete ?? d.freshness?.account_complete)],
-  ];
-  const stateKind = safetyState === "RUNNING" ? "good" : ["STARTING", "DEGRADED"].includes(safetyState) ? "warn" : "bad";
-  $("safety-content").innerHTML = `<div class="safety-state"><div class="safety-state-top"><span class="eyebrow">Safety state</span>${qualityChip(safetyState === "RUNNING" ? "OK" : safetyState)}</div><div class="state ${stateKind === "good" ? "pos" : stateKind === "warn" ? "warn-text" : "neg"}">${text(safetyState)}</div><div class="reason">${text(reason, "UNKNOWN")}</div></div>` +
-    `<div class="gate-list">${rows.map(([label, pass, value]) => `<div class="gate-row"><span class="gate-name">${esc(label)}</span><span class="gate-value ${pass === true ? "pass" : pass === false ? "fail" : "unknown"}">${esc(value)}</span></div>`).join("")}</div>` +
-    `<div class="safety-foot">source: ${text(safety.source || "service memory")} · changed ${fmtTs(safety.changed_at_ms)}</div>`;
-}
-function boolLabel(value) { return value === true ? "PASS" : value === false ? "BLOCKED" : "UNKNOWN"; }
-
-function renderPnl(d, runId) {
-  const block = d.pnl || {};
-  const p = block.pnl;
-  $("pnl-count").textContent = block.run_id === "ALL" ? "ALL RUNS" : "CURRENT RUN";
-  $("pnl-version").textContent = p?.calculation_version ? "口径 " + p.calculation_version : "";
-  if (block.error) { $("pnl").innerHTML = `<div class="empty">PnL 聚合失败：${esc(block.error)}</div>`; return; }
-  if (!p) { $("pnl").innerHTML = '<div class="empty">暂无 run 数据</div>'; return; }
-  const fields = [
-    ["权威资金费", p.funding_pnl, false], ["手续费", p.trading_fee, false], ["基差", p.basis_pnl, false],
-    ["已实现", p.realized_pnl, false], ["未实现", p.unrealized_pnl, false], ["现金差", p.cash_delta, false],
-    ["估算资金费", p.estimated_funding_pnl, true],
-  ];
-  $("pnl").innerHTML = `<div class="pnl-layout"><div class="pnl-total"><div class="label">净 PnL · ${block.run_id === "ALL" ? "跨 run" : "当前 run"}</div><div class="value">${signed(p.net_pnl)}</div><div class="meta">run context ${text(block.current_run_id || runId)} · authoritative ${p.authoritative_complete === false ? "INCOMPLETE" : "COMPLETE"}</div></div><div class="pnl-items">${fields.map(([label, value, estimate]) => `<div class="mini ${estimate ? "estimate" : ""}"><div class="k">${esc(label)}${estimate ? " · estimate" : ""}</div><div class="v">${(label === "已实现" || label === "未实现") ? signed(value) : num(value)}</div></div>`).join("")}</div></div>`;
-}
-
-function renderFilterStages(md) {
-  const stages = Array.isArray(md?.stages) ? md.stages : [];
-  if (!stages.length) return '<div class="filter-stage-strip"><div class="filter-stage-strip-head"><strong>筛选流水线</strong><span class="mono">UNKNOWN</span></div><div class="unknown">暂无阶段数据</div></div>';
-  const stageCards = stages.map((stage) => {
-    const status = String(stage.status || "UNKNOWN").toUpperCase();
-    const quality = String(stage.quality || "UNKNOWN").toUpperCase();
-    const cls = status === "RUNNING" ? "running" : status === "FAILED" ? "failed" : quality === "STALE" ? "stale" : "";
-    const count = stage.output_count === null || stage.output_count === undefined ? "-" : num(stage.output_count);
-    const input = stage.input_count === null || stage.input_count === undefined ? "-" : num(stage.input_count);
-    const duration = stage.duration_ms === null || stage.duration_ms === undefined ? "进行中" : fmtDuration(stage.duration_ms);
-    return `<div class="filter-stage ${cls}"><div class="filter-stage-head"><span class="filter-stage-name">${esc(stage.label || stage.id || "阶段")}</span>${qualityChip(status === "DONE" ? "OK" : status)}</div><div class="filter-stage-count">${count}</div><div class="filter-stage-meta"><span><b>输入</b><span>${input}</span></span><span><b>耗时</b><span>${esc(duration)}</span></span><span><b>更新</b><span>${esc(stage.age_ms === null || stage.age_ms === undefined ? "UNKNOWN" : fmtAge(stage.age_ms) + "前")}</span></span></div></div>`;
-  }).join("");
-  return `<div class="filter-stage-strip"><div class="filter-stage-strip-head"><strong>筛选流水线</strong><span class="mono">${qualityChip(md.stages_freshness || "UNKNOWN")} · ${md.stages_age_ms == null ? "as_of UNKNOWN" : "as_of " + fmtAge(md.stages_age_ms) + "前"}</span></div><div class="filter-stage-scroll"><div class="filter-stages">${stageCards}</div></div></div>`;
-}
-function fmtDuration(ms) {
-  const n = Number(ms);
-  if (!Number.isFinite(n)) return "UNKNOWN";
-  return n < 1000 ? Math.round(n) + "ms" : (n / 1000).toFixed(1) + "s";
-}
-
-function renderDataStatus(d, svc, st, posState) {
-  const md = d.market_data;
-  const mdEnv = d.market_data_envelope || {};
-  const rl = d.rate_limits;
-  const rlEnv = d.rate_limits_envelope || {};
-  const fr = d.freshness || {};
-  const frEnv = d.freshness_envelope || {};
-  const sourceLine = (env) => `${text(env.source)} · ${env.as_of_ms ? fmtClock(env.as_of_ms) : "as_of UNKNOWN"}`;
-  const marketLines = md ? [
-    ["状态", qualityChip(md.status)], ["覆盖", `${num(md.completed)} / ${num(md.expected)}${md.status === "BUILDING" ? `（${Math.min(100, Math.round((Number(md.completed) || 0) / (Number(md.expected) || 1) * 100))}%）` : ""}`], ["失败", num(md.failed_count || 0)], ["cutoff", text(md.decision_cutoff_ms ? fmtTs(md.decision_cutoff_ms) : null)], ["年龄", ageLabel(md.age_ms)],
-  ] : [["状态", qualityChip("UNKNOWN")], ["覆盖", "UNKNOWN"], ["cutoff", "UNKNOWN"], ["年龄", "UNKNOWN"]];
-  const rateEntries = rl && typeof rl === "object" ? Object.entries(rl) : [];
-  const rateHtml = rateEntries.length ? rateEntries.map(([scope, v]) => {
-    const observed = v.observed_used === null || v.observed_used === undefined ? "observed UNKNOWN" : "observed " + text(v.observed_used);
-    const local = v.local_used === null || v.local_used === undefined ? "local UNKNOWN" : "local " + text(v.local_used);
-    const flags = [v.frozen ? "FROZEN" : "", v.banned ? "BANNED" : ""].filter(Boolean).join(" · ");
-    return `<div class="health-line"><span>${esc(scope)}</span><span>${observed} · ${local} · ${text(v.in_flight, "UNKNOWN")} flight${flags ? " · " + flags : ""}</span></div>`;
-  }).join("") : '<div class="health-line"><span>限流诊断</span><span class="unknown">UNKNOWN</span></div>';
-  const freshness = [
-    ["账户", ageLabel(fr.account_age_ms)], ["对账", ageLabel(fr.reconcile_age_ms)], ["心跳", ageLabel(fr.heartbeat_age_ms)],
-    ["账本同步", fr.ledger_sync_ok === true ? "PASS" : fr.ledger_sync_ok === false ? "BLOCKED" : "UNKNOWN"], ["projection", posState],
-  ];
-  $("data-status").innerHTML = renderFilterStages(md) + `<div class="health-grid"><div class="health-card"><div class="health-title"><strong>行情 epoch</strong>${qualityChip(md?.status || mdEnv.quality)}</div>${marketLines.map(([k, v]) => `<div class="health-line"><span>${esc(k)}</span><span>${v}</span></div>`).join("")}<div class="health-source">${esc(sourceLine(mdEnv))}</div></div>` +
-    `<div class="health-card"><div class="health-title"><strong>限流 coordinator</strong>${qualityChip(rlEnv.quality)}</div>${rateHtml}<div class="health-line"><span>同出口 IP</span><span>${rateEntries.some(([, v]) => v.external_usage_uncertain) ? "UNCERTAIN" : "UNKNOWN"}</span></div><div class="health-source">${esc(sourceLine(rlEnv))}</div></div>` +
-    `<div class="health-card"><div class="health-title"><strong>新鲜度</strong>${qualityChip(frEnv.quality)}</div>${freshness.map(([k, v]) => `<div class="health-line"><span>${esc(k)}</span><span>${esc(String(v))}</span></div>`).join("")}<div class="health-source">${esc(sourceLine(frEnv))}</div></div></div>`;
-}
-
-function renderActivity(d) {
-  const orders = (d.orders || []).filter((o) => !o.error).slice(0, 12);
-  const fills = (d.fills || []).filter((f) => !f.error).slice(0, 12);
-  const alerts = (d.status?.recent_alerts || []).slice(0, 12);
-  $("orders-count").textContent = String(orders.length);
-  $("fills-count").textContent = String(fills.length);
-  $("alerts-count").textContent = String(alerts.length);
-  $("orders").innerHTML = table([{ t: "时间" }, { t: "Symbol" }, { t: "方向" }, { t: "市场" }, { t: "数量", num: 1 }, { t: "状态" }], orders.map((o) => `<td>${fmtClock(o.created_ms || o.ts_ms)}</td><td><span class="sym">${text(o.symbol)}</span></td><td><span class="side ${String(o.side || "").toLowerCase()}">${text(o.side)}</span></td><td>${text(o.market)}</td><td class="num">${num(o.quantity)}</td><td>${statusChip(o.state)}</td>`), 590);
-  $("fills").innerHTML = table([{ t: "时间" }, { t: "Symbol" }, { t: "方向" }, { t: "数量", num: 1 }, { t: "价格", num: 1 }, { t: "手续费", num: 1 }], fills.map((f) => `<td>${fmtClock(f.ts_ms)}</td><td><span class="sym">${text(f.symbol)}</span></td><td><span class="side ${String(f.side || "").toLowerCase()}">${text(f.side)}</span></td><td class="num">${num(f.quantity)}</td><td class="num">${num(f.price)}</td><td class="num">${num(f.fee_amount)} ${text(f.fee_asset, "")}</td>`), 590);
-  $("alerts").innerHTML = alerts.length ? alerts.map((a) => `<div class="alert-row"><span class="t">${fmtClock(a.ts_ms)}</span><span class="m">${text(a.market, "SYSTEM")}</span><span class="msg">${text(a.payload)}</span></div>`).join("") : '<div class="empty"><span class="empty-icon">✓</span>暂无告警</div>';
-}
 
 async function tick() {
   try {
@@ -804,18 +410,17 @@ async function tick() {
     if (!poolResp.ok) throw new Error(pool.error || ("HTTP " + poolResp.status));
     d.pool = pool;
     render(d);
+    $("errbar").classList.remove("show");
     lastOk = true;
   } catch (e) {
     $("errbar").classList.add("show");
     $("errbar-text").textContent = "连接中断，正在重试：" + (e?.message || e);
     $("updated").classList.add("offline");
     $("foot-state").textContent = "offline";
-    if (!lastOk) $("state-badge").textContent = "连接失败";
+    if (!lastOk) $("run-badge").textContent = "服务连接失败";
   }
 }
-window.addEventListener("hashchange", routeView);
 $("pool-symbol-filter").addEventListener("input", () => { poolPage = 0; renderPool(lastPool || {}); });
-$("pool-status-filter").addEventListener("change", () => { poolPage = 0; renderPool(lastPool || {}); });
 $("pool-prev").addEventListener("click", () => { poolPage = Math.max(0, poolPage - 1); renderPool(lastPool || {}); });
 $("pool-next").addEventListener("click", () => { poolPage += 1; renderPool(lastPool || {}); });
 function updateRelativeTime() {
