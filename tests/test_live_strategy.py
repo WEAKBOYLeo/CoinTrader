@@ -208,6 +208,28 @@ class TestQuoteFreshness:
         decision = _open_decision(tmp_path, _data(), quotes={SYMBOL: future})
         assert decision.reason_code is ReasonCode.STALE_QUOTE
 
+    def test_slow_tick_fresh_quote_not_rejected(self, tmp_path):
+        """慢 tick：tick 开场 ctx.now 之后 60s 才拿到报价（限流/403 重试）。
+
+        报价相对**定案时刻**（gate_now_ms）是新鲜的 → 不得误判"未来时间戳"；
+        回归 VPS/本地实测：top3 候选每轮 STALE_QUOTE（报价年龄 -54s）永不     开仓。
+        """
+        strat, _ = make_strategy(tmp_path, _data())
+        strat.refresh_candidates()
+        ctx = make_context()
+        late = make_quote(ts=NOW + 60)  # 相对 ctx.now（tick 开场）是"未来"
+        # 闸门时刻 = 报价刚接收后的当前时间 → 放行
+        decision = strat.complete_open(SYMBOL, ctx, late, gate_now_ms=late.ts_ms)
+        assert decision.decision_kind is DecisionKind.OPEN
+        assert decision.reason_code is ReasonCode.ENTRY_OK
+        # 闸门时刻仍早于报价接收时间（真时钟回拨）→ 仍拒
+        early = make_quote(ts=NOW + 60)
+        decision2 = strat.complete_open(
+            SYMBOL, ctx, early, gate_now_ms=int(NOW * 1000) - 1000
+        )
+        assert decision2.decision_kind is DecisionKind.SKIP
+        assert decision2.reason_code is ReasonCode.STALE_QUOTE
+
 
 class TestDedup:
     def test_already_held(self, tmp_path):

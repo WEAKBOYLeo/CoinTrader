@@ -17,8 +17,8 @@ import httpx
 import pandas as pd
 import pytest
 
-from cointrader.config import ApiConfig, DataConfig, RateLimitConfig
-from cointrader.data.binance import BinancePublicClient
+from cointrader.config import ApiConfig, DataConfig, RateLimitConfig, UniverseConfig
+from cointrader.data.binance import BinancePublicClient, ClientStats
 from cointrader.data.cache import CACHE_FORMAT_VERSION, DiskCache, make_key
 from cointrader.data.funding import (
     FundingIntervals,
@@ -35,6 +35,7 @@ from cointrader.data.klines import (
     historical_quote_volume_3d_avg,
     historical_quote_volume_24h,
     klines_to_frame,
+    make_pair_exclusion_checker,
     parse_symbol_rules,
     tradable_perpetuals,
 )
@@ -50,6 +51,31 @@ from cointrader.rate_limit import (
     RateLimitScope,
 )
 from conftest import make_funding_series
+
+
+class TestEndpointHealth:
+    def test_wait_is_not_failure_and_recovered_429_remains_visible(self) -> None:
+        stats = ClientStats()
+        stats.record_wait("premium_index", 1_250, now_ms=1_000_000)
+        stats.record_attempt("premium_index", success=False, status=429, now_ms=1_000_100)
+        stats.record_retry("premium_index", now_ms=1_000_100)
+        stats.record_attempt("premium_index", success=True, status=200, data_event=True, now_ms=1_000_200)
+
+        row = next(item for item in stats.endpoint_health(now_ms=1_000_300) if item["id"] == "premium_index")
+        assert row["attempts_window"] == 2
+        assert row["failures_window"] == 1
+        assert row["rate_limit_errors_window"] == 1
+        assert row["retries_window"] == 1
+        assert row["wait_ms_window"] == 1_250
+        assert row["last_success_ms"] == 1_000_200
+        assert row["status"] == "DEGRADED"
+
+    def test_unknown_source_stays_unknown(self) -> None:
+        stats = ClientStats()
+        row = next(item for item in stats.endpoint_health(now_ms=1_000_000) if item["id"] == "funding_history")
+        assert row["status"] == "UNKNOWN"
+        assert row["failures_window"] == 0
+        assert row["last_success_ms"] is None
 
 
 class TestFundingNormalization:
@@ -826,6 +852,76 @@ class TestTradablePerpetuals:
         assert symbols == sorted(symbols), "结果应已排序"
 
 
+class TestPairExclusionChecker:
+    """剔除规则检查器（实时池与回测同一口径）。"""
+
+    @staticmethod
+    def _info(symbols: list[dict[str, object]]) -> dict[str, object]:
+        return {"symbols": symbols}
+
+    def test_passes_healthy_pair(self) -> None:
+        spot = self._info([
+            {"symbol": "AAUSDT", "status": "TRADING",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "10"}]},
+        ])
+        futures = self._info([
+            {"symbol": "AAUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+             "quoteAsset": "USDT",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "20"}]},
+        ])
+        check = make_pair_exclusion_checker(futures, spot, canary_notional=60.0)
+        assert check("AAUSDT") is None
+
+    def test_no_spot_pair(self) -> None:
+        futures = self._info([
+            {"symbol": "BBUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+             "quoteAsset": "USDT",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "10"}]},
+        ])
+        check = make_pair_exclusion_checker(futures, self._info([]), canary_notional=60.0)
+        assert check("BBUSDT") == "无现货交易对"
+
+    def test_non_trading_either_side(self) -> None:
+        spot = self._info([
+            {"symbol": "CCUSDT", "status": "HALTED",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "10"}]},
+        ])
+        futures = self._info([
+            {"symbol": "CCUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+             "quoteAsset": "USDT",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "10"}]},
+        ])
+        check = make_pair_exclusion_checker(futures, spot, canary_notional=60.0)
+        assert "非TRADING" in (check("CCUSDT") or "")
+
+    def test_min_notional_above_canary(self) -> None:
+        # 任一侧最小名义额 > canary 即剔除（如 BTCUSDT 现货 minNotional=100 > 60）
+        spot = self._info([
+            {"symbol": "BTCUSDT", "status": "TRADING",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "100"}]},
+        ])
+        futures = self._info([
+            {"symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+             "quoteAsset": "USDT",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "100"}]},
+        ])
+        check = make_pair_exclusion_checker(futures, spot, canary_notional=60.0)
+        assert "超canary" in (check("BTCUSDT") or "")
+
+    def test_min_notional_exactly_canary_passes(self) -> None:
+        spot = self._info([
+            {"symbol": "DDUSDT", "status": "TRADING",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "60"}]},
+        ])
+        futures = self._info([
+            {"symbol": "DDUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+             "quoteAsset": "USDT",
+             "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "60"}]},
+        ])
+        check = make_pair_exclusion_checker(futures, spot, canary_notional=60.0)
+        assert check("DDUSDT") is None
+
+
 # ---------------------------------------------------------------------------
 # 分页
 # ---------------------------------------------------------------------------
@@ -838,6 +934,9 @@ class TestPagination:
         """多页拉取必须取全；单页 limit 固定 FUNDING_PAGE_SIZE（大 limit 会被 WAF 403）。"""
         from cointrader.data.binance import FUNDING_PAGE_SIZE
 
+        # 页大小由配置决定（默认 500，2026-09-28 实测服务端单次返回上限即 500）；
+        # 这里用 100 显式构造，验证分页而不依赖默认值。
+        page_size = 100
         total = 250  # 需要 3 页（100+100+50）
         base_time = 1_700_000_000_000
         step = 28_800_000
@@ -862,7 +961,13 @@ class TestPagination:
 
         data_config = DataConfig(cache_dir=tmp_cache_dir)
         client = BinancePublicClient(
-            ApiConfig(), data_config, client=httpx.Client(transport=httpx.MockTransport(handler))
+            ApiConfig(),
+            data_config,
+            # 页大小按 venue 配置（此处统一成 page_size 以便验证分页）
+            universe=UniverseConfig(
+                mainnet_funding_page_size=page_size, demo_funding_page_size=page_size
+            ),
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
         records = client.funding_history("BTCUSDT", limit=total)
 
@@ -871,7 +976,9 @@ class TestPagination:
         assert times == sorted(times), "结果应按时间升序"
         assert len(set(times)) == total, "不应有重复记录"
         assert len(seen_limits) == 3, f"应分 3 页，实际 {len(seen_limits)} 次请求"
-        assert all(v == FUNDING_PAGE_SIZE for v in seen_limits), "单页 limit 必须 ≤ 100（防 WAF 403）"
+        assert all(v == page_size for v in seen_limits), (
+            f"单页 limit 必须等于配置的 funding_page_size={page_size}"
+        )
         client.close()
 
     def test_funding_history_exceeds_1000_nominal_cap(self, tmp_cache_dir: Path) -> None:
@@ -883,7 +990,8 @@ class TestPagination:
         """
         from cointrader.data.binance import FUNDING_MAX_LIMIT, FUNDING_PAGE_SIZE
 
-        total = FUNDING_MAX_LIMIT + 200  # 需要 12 页
+        page_size = 200  # demo 级页大小，让 1200 条需要 6 页，验证跨页取全
+        total = FUNDING_MAX_LIMIT + 200
         base_time = 1_700_000_000_000
         step = 4 * 3_600_000  # 4h 结算
         seen_limits: list[int] = []
@@ -907,15 +1015,23 @@ class TestPagination:
 
         data_config = DataConfig(cache_dir=tmp_cache_dir)
         client = BinancePublicClient(
-            ApiConfig(), data_config, client=httpx.Client(transport=httpx.MockTransport(handler))
+            ApiConfig(),
+            data_config,
+            # 页大小按 venue 配置（此处统一成 page_size 以便验证分页）
+            universe=UniverseConfig(
+                mainnet_funding_page_size=page_size, demo_funding_page_size=page_size
+            ),
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
         records = client.funding_history("BTCUSDT", limit=total)
 
         assert len(records) == total, f"应跨页取回全部 {total} 条，实际 {len(records)} 条"
         times = [r["fundingTime"] for r in records]
         assert times[-1] == base_time + (total - 1) * step, "近期（尾部）记录不得被截断"
-        assert len(seen_limits) == (total + FUNDING_PAGE_SIZE - 1) // FUNDING_PAGE_SIZE
-        assert all(v == FUNDING_PAGE_SIZE for v in seen_limits), "单页 limit 必须 ≤ 100（防 WAF 403）"
+        assert len(seen_limits) == (total + page_size - 1) // page_size
+        assert all(v == page_size for v in seen_limits), (
+            f"单页 limit 必须等于配置的 funding_page_size={page_size}"
+        )
         client.close()
 
     def test_funding_history_limit_below_1_rejected(self, tmp_cache_dir: Path) -> None:

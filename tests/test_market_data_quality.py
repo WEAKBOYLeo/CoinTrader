@@ -223,10 +223,10 @@ class TestQuoteGatePure:
 class _FakePublic:
     """最小公开行情 fake（与真实 premiumIndex 字段一致，无 lastPrice）。"""
 
-    def spot_price(self, symbol: str) -> str:  # noqa: ARG002
+    def spot_price(self, symbol: str, **_kw: object) -> str:  # noqa: ARG002
         return "81000.00"
 
-    def premium_index(self, symbol: str) -> dict[str, Any]:  # noqa: ARG002
+    def premium_index(self, symbol: str, **_kw: object) -> dict[str, Any]:  # noqa: ARG002
         return {
             "symbol": "BTCUSDT",
             "markPrice": "81044.91",
@@ -266,7 +266,7 @@ class TestRestAdapterProvenance:
 
     def test_fetch_failure_returns_none(self) -> None:
         class _Boom:
-            def spot_price(self, symbol: str) -> str:  # noqa: ARG002
+            def spot_price(self, symbol: str, **_kw: object) -> str:  # noqa: ARG002
                 raise RuntimeError("api down")
 
         assert _make_quote_fetcher(_Boom())("BTCUSDT") is None  # type: ignore[arg-type]

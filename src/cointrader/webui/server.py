@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..config import Config
+from ..observability.recovery import recovery_error_from_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,7 @@ def build_payload(
         "pnl": None,
         # T4：来自服务内存快照的数据状态区（服务未运行时为 None，不得渲染成 0）
         "market_data": service.get("market_data"),
+        "pool": service.get("pool"),
         # v5.0 T3：诊断信封（source/as_of/quality）与 cache 健康；
         # 服务未运行/诊断不可用时为 None（UNKNOWN），不得渲染为 0/RUNNING
         "market_data_envelope": service.get("market_data_envelope"),
@@ -163,6 +165,7 @@ def build_payload(
         "cache_stats": service.get("cache_stats"),
         "cache_stats_envelope": service.get("cache_stats_envelope"),
         "freshness": {},
+        "recovery_error": service.get("recovery_error"),
         "store_available": False,
     }
 
@@ -199,9 +202,27 @@ def build_payload(
                 e for e in queries.exchange_events(limit=20)
                 if str(e.get("event_type")) == "alert"
             ]
+            recovery_error = recovery_error_from_runtime(runtime, recon, now_ms=now_ms)
+            db_recovery_error = recovery_error
+            if isinstance(service.get("recovery_error"), dict):
+                recovery_error = {
+                    **(db_recovery_error or {}),
+                    **service["recovery_error"],
+                }
+                if db_recovery_error and db_recovery_error.get("last_reconciliation"):
+                    recovery_error["last_reconciliation"] = db_recovery_error[
+                        "last_reconciliation"
+                    ]
+            payload["recovery_error"] = recovery_error
             payload["status"] = {
                 "service_state": runtime.get("service_state", {}).get("value"),
                 "recovery_reason": runtime.get("recovery_reason", {}).get("value", ""),
+                "recovery_error": recovery_error,
+                "recovery_since_ms": (
+                    int(runtime["recovery_since_ms"]["value"])
+                    if runtime.get("recovery_since_ms", {}).get("value")
+                    else None
+                ),
                 "run_id": runtime.get("run_id", {}).get("value") or (latest_run or {}).get("run_id"),
                 "run": latest_run,
                 "online": queries.online_stats(now_ms),
@@ -317,6 +338,167 @@ def build_payload(
     return payload
 
 
+def _ledger_pool_payload(config: Config, now_ms: int) -> dict[str, Any] | None:
+    """服务重启/停止时从 LedgerQueryService 恢复最近 READY 候选。"""
+    db_path = config.resolved_path(config.execution.state_db)
+    if not db_path.exists():
+        return None
+    store = None
+    try:
+        from ..execution.store import StateStore
+        from ..ledger.service import LedgerQueryService
+        from ..strategy.funding_carry import CandidateInput, FundingCarryEvaluator
+
+        store = StateStore(db_path)
+        queries = LedgerQueryService(store)
+        runtime = queries.runtime_state()
+        mode = str(runtime.get("mode", {}).get("value") or config.execution.mode)
+        venue = {"live": "mainnet", "paper": "demo", "testnet": "demo", "shadow": "demo"}.get(
+            mode.lower(), ""
+        )
+        epochs = queries.scan_epochs(limit=1)
+        if not epochs:
+            return None
+        raw_epoch = epochs[0]
+        if str(raw_epoch.get("status")) != "READY":
+            return {
+                "as_of_ms": now_ms,
+                "venue": venue,
+                "epoch": {
+                    "id": raw_epoch.get("epoch_id"),
+                    "status": raw_epoch.get("status"),
+                    "created_ms": raw_epoch.get("created_ms"),
+                    "completed_ms": raw_epoch.get("completed_ms"),
+                    "decision_cutoff_ms": raw_epoch.get("decision_cutoff_ms"),
+                    "age_ms": max(0, now_ms - int(raw_epoch.get("created_ms") or now_ms)),
+                    "reason": raw_epoch.get("error") or "最近 epoch 非 READY",
+                    "expected": len(json.loads(raw_epoch.get("expected_json") or "[]")),
+                    "completed": None,
+                    "excluded_count": None,
+                    "failed_count": None,
+                },
+                "api_sources": None,
+                "stages": [],
+                "candidates": [],
+                "quality": "STALE",
+                "error": raw_epoch.get("error") or "最近 epoch 非 READY",
+            }
+        entry = config.strategy.entry
+        selection = config.strategy.selection
+        evaluator = FundingCarryEvaluator(config=config)
+        threshold = max(
+            Decimal(str(entry.min_trailing_annualized)),
+            Decimal(str(entry.min_annualized_rate)),
+        )
+        candidates: list[dict[str, Any]] = []
+        for snap in queries.candidate_snapshots(str(raw_epoch.get("epoch_id"))):
+            rates = tuple(Decimal(str(v)) for v in snap.get("rates", ()))
+            marks = tuple(Decimal(str(v)) for v in snap.get("mark_prices", ()))
+            timestamps = tuple(int(v) for v in snap.get("timestamps", ()))
+            volume = Decimal(str(snap.get("quote_volume_3d_avg") or "0"))
+            candidate = CandidateInput(
+                symbol=str(snap.get("symbol")), rates=rates, mark_prices=marks,
+                timestamps=timestamps, interval_hours=int(snap.get("interval_hours") or 8),
+                volume_3d_avg=volume, refreshed_ts_ms=int(snap.get("fetched_ms") or 0),
+            )
+            trailing, streak = evaluator.entry_metrics(candidate)
+            if trailing < threshold or streak < entry.min_consecutive_positive or volume < Decimal(str(selection.min_quote_volume_3d_avg)):
+                continue
+            avg = sum(rates[-entry.lookback_periods:], Decimal("0")) / Decimal(entry.lookback_periods) if len(rates) >= entry.lookback_periods else None
+            candidates.append({
+                "symbol": candidate.symbol,
+                "pool_status": "READY",
+                "current_funding_rate": None,
+                "latest_settled_rate": str(rates[-1]) if rates else None,
+                "average_rate_8h": str(avg) if avg is not None else None,
+                "trailing_annualized": str(trailing),
+                "threshold_min_trailing_annualized": str(entry.min_trailing_annualized),
+                "threshold_min_annualized_rate": str(entry.min_annualized_rate),
+                "effective_threshold": str(threshold),
+                "threshold_distance": str(max(threshold - trailing, Decimal("0"))),
+                "threshold_excess": str(max(trailing - threshold, Decimal("0"))),
+                "consecutive_positive_periods": streak,
+                "required_consecutive_positive": entry.min_consecutive_positive,
+                "quote_volume_3d_avg": str(volume),
+                "quote_volume_threshold": str(selection.min_quote_volume_3d_avg),
+                "volume_status": "FETCHED",
+                "open_qualification": "UNKNOWN_SERVICE_STOPPED",
+                "open_blockers": ["服务未运行；只显示最近完整 epoch，开仓资格 UNKNOWN"],
+                "funding_updated_ms": snap.get("fetched_ms"),
+                "latest_settled_ms": timestamps[-1] if timestamps else None,
+                "premium_fetched_ms": None,
+                "next_funding_time_ms": None,
+                "volume_window_end_ms": snap.get("volume_window_end_ms"),
+                "settle_interval_hours": snap.get("interval_hours") or 8,
+                "epoch_id": raw_epoch.get("epoch_id"),
+                "decision_cutoff_ms": raw_epoch.get("decision_cutoff_ms"),
+            })
+        candidates.sort(key=lambda row: (-Decimal(row["trailing_annualized"]), row["symbol"]))
+        expected = len(json.loads(raw_epoch.get("expected_json") or "[]"))
+        excluded = len(json.loads(raw_epoch.get("excluded_json") or "{}"))
+        failed = len(json.loads(raw_epoch.get("failed_json") or "{}"))
+        return {
+            "as_of_ms": now_ms,
+            "venue": venue,
+            "epoch": {
+                "id": raw_epoch.get("epoch_id"), "status": "READY",
+                "created_ms": raw_epoch.get("created_ms"), "completed_ms": raw_epoch.get("completed_ms"),
+                "decision_cutoff_ms": raw_epoch.get("decision_cutoff_ms"),
+                "age_ms": max(0, now_ms - int(raw_epoch.get("completed_ms") or raw_epoch.get("created_ms") or now_ms)),
+                "reason": "服务未运行；来自账本最近 READY epoch",
+                "expected": expected, "completed": expected - excluded - failed,
+                "excluded_count": excluded, "failed_count": failed,
+            },
+            "api_sources": None, "stages": [], "stages_freshness": "UNKNOWN",
+            "candidates": candidates, "quality": "STALE",
+            "error": "API 健康与实时当前费率在服务未运行时 UNKNOWN",
+        }
+    except Exception:  # noqa: BLE001 —— 只读恢复失败返回 UNKNOWN
+        logger.debug("从账本恢复币池 projection 失败", exc_info=True)
+        return None
+    finally:
+        if store is not None:
+            with contextlib.suppress(Exception):
+                store.close()
+
+
+def build_pool_payload(
+    config: Config,
+    state_provider: Callable[[], dict] | None = None,
+) -> dict[str, Any]:
+    """币池页独立只读 projection；绝不打开账本或调用交易所。"""
+    now_ms = int(time.time() * 1000)
+    try:
+        service = state_provider() if state_provider is not None else {}
+        pool = service.get("pool") if isinstance(service, dict) else None
+    except Exception as exc:  # noqa: BLE001 —— 页面局部降级
+        return {
+            "as_of_ms": now_ms,
+            "venue": None,
+            "epoch": None,
+            "api_sources": None,
+            "stages": [],
+            "candidates": [],
+            "quality": "UNKNOWN",
+            "error": f"币池诊断不可用: {type(exc).__name__}",
+        }
+    if isinstance(pool, dict):
+        return pool
+    recovered = _ledger_pool_payload(config, now_ms)
+    if recovered is not None:
+        return recovered
+    return {
+        "as_of_ms": now_ms,
+        "venue": None,
+        "epoch": None,
+        "api_sources": None,
+        "stages": [],
+        "candidates": [],
+        "quality": "UNKNOWN",
+        "error": "服务未运行或尚无币池快照",
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTTP 服务
 # ---------------------------------------------------------------------------
@@ -380,6 +562,10 @@ def _make_handler(
                 elif path == "/api/state":
                     self._send_json(
                         200, build_payload(self._ui.config, self._ui.state_provider)
+                    )
+                elif path == "/api/pool":
+                    self._send_json(
+                        200, build_pool_payload(self._ui.config, self._ui.state_provider)
                     )
                 else:
                     self._send_json(404, {"error": f"not found: {path}"})

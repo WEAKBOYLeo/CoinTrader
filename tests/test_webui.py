@@ -19,8 +19,9 @@ from pathlib import Path
 import pytest
 
 from cointrader.config import load_config
+from cointrader.execution.models import ReconciliationResult
 from cointrader.execution.store import StateStore
-from cointrader.webui.server import LiveWebUI, build_payload
+from cointrader.webui.server import LiveWebUI, build_payload, build_pool_payload
 
 
 @pytest.fixture()
@@ -34,6 +35,20 @@ def webui_config(project_root: Path, tmp_path: Path):
         webui_port=0,  # 随机空闲端口，避免测试间冲突
     )
     return dataclasses.replace(config, execution=execution)
+
+
+def test_build_pool_payload_is_read_only_projection(webui_config):
+    pool = {
+        "as_of_ms": 10,
+        "venue": "demo",
+        "epoch": {"id": "ep-1", "status": "READY"},
+        "api_sources": [],
+        "stages": [],
+        "candidates": [],
+        "quality": "OK",
+    }
+    result = build_pool_payload(webui_config, state_provider=lambda: {"pool": pool})
+    assert result == pool
 
 
 def test_build_payload_without_store(webui_config):
@@ -115,6 +130,61 @@ def test_build_payload_online_stats_cumulative(webui_config):
     assert run["run_id"] == "run-2"
 
 
+def test_build_payload_exposes_structured_recovery_error(webui_config):
+    store = StateStore(webui_config.execution.state_db)
+    store.set_runtime_state("service_state", "RECOVERY")
+    store.set_runtime_state("recovery_reason", "周期对账不一致")
+    store.set_runtime_state(
+        "recovery_diagnostic",
+        json.dumps({
+            "code": "RECONCILIATION_MISMATCH",
+            "message": "周期对账不一致",
+            "entered_at_ms": 100,
+            "last_retry_at_ms": 200,
+            "retry_count": 3,
+            "details": {"mismatches": ["BTCUSDT: Spot 余额不一致"]},
+        }, ensure_ascii=False),
+    )
+    store.record_reconciliation(
+        ReconciliationResult(
+            ts_ms=200,
+            consistent=False,
+            can_open=False,
+            mismatches=("BTCUSDT: Spot 余额不一致",),
+            repaired=(),
+            details={
+                "positions": {
+                    "BTCUSDT": {
+                        "spot": {
+                            "expected": "100",
+                            "actual": "98.5",
+                            "difference": "-1.5",
+                            "tolerance": "0.1",
+                            "within_tolerance": False,
+                        }
+                    }
+                }
+            },
+        ),
+        reason="recovery_check",
+    )
+    store.close()
+
+    payload = build_payload(webui_config, state_provider=lambda: {})
+    error = payload["recovery_error"]
+    assert error["code"] == "RECONCILIATION_MISMATCH"
+    assert error["retry_count"] == 3
+    assert error["affected"] == [{
+        "symbol": "BTCUSDT",
+        "market": "spot",
+        "expected": "100",
+        "actual": "98.5",
+        "difference": "-1.5",
+        "tolerance": "0.1",
+    }]
+    assert payload["status"]["recovery_error"] == error
+
+
 def test_build_payload_survives_bad_state_provider(webui_config):
     """state_provider 抛异常 → 降级为 {"error": ...}，其余区块不受影响。"""
     def boom() -> dict:
@@ -155,6 +225,12 @@ def test_live_webui_lifecycle(webui_config):
         assert payload["store_available"] is False
         assert "status" in payload and "positions" in payload
         assert "orders" in payload and "fills" in payload
+
+        code, body = get("/api/pool")
+        assert code == 200
+        pool = json.loads(body)
+        assert pool["quality"] == "UNKNOWN"
+        assert pool["epoch"] is None
 
         try:
             urllib.request.urlopen(f"http://{host}:{port}/nope", timeout=5)
@@ -294,7 +370,9 @@ class TestT4CurrentProjectionAndStatus:
             "state": "RUNNING",
             "market_data": {"epoch_id": "e-1", "status": "READY", "can_rank": True,
                             "expected": 3, "completed": 3, "failed_count": 0,
-                            "age_ms": 1000, "decision_cutoff_ms": 123},
+                            "age_ms": 1000, "decision_cutoff_ms": 123,
+                            "stages": [{"id": "funding_signal", "status": "DONE", "output_count": 2}],
+                            "stages_freshness": "FRESH", "stages_age_ms": 200},
             "market_data_envelope": {"source": "test-sync（诊断）", "as_of_ms": 1234,
                                      "quality": "OK"},
             "rate_limits": {"spot": {"limit": 6000, "in_flight": 1,
@@ -315,6 +393,8 @@ class TestT4CurrentProjectionAndStatus:
         }
         payload = build_payload(webui_config, state_provider=lambda: svc)
         assert payload["market_data"]["status"] == "READY"
+        assert payload["market_data"]["stages"][0]["id"] == "funding_signal"
+        assert payload["market_data"]["stages_freshness"] == "FRESH"
         assert payload["rate_limits"]["spot"]["in_flight"] == 1
         assert payload["freshness"]["ledger_sync_ok"] is True
         # v5.0 T3：诊断信封透传（source/as_of/quality + cache 健康）

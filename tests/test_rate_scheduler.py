@@ -80,6 +80,117 @@ def make_coordinator(
 
 
 class TestBudgetAndWindow:
+    def test_local_window_rolls_without_header(self) -> None:
+        """回归（生产日志 19:22~19:44）：不回 ``x-mbx-used-weight-1m`` 头的端点
+        （如 ``/fapi/v1/fundingRate``）只能本地记账。
+
+        旧 ``_release()`` 每次请求都把 ``window_start`` 推到当下，使窗口滚动条件
+        （now - window_start >= 60s）永不成立、``local_used`` 永不归零；一旦超过
+        P3 的 cap，每次 acquire 都判“本窗口已满”并等 60s，并发还会叠加成
+        116~118s 的虚假等待，预热因此卡死。
+
+        为让 cap 可达，这里把 futures 限额调小（200 → P3 cap = 200×0.5 = 100）。
+        """
+        fake = FakeClock()
+        coord = make_coordinator(fake, futures=200)
+        cap = 200 * (0.80 - 0.30)  # P3 上限 = 100
+        assert cap == 100.0
+
+        # 窗口内累加：每次 weight=10，10 次刚好填满 cap，全程不阻塞
+        for _ in range(10):
+            with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+                pass
+        assert coord.effective_used(FUT) == 100
+        assert fake.sleeps == [], f"窗口内不应阻塞: {fake.sleeps}"
+
+        # 超 cap：同一窗口内下一个请求必须等窗口滚动；
+        # 现在实现分小步轮询（每步 ≤ _WINDOW_POLL_SECONDS），因此断言
+        # “总等待 ≈ 一个窗口”而非“单次睡满 60s”，并验证轮询步长有界。
+        fake.sleeps.clear()
+        with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+            pass
+        assert fake.sleeps, "超 cap 应等待"
+        assert all(s <= 2.0 + 1e-9 for s in fake.sleeps), (
+            f"轮询步长必须有界（避免窗口已滚动却白等），实际 {fake.sleeps[:5]}"
+        )
+        assert sum(fake.sleeps) >= 59.0, (
+            f"同一窗口内总等待应接近 60s，实际 {sum(fake.sleeps)}"
+        )
+
+        # 关键回归：单调进入新窗口后 local_used 必须滚动归零。
+        # 旧实现每次 release 都重推 window_start，此处会继续报 60s。
+        fake.sleeps.clear()
+        fake.value += 61.0
+        with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+            pass
+        assert fake.sleeps == [], f"新窗口内首个请求不得阻塞: {fake.sleeps}"
+        assert coord.effective_used(FUT) == 10, "新窗口只应有本次权重"
+
+        # 再进一个新窗口，确认是稳定滚动而不是只归零一次
+        fake.value += 61.0
+        with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+            pass
+        assert fake.sleeps == [], f"第三个窗口仍被阻塞: {fake.sleeps}"
+        assert coord.effective_used(FUT) == 10
+
+    def test_stale_observation_falls_back_to_local(self) -> None:
+        """回归：观测值过期后必须失效，否则会被与当前无关的历史流量卡死。
+
+        ``x-mbx-used-weight-1m`` 描述服务端当前分钟窗口。旧实现把它当永久真相：
+        同出口 IP 的外部流量曾把服务端记账推到接近上限，之后即使窗口早已
+        滚动，每次 acquire 仍按那个旧值判“超预算”而等 60s（生产日志实测）。
+        """
+        fake = FakeClock()
+        coord = make_coordinator(fake, futures=200)
+        cap = 200 * (0.80 - 0.30)
+
+        # 外部流量把服务端记账推到接近 cap
+        coord.observe(FUT, int(cap) - 5, 200, None)
+        assert coord.effective_used(FUT) == int(cap) - 5
+
+        # 新鲜观测期内：新请求被正确挡住（不是限流失效）
+        with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+            pass
+        assert fake.sleeps, "新鲜高位观测必须仍然生效"
+
+        # 观测过期（超过一个窗口）后：不得再被旧值阻塞
+        fake.sleeps.clear()
+        fake.value += 61.0  # 超过一个 60s 服务端窗口
+        with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+            pass
+        assert fake.sleeps == [], f"过期观测不得继续封杀: {fake.sleeps}"
+
+        # 但诊断仍能看到那个旧值（带 age），不是静默丢弃
+        snap = coord.snapshot()[FUT]
+        assert snap.observed_used == int(cap) - 5
+        assert snap.observed_at is not None
+
+    def test_budget_wait_polls_bounded_steps(self) -> None:
+        """回归：预算不足时单次睡眠必须有界。
+
+        本地锚点（最后一次 header 观测时刻 / 本地窗口起点）可能早于服务端
+        真实窗口边界；睡满整个剩余窗口会让本进程在窗口已滚动后仍白等。
+        分小步睡，每步后重新评估，窗口一滚动立即放行。
+        """
+        fake = FakeClock()
+        coord = make_coordinator(fake, futures=200)
+        cap = 200 * (0.80 - 0.30)
+        coord.observe(FUT, int(cap) - 1, 200, None)
+
+        with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+            pass
+        assert fake.sleeps, "应发生等待"
+        assert all(s <= 2.0 + 1e-9 for s in fake.sleeps), (
+            f"单次睡眠必须有界，实际 {fake.sleeps[:5]}"
+        )
+
+        # 窗口滚动（服务端 header 回落）后立即放行，不再空等
+        fake.sleeps.clear()
+        coord.observe(FUT, 5, 200, None)
+        with coord.acquire(FUT, RequestPriority.P3_CANDIDATE, 10):
+            pass
+        assert fake.sleeps == [], f"header 回落后应立即放行: {fake.sleeps}"
+
     def test_header_rollover_updates_window(self) -> None:
         """响应头回落（服务端窗口滚动）后，被预算挡住的请求应放行。"""
         fake = FakeClock()
@@ -478,7 +589,10 @@ class TestSharedCoordinator:
         # → 被同一出口 IP 预算挡住：等待一个完整窗口后才放行（429 熔断兜底）
         result = signed.get("/fapi/v1/userTrades", {"symbol": "BTCUSDT"}, priority=RequestPriority.P3_CANDIDATE)
         assert result == {"serverTime": 1}
-        assert any(s >= 59.0 for s in fake.sleeps), "P3 请求必须被共享预算挡下等待窗口滚动"
+        # 共享预算生效：总等待至少一个窗口（实现分小步轮询，故看总时长）
+        assert sum(fake.sleeps) >= 59.0, (
+            f"P3 请求必须被共享预算挡下等待窗口滚动，实际 {fake.sleeps}"
+        )
 
         # 但 P1（恢复/对账）用保留预算立即放行：1199 + 5 <= 2400
         result = signed.get("/fapi/v2/account", priority=RequestPriority.P1_RECOVERY)

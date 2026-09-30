@@ -49,10 +49,18 @@ logger = logging.getLogger(__name__)
 #: 覆盖元数据格式版本。结构变更时递增，让旧索引整体失效（按 miss 重拉）。
 COVERAGE_FORMAT_VERSION = 1
 
-#: 覆盖索引 namespace（每 CoverageKey 一个文件，key = key_hash）。
-INDEX_NAMESPACE = "coverage_v1"
-#: 历史段数据 namespace（每段一个文件，ttl=None 永不过期）。
-SEGMENT_NAMESPACE = "hist_segments_v1"
+#: 覆盖索引 namespace 前缀（每 CoverageKey 一个文件，key = key_hash）。
+#: 实际 namespace 追加 ``_{venue}``，如 ``coverage_v1_mainnet``——
+#: demo 与主网的合约清单/历史均可不同，混用同一索引会让一个场地的请求
+#: 把另一个场地的数据当成“已覆盖”而跳过（静默串数据）。
+INDEX_NAMESPACE_PREFIX = "coverage_v1"
+#: 历史段数据 namespace 前缀（每段一个文件，ttl=None 永不过期）。
+SEGMENT_NAMESPACE_PREFIX = "hist_segments_v1"
+
+
+def _namespaced(prefix: str, venue: str) -> str:
+    """拼出 venue 隔离的 cache namespace。"""
+    return f"{prefix}_{venue}"
 
 #: 常被使用的 K 线周期 → 毫秒数。回测对齐资金费结算时间、闭合判定都要用。
 #: （由 data/klines.py 迁入本模块，klines.py 保留 re-export 不破坏既有 import。）
@@ -325,6 +333,23 @@ class HistoricalRepository:
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
+    # -- venue 隔离的 namespace ------------------------------------------------
+
+    @property
+    def _venue(self) -> str:
+        """本仓库绑定的 venue（取自客户端，缺属性时保守回退主网）。"""
+        return str(getattr(self._client, "venue_name", "mainnet"))
+
+    @property
+    def index_namespace(self) -> str:
+        """该 venue 的覆盖索引 namespace。"""
+        return _namespaced(INDEX_NAMESPACE_PREFIX, self._venue)
+
+    @property
+    def segment_namespace(self) -> str:
+        """该 venue 的历史段数据 namespace。"""
+        return _namespaced(SEGMENT_NAMESPACE_PREFIX, self._venue)
+
     # -- single-flight -------------------------------------------------------
 
     def _lock_for(self, key_hash: str) -> threading.Lock:
@@ -345,6 +370,7 @@ class HistoricalRepository:
         end_ms: int,
         *,
         limit: int,
+        closed_at_ms: int | None = None,
     ) -> HistoricalDatasetResult:
         """永续 K 线历史区间 ``[start_ms, end_ms)``（按 open time，仅已闭合）。
 
@@ -354,7 +380,7 @@ class HistoricalRepository:
         if start_ms >= end_ms:
             raise ValueError(f"start_ms 必须 < end_ms: {start_ms} >= {end_ms}")
         key = CoverageKey(
-            venue="binance", market="futures", dataset=_DATASET_KLINES,
+            venue=self._venue, market="futures", dataset=_DATASET_KLINES,
             symbol=symbol, interval=interval,
         )
         interval_ms = INTERVAL_MS[interval]
@@ -365,7 +391,8 @@ class HistoricalRepository:
 
         def horizon_ms() -> int:
             # 闭合边界（exclusive）：open <= now - interval_ms ⇔ open < now - interval_ms + 1
-            return self._client.futures_time() - interval_ms + 1
+            closed_at = closed_at_ms if closed_at_ms is not None else self._client.futures_time()
+            return closed_at - interval_ms + 1
 
         return self._fetch_range(
             key,
@@ -387,6 +414,7 @@ class HistoricalRepository:
         end_ms: int,
         *,
         limit: int,
+        settled_at_ms: int | None = None,
     ) -> HistoricalDatasetResult:
         """资金费历史区间 ``[start_ms, end_ms)``（按 fundingTime，半开）。
 
@@ -398,14 +426,20 @@ class HistoricalRepository:
         if limit < 1:
             raise ValueError(f"limit 必须 >= 1，当前 {limit}")
         key = CoverageKey(
-            venue="binance", market="futures", dataset=_DATASET_FUNDING, symbol=symbol,
+            venue=self._venue, market="futures", dataset=_DATASET_FUNDING, symbol=symbol,
         )
 
         def horizon_ms() -> int:
-            # 只有严格早于交易所当前时间的结算事件才视为已发生（毫秒抖动保守）。
-            return self._client.futures_time()
+            # epoch 调用复用统一 server cutoff；其它调用现场取交易所时间。
+            return settled_at_ms if settled_at_ms is not None else self._client.futures_time()
 
-        from .binance import FUNDING_PAGE_SIZE  # 函数内 import 避免循环引用
+        from .binance import FUNDING_PAGE_SIZE  # 回退默认值（避免循环引用）
+
+        # 页大小必须与客户端实际发出的 limit 一致：两者都取自
+        # ``UniverseConfig.funding_page_size_for(venue)``。若这里用模块常量而客户端
+        # 用 venue 配置值，两者不等时会把“已到配置上限的满页”误判为短页，
+        # 提前终止分页 → 静默少拉数据。
+        page_size = int(getattr(self._client, "funding_page_size", FUNDING_PAGE_SIZE))
 
         return self._fetch_range(
             key,
@@ -416,7 +450,7 @@ class HistoricalRepository:
             page_fetch=lambda cursor, gap_end: self._client._funding_page(
                 symbol, start_ms=cursor, end_ms=gap_end - 1
             ),
-            page_limit=FUNDING_PAGE_SIZE,
+            page_limit=page_size,
             horizon_ms_fn=horizon_ms,
         )
 
@@ -475,7 +509,7 @@ class HistoricalRepository:
         for seg in index_segments:
             if clip_to_requested(seg.range, requested) is None:
                 continue
-            entry = self._cache.get(SEGMENT_NAMESPACE, seg.segment_key)
+            entry = self._cache.get(self.segment_namespace, seg.segment_key)
             records = entry.data if entry is not None else None
             if records is not None and self._verify_records(records, seg, identity_of):
                 cache_hits += 1
@@ -572,7 +606,7 @@ class HistoricalRepository:
 
     def _load_index(self, key: CoverageKey, key_hash: str) -> list[CoverageSegment]:
         """读覆盖索引；文件损坏/版本不符/key 不符 → 空列表（整体按 miss）。"""
-        entry = self._cache.get(INDEX_NAMESPACE, key_hash)
+        entry = self._cache.get(self.index_namespace, key_hash)
         if entry is None:
             return []
         payload = entry.data
@@ -691,8 +725,8 @@ class HistoricalRepository:
             "key": key.to_dict(),
             "segments": [seg.to_dict() for seg in segments],
         }
-        self._cache.put(INDEX_NAMESPACE, key_hash, payload, ttl=None)
-        readback = self._cache.get(INDEX_NAMESPACE, key_hash)
+        self._cache.put(self.index_namespace, key_hash, payload, ttl=None)
+        readback = self._cache.get(self.index_namespace, key_hash)
         if readback is None or readback.data != payload:
             logger.warning("覆盖索引写回校验失败: %s", key.symbol)
             return False
@@ -709,8 +743,8 @@ class HistoricalRepository:
         """段数据原子落盘 + 读回 checksum 验证；失败返回 None（不推进覆盖）。"""
         checksum = canonical_checksum(records)
         segment_key = make_key(key_hash, start_ms, end_ms, checksum)
-        self._cache.put(SEGMENT_NAMESPACE, segment_key, records, ttl=None)
-        entry = self._cache.get(SEGMENT_NAMESPACE, segment_key)
+        self._cache.put(self.segment_namespace, segment_key, records, ttl=None)
+        entry = self._cache.get(self.segment_namespace, segment_key)
         if (
             entry is None
             or not isinstance(entry.data, list)
@@ -754,8 +788,8 @@ class HistoricalRepository:
 
 __all__ = [
     "COVERAGE_FORMAT_VERSION",
-    "INDEX_NAMESPACE",
-    "SEGMENT_NAMESPACE",
+    "INDEX_NAMESPACE_PREFIX",
+    "SEGMENT_NAMESPACE_PREFIX",
     "INTERVAL_MS",
     "CoverageKey",
     "CoverageSegment",

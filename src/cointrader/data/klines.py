@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -463,6 +464,69 @@ def tradable_perpetuals(
     return sorted(result)
 
 
+def make_pair_exclusion_checker(
+    futures_info: dict[str, Any],
+    spot_info: dict[str, Any],
+    *,
+    canary_notional: float,
+) -> Callable[[str], str | None]:
+    """构造剔除规则检查器（实时池与回测同一口径，§实时策略候选池）。
+
+    与实时路径 ``_pair_exclusion_reason`` 同规则：
+    - 无现货交易对 → 剔除（策略现货腿开不了）
+    - 现货/永续任一侧非 TRADING → 剔除（停牌/退市过渡）
+    - 任一侧最小名义额 > ``canary_notional`` → 剔除（单 pair 名义额硬顶下单必被拒）
+
+    Args:
+        futures_info: 永续 ``exchangeInfo`` 原始 JSON。
+        spot_info: 现货 ``exchangeInfo`` 原始 JSON。
+        canary_notional: 单 pair 名义额硬顶（USDT，``execution.canary_notional``）。
+
+    Returns:
+        ``symbol -> 剔除原因``；None = 通过。
+    """
+
+    def _min_notional(entry: dict[str, Any]) -> float | None:
+        for f in entry.get("filters", []):
+            if f.get("filterType") == "MIN_NOTIONAL":
+                raw = f.get("minNotional")
+                try:
+                    return float(raw) if raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    futures_rules = {
+        str(e["symbol"]): e
+        for e in futures_info.get("symbols", [])
+        if isinstance(e, dict) and e.get("symbol")
+    }
+    spot_rules = {
+        str(e["symbol"]): e
+        for e in spot_info.get("symbols", [])
+        if isinstance(e, dict) and e.get("symbol")
+    }
+
+    def check(symbol: str) -> str | None:
+        spot_rule = spot_rules.get(symbol)
+        if spot_rule is None:
+            return "无现货交易对"
+        perp_rule = futures_rules.get(symbol)
+        if perp_rule is None:
+            return "无永续交易对"
+        for name, rule in (("现货", spot_rule), ("永续", perp_rule)):
+            status = rule.get("status")
+            if status and status != "TRADING":
+                return f"{name}非TRADING({status})"
+        for name, rule in (("现货", spot_rule), ("永续", perp_rule)):
+            min_notional = _min_notional(rule)
+            if min_notional is not None and canary_notional < min_notional:
+                return f"{name}最小名义额{min_notional}超canary"
+        return None
+
+    return check
+
+
 __all__ = [
     "INTERVAL_MS",
     "KLINE_COLUMNS",
@@ -475,5 +539,6 @@ __all__ = [
     "historical_quote_volume_3d_avg",
     "klines_to_frame",
     "parse_symbol_rules",
+    "make_pair_exclusion_checker",
     "tradable_perpetuals",
 ]

@@ -33,6 +33,7 @@ from typing import Any, Protocol
 from ..config import Config
 from ..data.funding import normalize_funding_records_to_8h
 from ..errors import CoinTraderError
+from ..strategy.funding_carry import CandidateInput, FundingCarryEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,14 @@ class CandidateSnapshot:
     quote_volume_3d_avg: Decimal
     fetched_ms: int
     error: str = ""
+    # Funding 历史统一到 8h 桶后保留原始结算周期与最近已结算事件，
+    # 供监控展示，不参与新的策略判定。
+    settle_interval_hours: int = 8
+    latest_settled_rate: Decimal | None = None
+    latest_settled_ms: int | None = None
+    # ``NOT_REQUESTED`` is meaningful: funding pre筛未通过时没有请求 3 日 K 线，
+    # 不能把默认 0 渲染成真实成交额。
+    volume_status: str = "NOT_REQUESTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +247,8 @@ class MarketDataSynchronizer:
         now_fn: Callable[[], float] = time.time,
         excluded_symbols: Mapping[str, str] | None = None,
         exclusion_fn: Callable[[str], str | None] | None = None,
+        long_history_symbols_fn: Callable[[], set[str]] | None = None,
+        epoch_persist_fn: Callable[[ScanEpoch, Mapping[str, CandidateSnapshot]], None] | None = None,
     ) -> None:
         self._config = config
         self._data = data
@@ -245,6 +256,8 @@ class MarketDataSynchronizer:
         self._server_time = server_time_fn
         self._excluded_symbols: dict[str, str] = dict(excluded_symbols or {})
         self._exclusion_fn = exclusion_fn
+        self._long_history_symbols_fn = long_history_symbols_fn
+        self._epoch_persist_fn = epoch_persist_fn
 
         self._lock = threading.Lock()
         self._building: _EpochBuilder | None = None
@@ -254,6 +267,11 @@ class MarketDataSynchronizer:
         self._worker: threading.Thread | None = None
         self._epoch_seq = 0
         self._epoch_snapshots: dict[str, dict[str, CandidateSnapshot]] = {}
+        self._premium_index: dict[str, dict[str, Any]] = {}
+        self._last_premium_refresh_ms = 0
+        self._stage_lock = threading.Lock()
+        self._stage_stats: dict[str, dict[str, Any]] = {}
+        self._stage_perf_started: dict[str, float] = {}
         # 旧版 fake provider 可能不支持 end_ms 关键字；不支持时由 synchronizer
         # 自行按 cutoff 过滤（语义等价）。
         self._funding_supports_end_ms = _accepts_end_ms(data.funding_rates)
@@ -342,6 +360,163 @@ class MarketDataSynchronizer:
             }[epoch.status],
         )
 
+    def _reset_stage_stats(self, now_ms: int) -> None:
+        stages = (
+            ("universe", "合约池"),
+            ("volume_24h", "24h成交额"),
+            ("pair_rules", "交易规则"),
+            ("funding_data", "资金费数据"),
+            ("funding_signal", "资金费信号"),
+            ("volume_3d", "3日成交额"),
+            ("ready", "READY横截面"),
+        )
+        with self._stage_lock:
+            self._stage_stats = {
+                stage_id: {
+                    "id": stage_id,
+                    "label": label,
+                    "status": "WAITING",
+                    "input_count": None,
+                    "output_count": None,
+                    "duration_ms": None,
+                    "started_at_ms": None,
+                    "completed_at_ms": None,
+                    "updated_at_ms": now_ms,
+                    "excluded_count": None,
+                    "failed_count": None,
+                    "error": None,
+                }
+                for stage_id, label in stages
+            }
+            self._stage_perf_started = {}
+
+    def _stage_start(self, stage_id: str, *, input_count: int | None = None) -> None:
+        now_ms = int(self._now() * 1000)
+        with self._stage_lock:
+            stage = self._stage_stats.get(stage_id)
+            if stage is None:
+                return
+            stage.update({
+                "status": "RUNNING",
+                "input_count": input_count,
+                "started_at_ms": now_ms,
+                "updated_at_ms": now_ms,
+                "error": None,
+            })
+            self._stage_perf_started[stage_id] = time.perf_counter()
+
+    def _stage_done(
+        self,
+        stage_id: str,
+        *,
+        output_count: int | None = None,
+        excluded_count: int | None = None,
+        failed_count: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        now_ms = int(self._now() * 1000)
+        with self._stage_lock:
+            stage = self._stage_stats.get(stage_id)
+            if stage is None:
+                return
+            started = self._stage_perf_started.pop(stage_id, None)
+            stage.update({
+                "status": "FAILED" if error else "DONE",
+                "output_count": output_count,
+                "excluded_count": excluded_count,
+                "failed_count": failed_count,
+                "completed_at_ms": now_ms,
+                "updated_at_ms": now_ms,
+                "duration_ms": (
+                    round((time.perf_counter() - started) * 1000, 1)
+                    if started is not None else None
+                ),
+                "error": error,
+            })
+
+    def _refresh_premium_if_due(self) -> None:
+        """按短 TTL 批量刷新最终候选的当前费率，不逐币请求。"""
+        now_ms = int(self._now() * 1000)
+        if now_ms - self._last_premium_refresh_ms < 5_000:
+            return
+        with self._lock:
+            epoch = self._latest
+            snapshots = dict(self._epoch_snapshots.get(epoch.epoch_id, ())) if epoch and epoch.status is ScanEpochStatus.READY else {}
+        if not snapshots:
+            return
+        min_volume = Decimal(str(self._config.strategy.selection.min_quote_volume_3d_avg))
+        symbols = tuple(
+            sorted(
+                symbol for symbol, snapshot in snapshots.items()
+                if snapshot.volume_status == "FETCHED"
+                and snapshot.quote_volume_3d_avg >= min_volume
+                and not snapshot.error
+            )
+        )
+        if symbols:
+            self._refresh_premium_index(symbols)
+            self._last_premium_refresh_ms = now_ms
+
+    def premium_snapshots(self) -> Mapping[str, dict[str, Any]]:
+        """最近一次批量 premiumIndex 快照；WebUI 只读，不触发网络请求。"""
+        with self._lock:
+            return {symbol: dict(value) for symbol, value in self._premium_index.items()}
+
+    def _refresh_premium_index(self, symbols: tuple[str, ...]) -> None:
+        """在 epoch 后台构建阶段批量刷新当前费率。
+
+        provider 没有该能力时保持 UNKNOWN；刷新失败不使历史 epoch 从 READY
+        变成失败，避免实时展示反过来改变筛选完整性闸门。
+        """
+        refresh = getattr(self._data, "refresh_premium_index", None)
+        if not callable(refresh) or not symbols:
+            return
+        try:
+            payload = refresh(symbols)
+            if not isinstance(payload, Mapping):
+                return
+            with self._lock:
+                self._premium_index = {
+                    str(symbol): dict(value)
+                    for symbol, value in payload.items()
+                    if isinstance(value, Mapping)
+                }
+        except Exception as exc:  # noqa: BLE001 —— 当前费率失败只局部降级
+            logger.warning("premiumIndex 批量刷新失败（候选当前费率显示 UNKNOWN）: %s", exc)
+
+    def stage_readiness(self, now_ms: int | None = None) -> dict[str, Any]:
+        """阶段级筛选诊断；只读副本，供 WebUI 展示数量/耗时/新鲜度。"""
+        now = now_ms if now_ms is not None else int(self._now() * 1000)
+        with self._stage_lock:
+            stages = [dict(stage) for stage in self._stage_stats.values()]
+        for stage in stages:
+            updated = stage.get("updated_at_ms")
+            stage["age_ms"] = max(0, now - int(updated)) if updated else None
+            stage["quality"] = (
+                "OK" if stage["status"] == "DONE"
+                else "DEGRADED" if stage["status"] == "FAILED"
+                else "STALE" if stage["status"] == "RUNNING"
+                else "UNKNOWN"
+            )
+        latest = max(
+            (int(stage["updated_at_ms"]) for stage in stages if stage.get("updated_at_ms")),
+            default=0,
+        )
+        freshness_window = max(
+            30_000,
+            int(self._config.execution.candidate_refresh_seconds * 2_000),
+        )
+        return {
+            "stages": stages,
+            "as_of_ms": now,
+            "age_ms": max(0, now - latest) if latest else None,
+            "freshness": (
+                "UNKNOWN" if not latest
+                else "FRESH" if now - latest <= freshness_window
+                else "STALE"
+            ),
+        }
+
     # -- 触发 -----------------------------------------------------------------
 
     def trigger_refresh(self) -> str | None:
@@ -394,6 +569,7 @@ class MarketDataSynchronizer:
             try:
                 self.trigger_refresh()
                 self._expire_ready_if_needed()
+                self._refresh_premium_if_due()
                 with self._lock:
                     builder = self._building
                 if builder is not None:
@@ -414,10 +590,20 @@ class MarketDataSynchronizer:
 
     def _start_building_locked(self, now_ms: int) -> _EpochBuilder:
         """调用方持有 lock。universe 快照 + cutoff + expected/excluded 划分。"""
+        self._reset_stage_stats(now_ms)
+        self._stage_start("universe")
         try:
             universe = tuple(self._data.tradable_universe())
+        except Exception as exc:
+            self._stage_done("universe", error=f"{type(exc).__name__}: {exc}")
+            raise EpochBuildError(f"universe 快照失败: {type(exc).__name__}: {exc}") from exc
+        self._stage_done("universe", output_count=len(universe), excluded_count=0, failed_count=0)
+
+        self._stage_start("volume_24h", input_count=len(universe))
+        try:
             volumes = {str(k): float(v) for k, v in self._data.quote_volume_24h().items()}
         except Exception as exc:
+            self._stage_done("volume_24h", error=f"{type(exc).__name__}: {exc}")
             raise EpochBuildError(f"universe 快照失败: {type(exc).__name__}: {exc}") from exc
 
         selection = self._config.strategy.selection
@@ -427,8 +613,15 @@ class MarketDataSynchronizer:
         max_n = int(self._config.execution.candidate_pool_max_symbols)
         if max_n > 0:
             pool = pool[:max_n]
+        self._stage_done(
+            "volume_24h",
+            output_count=len(pool),
+            excluded_count=len(universe) - len(pool),
+            failed_count=0,
+        )
 
-        cutoff_ms = self._server_time() if self._server_time is not None else now_ms
+        self._stage_start("pair_rules", input_count=len(pool))
+
         self._epoch_seq += 1
         epoch_id = f"ep-{now_ms}-{self._epoch_seq}"
         deadline_ms = int(self._config.execution.scan_epoch_deadline_seconds * 1000)
@@ -447,7 +640,14 @@ class MarketDataSynchronizer:
                 excluded[symbol] = reason
             else:
                 expected.append(symbol)
+        self._stage_done(
+            "pair_rules",
+            output_count=len(expected),
+            excluded_count=len(excluded),
+            failed_count=0,
+        )
 
+        cutoff_ms = self._server_time() if self._server_time is not None else now_ms
         builder = _EpochBuilder(
             epoch_id=epoch_id,
             universe_snapshot_ts_ms=now_ms,
@@ -467,42 +667,118 @@ class MarketDataSynchronizer:
         return builder
 
     def _fill_builder(self, builder: _EpochBuilder) -> None:
-        """按有界并发补齐 expected 候选；全部到齐则封存 READY。
+        """先筛 funding，再为通过者补成交额 K 线，减少逐币请求。
 
-        每轮 fill 是一个独立的完整横截面尝试：重置上轮的 snapshots/failed
-        后重新拉取（失败 symbol 在 deadline 内自然重试）。
+        未持仓候选只需入场窗口；持仓候选保留完整退出窗口。成交额是入场
+        条件，在 funding 信号筛选后再读取。任何已开始的第二阶段请求失败仍
+        计 failed，不能把数据缺失伪装成策略未通过。
         """
         builder.snapshots = {}
         builder.failed = {}
         if not builder.expected_symbols:
+            self._stage_done("ready", output_count=0)
             self._seal(builder, now_ms=builder.created_ms)
             return
+        self._stage_start("ready", input_count=len(builder.expected_symbols))
         concurrency = int(self._config.execution.candidate_refresh_concurrency)
         entry = self._config.strategy.entry
         exit_cfg = self._config.strategy.exit
-        periods = max(
+        entry_periods = entry.lookback_periods + entry.min_consecutive_positive + 5
+        full_periods = max(
             entry.lookback_periods + entry.min_consecutive_positive,
             exit_cfg.exit_lookback_periods,
         ) + 5
+        try:
+            long_symbols = set(self._long_history_symbols_fn() if self._long_history_symbols_fn else ())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取持仓长历史 symbol 失败，按无持仓处理: %s", exc)
+            long_symbols = set()
 
-        def fetch(symbol: str) -> CandidateSnapshot:
-            return self._fetch_candidate(builder, symbol, periods)
+        evaluator = FundingCarryEvaluator(config=self._config, now_fn=self._now)
+
+        def fetch_funding(symbol: str) -> CandidateSnapshot:
+            periods = full_periods if symbol in long_symbols else entry_periods
+            return self._fetch_candidate(builder, symbol, periods, fetch_volume=False)
+
+        self._stage_start("funding_data", input_count=len(builder.expected_symbols))
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            initial = list(pool.map(fetch_funding, builder.expected_symbols))
+
+        for snapshot in initial:
+            if snapshot.error:
+                builder.failed[snapshot.symbol] = snapshot.error
+                continue
+            builder.snapshots[snapshot.symbol] = snapshot
+        self._stage_done(
+            "funding_data",
+            output_count=len(builder.snapshots),
+            excluded_count=0,
+            failed_count=len(builder.failed),
+            error=(f"{len(builder.failed)} 个 symbol 失败" if builder.failed else None),
+        )
+
+        self._stage_start("funding_signal", input_count=len(builder.snapshots))
+        signal_targets: list[CandidateSnapshot] = []
+        for snapshot in builder.snapshots.values():
+            if self._passes_entry_signal(snapshot, evaluator):
+                signal_targets.append(snapshot)
+        self._stage_done(
+            "funding_signal",
+            output_count=len(signal_targets),
+            excluded_count=len(builder.snapshots) - len(signal_targets),
+            failed_count=0,
+        )
+
+        volume_targets = list(signal_targets)
+        signal_symbols = {s.symbol for s in signal_targets}
+        volume_targets.extend(
+            snapshot
+            for snapshot in builder.snapshots.values()
+            if snapshot.symbol in long_symbols and snapshot.symbol not in signal_symbols
+        )
+
+        self._stage_start("volume_3d", input_count=len(volume_targets))
+        def fetch_volume(snapshot: CandidateSnapshot) -> CandidateSnapshot:
+            return self._fetch_volume(snapshot)
 
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-            results = list(pool.map(fetch, builder.expected_symbols))
-
-        for snapshot in results:
+            completed = list(pool.map(fetch_volume, volume_targets))
+        for snapshot in completed:
             if snapshot.error:
                 builder.failed[snapshot.symbol] = snapshot.error
             else:
                 builder.snapshots[snapshot.symbol] = snapshot
-        # failed 与 completed 互斥：失败的不进 snapshots
+        min_volume = Decimal(str(self._config.strategy.selection.min_quote_volume_3d_avg))
+        volume_pass_count = sum(
+            1
+            for snapshot in completed
+            if not snapshot.error and snapshot.quote_volume_3d_avg >= min_volume
+        )
+        self._stage_done(
+            "volume_3d",
+            output_count=volume_pass_count,
+            excluded_count=sum(
+                1
+                for snapshot in completed
+                if not snapshot.error and snapshot.quote_volume_3d_avg < min_volume
+            ),
+            failed_count=len(builder.failed),
+            error=(f"{len(builder.failed)} 个 symbol 失败" if builder.failed else None),
+        )
+
+        # 一次批量请求覆盖最终候选；页面轮询只读该快照，不按币逐个请求。
+        final_symbols = tuple(
+            sorted(
+                snapshot.symbol
+                for snapshot in completed
+                if not snapshot.error and snapshot.volume_status == "FETCHED"
+                and snapshot.quote_volume_3d_avg >= min_volume
+            )
+        )
+        self._refresh_premium_index(final_symbols)
+
         for symbol in list(builder.failed):
             builder.snapshots.pop(symbol, None)
-        # 上一轮失败、本轮成功的：清掉失败标记
-        for symbol in list(builder.failed):
-            if symbol in builder.snapshots:
-                builder.failed.pop(symbol, None)
         newly_ready = not builder.failed
 
         with self._lock:
@@ -511,24 +787,91 @@ class MarketDataSynchronizer:
             return  # 已被取消/替换（不应发生，单 worker 串行）
         now_ms = int(self._now() * 1000)
         if newly_ready:
+            self._stage_done(
+                "ready",
+                output_count=len(builder.snapshots),
+                excluded_count=len(builder.excluded),
+                failed_count=len(builder.failed),
+            )
             self._seal(builder, now_ms=now_ms)
         elif now_ms >= builder.expires_ms:
             builder.error = "截止时仍未完整（见 failed 明细）"
+            self._stage_done(
+                "ready",
+                output_count=len(builder.snapshots),
+                excluded_count=len(builder.excluded),
+                failed_count=len(builder.failed),
+                error=builder.error,
+            )
             self._seal(builder, now_ms=now_ms, status=ScanEpochStatus.DEGRADED)
 
-    def _fetch_candidate(
-        self, builder: _EpochBuilder, symbol: str, periods: int
-    ) -> CandidateSnapshot:
-        """拉取单个候选并校验 cutoff 不变量；任何失败带 error 返回（failed 而非 excluded）。
+    def _passes_entry_signal(
+        self, snapshot: CandidateSnapshot, evaluator: FundingCarryEvaluator
+    ) -> bool:
+        """只用 funding 指标判断是否值得读取精确 3 日成交额。"""
+        candidate = CandidateInput(
+            symbol=snapshot.symbol,
+            rates=snapshot.rates,
+            mark_prices=snapshot.mark_prices,
+            timestamps=snapshot.timestamps,
+            interval_hours=snapshot.interval_hours,
+            volume_3d_avg=Decimal("0"),
+            refreshed_ts_ms=snapshot.fetched_ms,
+        )
+        trailing, streak = evaluator.entry_metrics(candidate)
+        threshold = max(
+            Decimal(str(self._config.strategy.entry.min_trailing_annualized)),
+            Decimal(str(self._config.strategy.entry.min_annualized_rate)),
+        )
+        return trailing >= threshold and streak >= self._config.strategy.entry.min_consecutive_positive
 
-        费率统一聚合到 8h 结算桶（与回测同口径）：4h 币每桶 2 期、1h 币
-        每桶 8 期，桶费率 = 桶内求和。候选的「期」一律 = 8h 日历天，
-        避免不同周期币的决策窗口/持有期/交易频率语义漂移。
+    def _fetch_volume(self, snapshot: CandidateSnapshot) -> CandidateSnapshot:
+        """为已通过 funding 的候选补精确成交额；不重复请求 funding。"""
+        try:
+            if self._volume_supports_end_ms:
+                volume = self._data.quote_volume_3d_avg(
+                    snapshot.symbol, end_ms=snapshot.volume_window_end_ms
+                )
+            else:
+                volume = self._data.quote_volume_3d_avg(snapshot.symbol)
+            return replace(
+                snapshot,
+                quote_volume_3d_avg=Decimal(str(volume)),
+                fetched_ms=int(self._now() * 1000),
+                volume_status="FETCHED",
+            )
+        except Exception as exc:  # noqa: BLE001 —— 已开始请求，失败必须显式进入 failed
+            return replace(
+                snapshot,
+                error=f"{type(exc).__name__}: {exc}",
+                volume_status="FAILED",
+            )
+
+    def _fetch_candidate(
+        self,
+        builder: _EpochBuilder,
+        symbol: str,
+        periods: int,
+        *,
+        fetch_volume: bool = True,
+    ) -> CandidateSnapshot:
+        """拉取 funding，并可选补成交额；任何已请求失败都显式进入 failed。
+
+        funding 与成交额分阶段：未通过入场 funding 条件的候选不请求 K 线。
         """
         cutoff = builder.decision_cutoff_ms
+        declared_hours: int | None = None
+        raw: list[tuple[int, Decimal, Decimal]] = []
         try:
-            # 原始事件数 = 目标 8h 桶数 × 每桶最多 8 期（1h 币），保证桶数充足
-            raw_periods = periods * 8
+            # FundingInfo 给出实际结算间隔。8h 桶需要 8/interval 个事件；
+            # 周期未知时按最密集的 1h 保守读取，避免漏窗口。
+            declared_hours = _declared_interval_hours(self._data, symbol)
+            events_per_bucket = (
+                8 // declared_hours
+                if declared_hours in (1, 2, 4, 8)
+                else 8
+            )
+            raw_periods = periods * events_per_bucket
             if self._funding_supports_end_ms:
                 raw = self._data.funding_rates(symbol, raw_periods, end_ms=cutoff)
             else:
@@ -551,7 +894,6 @@ class MarketDataSynchronizer:
             # （>3 个间隔未出结算）仍能抓住。间隔取 fundingInfo 声明值
             # （动态周期币历史混合间隔，最小间隔推断会误判）；不能用
             # 「cutoff 整点结算未到账」判滞后（刚发生的结算 API 可能未返回）
-            declared_hours = _declared_interval_hours(self._data, symbol)
             settle_ms = (
                 declared_hours * 3600 * 1000
                 if declared_hours is not None
@@ -561,14 +903,19 @@ class MarketDataSynchronizer:
                 raise ValueError(
                     f"最后结算 {last_raw_ts[-1]} 距 cutoff {cutoff} 超过 3 个结算间隔，结算滞后"
                 )
-            # 取「闭合时间 <= cutoff 的最后一根 4h K 线」的闭合时间
+            # 取「闭合时间 <= cutoff 的最后一根 4h K 线」的闭合时间。
+            # 第一阶段只记录窗口边界；第二阶段才请求 K 线。
             volume_end_ms = (cutoff // _KLINE_INTERVAL_MS + 1) * _KLINE_INTERVAL_MS
             if volume_end_ms > cutoff:
                 volume_end_ms -= _KLINE_INTERVAL_MS
-            if self._volume_supports_end_ms:
-                volume = self._data.quote_volume_3d_avg(symbol, end_ms=volume_end_ms)
-            else:
-                volume = self._data.quote_volume_3d_avg(symbol)
+            volume = Decimal("0")
+            if fetch_volume:
+                if self._volume_supports_end_ms:
+                    volume = self._data.quote_volume_3d_avg(
+                        symbol, end_ms=volume_end_ms
+                    )
+                else:
+                    volume = self._data.quote_volume_3d_avg(symbol)
         except Exception as exc:  # noqa: BLE001 —— failed 语义：网络/限流/解析/结算滞后
             return CandidateSnapshot(
                 epoch_id=builder.epoch_id,
@@ -582,6 +929,10 @@ class MarketDataSynchronizer:
                 quote_volume_3d_avg=Decimal("0"),
                 fetched_ms=int(self._now() * 1000),
                 error=f"{type(exc).__name__}: {exc}",
+                settle_interval_hours=declared_hours or 8,
+                latest_settled_rate=Decimal(str(raw[-1][1])) if "raw" in locals() and raw else None,
+                latest_settled_ms=int(raw[-1][0]) if "raw" in locals() and raw else None,
+                volume_status="FAILED" if fetch_volume else "NOT_REQUESTED",
             )
         return CandidateSnapshot(
             epoch_id=builder.epoch_id,
@@ -595,6 +946,10 @@ class MarketDataSynchronizer:
             quote_volume_3d_avg=Decimal(str(volume)),
             fetched_ms=int(self._now() * 1000),
             error="",
+            settle_interval_hours=declared_hours or 8,
+            latest_settled_rate=Decimal(str(raw[-1][1])),
+            latest_settled_ms=int(raw[-1][0]),
+            volume_status="FETCHED" if fetch_volume else "NOT_REQUESTED",
         )
 
     def _seal(
@@ -612,7 +967,7 @@ class MarketDataSynchronizer:
         for symbol, snap in builder.snapshots.items():
             if snap.timestamps:
                 last_ts[symbol] = int(snap.timestamps[-1])
-                intervals[symbol] = int(snap.interval_hours)
+                intervals[symbol] = int(snap.settle_interval_hours)
         epoch = ScanEpoch(
             epoch_id=builder.epoch_id,
             universe_snapshot_ts_ms=builder.universe_snapshot_ts_ms,
@@ -636,6 +991,11 @@ class MarketDataSynchronizer:
             else:
                 self._epoch_snapshots.pop(epoch.epoch_id, None)
             self._trim_locked()
+        if self._epoch_persist_fn is not None:
+            try:
+                self._epoch_persist_fn(epoch, dict(builder.snapshots))
+            except Exception as exc:  # noqa: BLE001 —— 持久化失败不伪造 READY，但不阻断内存闸门
+                logger.warning("scan epoch %s 诊断持久化失败: %s", epoch.epoch_id, exc)
         logger.info(
             "scan epoch %s 封存为 %s（expected=%d excluded=%d failed=%d）",
             epoch.epoch_id, status.value,

@@ -26,12 +26,10 @@ from typing import Any
 import httpx
 import pytest
 
-from cointrader.config import ApiConfig, DataConfig, RateLimitConfig
+from cointrader.config import ApiConfig, DataConfig, RateLimitConfig, UniverseConfig
 from cointrader.data.binance import BinancePublicClient
 from cointrader.data.coverage import (
     COVERAGE_FORMAT_VERSION,
-    INDEX_NAMESPACE,
-    SEGMENT_NAMESPACE,
     CoverageKey,
     HistoricalDatasetResult,
     canonical_checksum,
@@ -41,6 +39,7 @@ from cointrader.data.coverage import (
     merge_intervals,
     subtract_intervals,
 )
+from cointrader.data.venue import Venue
 from cointrader.domain.market import DataQuality
 from cointrader.errors import BinanceError, ParseError, RateLimitError
 from cointrader.rate_limit import RateLimitCoordinator, RateLimitScope
@@ -170,17 +169,30 @@ def make_client(
     tmp_cache_dir: Path,
     *,
     sleep_calls: list[float] | None = None,
+    funding_page_size: int | None = None,
 ) -> BinancePublicClient:
-    """MockTransport 客户端（短退避、不真睡），缓存目录为临时目录。"""
+    """MockTransport 客户端（短退避、不真睡），缓存目录为临时目录。
+
+    ``funding_page_size``：资金费分页单页条数（None = 用配置默认值）。
+    验证分页行为时显式传小页，不把测试钉在默认值上。
+    """
     data_config = DataConfig(
         cache_dir=tmp_cache_dir,
         rate_limit=RateLimitConfig(
             base_backoff_seconds=0.001, max_backoff_seconds=0.01, max_retries=2
         ),
     )
+    # 页大小现在按 venue 配置（主网/ demo 的 WAF 阈值不同）
+    universe = UniverseConfig()
+    if funding_page_size is not None:
+        universe = UniverseConfig(
+            mainnet_funding_page_size=funding_page_size,
+            demo_funding_page_size=funding_page_size,
+        )
     return BinancePublicClient(
         ApiConfig(),
         data_config,
+        universe=universe,
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep_fn=(sleep_calls.append if sleep_calls is not None else lambda _s: None),
     )
@@ -230,7 +242,7 @@ def make_flaky_client(handler: Any, tmp_cache_dir: Path) -> tuple[BinancePublicC
 
 def read_index(tmp_cache_dir: Path, key: CoverageKey) -> dict[str, Any] | None:
     """直接读磁盘上的覆盖索引（验证元数据/checksum/版本可校验）。"""
-    path = tmp_cache_dir / INDEX_NAMESPACE / f"{key.key_hash()}.json"
+    path = tmp_cache_dir / "coverage_v1_mainnet" / f"{key.key_hash()}.json"
     if not path.is_file():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -240,15 +252,20 @@ def read_index(tmp_cache_dir: Path, key: CoverageKey) -> dict[str, Any] | None:
     return data
 
 
+#: 测试客户端的 venue（BinancePublicClient 默认 MAINNET）；
+#: CoverageKey.venue 必须与之一致，否则 key_hash 失配、读不到索引。
+_VENUE = Venue.MAINNET.value
+
+
 def klines_key(symbol: str, interval: str = "8h") -> CoverageKey:
     return CoverageKey(
-        venue="binance", market="futures", dataset="futures_klines",
+        venue=_VENUE, market="futures", dataset="futures_klines",
         symbol=symbol, interval=interval,
     )
 
 
 def funding_key(symbol: str) -> CoverageKey:
-    return CoverageKey(venue="binance", market="futures", dataset="funding_history", symbol=symbol)
+    return CoverageKey(venue=_VENUE, market="futures", dataset="funding_history", symbol=symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +309,7 @@ class TestCoverageKeyAndChecksum:
     def test_key_hash_stable_and_distinct(self) -> None:
         a = klines_key("BTCUSDT", "8h")
         b = CoverageKey(
-            venue="binance", market="futures", dataset="futures_klines",
+            venue=_VENUE, market="futures", dataset="futures_klines",
             symbol="BTCUSDT", interval="8h",
         )
         assert a.key_hash() == b.key_hash()
@@ -305,16 +322,16 @@ class TestCoverageKeyAndChecksum:
 
     def test_key_validation(self) -> None:
         with pytest.raises(ValueError):
-            CoverageKey(venue="binance", market="futures", dataset="futures_klines",
+            CoverageKey(venue=_VENUE, market="futures", dataset="futures_klines",
                        symbol="BTCUSDT", interval="bogus")
         with pytest.raises(ValueError):
-            CoverageKey(venue="binance", market="futures", dataset="futures_klines",
+            CoverageKey(venue=_VENUE, market="futures", dataset="futures_klines",
                        symbol="", interval="8h")
         with pytest.raises(ValueError):
-            CoverageKey(venue="binance", market="futures", dataset="nope",
+            CoverageKey(venue=_VENUE, market="futures", dataset="nope",
                        symbol="BTCUSDT", interval="")
         with pytest.raises(ValueError):
-            CoverageKey(venue="binance", market="futures", dataset="funding_history",
+            CoverageKey(venue=_VENUE, market="futures", dataset="funding_history",
                        symbol="BTCUSDT", interval="8h")
 
     def test_checksum_stable_and_sensitive(self) -> None:
@@ -543,7 +560,7 @@ class TestCoverageKlines:
                 "BTCUSDT", "8h", BASE, BASE + 4 * H8, limit=1500
             )
         assert read_index(tmp_cache_dir, klines_key("BTCUSDT")) is None
-        assert list((tmp_cache_dir / SEGMENT_NAMESPACE).glob("*.json")) == []
+        assert list((tmp_cache_dir / "hist_segments_v1_mainnet").glob("*.json")) == []
         # 冻结等待经假时钟完成（非真实等待）
         assert fake_clock.sleeps
         flaky.close()
@@ -587,7 +604,7 @@ class TestCoverageKlines:
                 "BTCUSDT", "8h", BASE, BASE + 4 * H8, limit=2
             )
         assert read_index(tmp_cache_dir, klines_key("BTCUSDT")) is None
-        assert list((tmp_cache_dir / SEGMENT_NAMESPACE).glob("*.json")) == []
+        assert list((tmp_cache_dir / "hist_segments_v1_mainnet").glob("*.json")) == []
         client.close()
 
     def test_partial_failure_checkpoint_and_resume(self, tmp_cache_dir: Path) -> None:
@@ -634,7 +651,7 @@ class TestCoverageKlines:
         first = repo.fetch_futures_klines("BTCUSDT", "8h", BASE, BASE + 4 * H8, limit=1500)
         assert len(first.records) == 4
 
-        index_path = tmp_cache_dir / INDEX_NAMESPACE / f"{klines_key('BTCUSDT').key_hash()}.json"
+        index_path = tmp_cache_dir / "coverage_v1_mainnet" / f"{klines_key('BTCUSDT').key_hash()}.json"
         index_path.write_text("{ 这不是合法 JSON", encoding="utf-8")
 
         server.reset()
@@ -657,7 +674,7 @@ class TestCoverageKlines:
         key = klines_key("BTCUSDT")
         index = read_index(tmp_cache_dir, key)
         assert index is not None and len(index["segments"]) == 2
-        seg_path = tmp_cache_dir / SEGMENT_NAMESPACE / f"{index['segments'][0]['segment_key']}.json"
+        seg_path = tmp_cache_dir / "hist_segments_v1_mainnet" / f"{index['segments'][0]['segment_key']}.json"
         payload = json.loads(seg_path.read_text(encoding="utf-8"))
         payload["data"][0][4] = "999999"  # 篡改收盘价
         seg_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -717,7 +734,7 @@ class TestCoverageKlines:
         assert seg_meta["complete"] is True
         assert seg_meta["format_version"] == COVERAGE_FORMAT_VERSION
 
-        seg_path = tmp_cache_dir / SEGMENT_NAMESPACE / f"{seg_meta['segment_key']}.json"
+        seg_path = tmp_cache_dir / "hist_segments_v1_mainnet" / f"{seg_meta['segment_key']}.json"
         seg_data = json.loads(seg_path.read_text(encoding="utf-8"))["data"]
         assert canonical_checksum(seg_data) == seg_meta["checksum"]
         client.close()
@@ -747,7 +764,7 @@ class TestCoverageKlines:
         rc = repo.fetch_futures_klines("AAAUSDT", "4h", BASE, BASE + 4 * H8, limit=1500)
         assert len(rc.records) == 8  # [BASE, BASE+32h) 含 8 根 4h K 线
 
-        index_files = list((tmp_cache_dir / INDEX_NAMESPACE).glob("*.json"))
+        index_files = list((tmp_cache_dir / "coverage_v1_mainnet").glob("*.json"))
         assert len(index_files) == 3  # AAA-8h / BBB-8h / AAA-4h
         client.close()
 
@@ -795,7 +812,7 @@ class TestCoverageKlines:
         index = read_index(tmp_cache_dir, klines_key("BTCUSDT"))
         assert index is not None and len(index["segments"]) == 1
         seg_meta = index["segments"][0]
-        seg_path = tmp_cache_dir / SEGMENT_NAMESPACE / f"{seg_meta['segment_key']}.json"
+        seg_path = tmp_cache_dir / "hist_segments_v1_mainnet" / f"{seg_meta['segment_key']}.json"
         seg_data = json.loads(seg_path.read_text(encoding="utf-8"))["data"]
         assert canonical_checksum(seg_data) == seg_meta["checksum"]
         assert seg_meta["record_count"] == 4
@@ -814,7 +831,7 @@ class TestCoverageFunding:
         now = BASE + 8 * H8 + 3_600_000
         events = [make_funding_event(BASE + i * H8) for i in range(8)]
         server = FakeHistoryServer(server_now_ms=now, funding={"BTCUSDT": events})
-        client = make_client(server.handle, tmp_cache_dir)
+        client = make_client(server.handle, tmp_cache_dir, funding_page_size=100)
         repo = client.historical_repository
 
         result = repo.fetch_funding_history("BTCUSDT", BASE, BASE + 6 * H8, limit=1000)
@@ -822,7 +839,7 @@ class TestCoverageFunding:
         assert result.quality is DataQuality.FRESH
         assert result.covered_ranges == [(BASE, BASE + 6 * H8)]
         assert len(server.funding_pages()) == 1
-        # 单页 limit 固定 100（防 WAF 403）
+        # 单页 limit 等于配置的 funding_page_size
         assert server.funding_pages()[0]["limit"] == "100"
 
         server.reset()
@@ -830,6 +847,31 @@ class TestCoverageFunding:
         assert [r["fundingTime"] for r in result2.records] == [r["fundingTime"] for r in result.records]
         assert server.data_requests() == []
         assert client.stats.historical_cache_hits == 1
+        client.close()
+
+    def test_default_page_size_is_500(self, tmp_cache_dir: Path) -> None:
+        """默认分页 500 条：一年 8h 结算（1095 条）只需 3 页。
+
+        回归：旧值 100 需 11 页，而 2026-09-28 实测 500 与 100 的 RTT 几乎相同
+        （0.51s vs 0.49s）——多出的 8 次请求是纯浪费。同时防止 coverage 的
+        page_limit 与客户端 limit 不一致而把满页误判为短页。
+        """
+        total = 1095
+        now = BASE + (total + 2) * H8 + 3_600_000
+        events = [make_funding_event(BASE + i * H8) for i in range(total)]
+        server = FakeHistoryServer(server_now_ms=now, funding={"BTCUSDT": events})
+        client = make_client(server.handle, tmp_cache_dir)  # 用配置默认页大小
+        repo = client.historical_repository
+
+        result = repo.fetch_funding_history(
+            "BTCUSDT", BASE, BASE + total * H8, limit=total + 10
+        )
+        assert len(result.records) == total
+        assert result.quality is DataQuality.FRESH
+        pages = server.funding_pages()
+        assert pages, "应有网络请求"
+        assert all(p["limit"] == "500" for p in pages), "默认单页必须是 500"
+        assert len(pages) == 3, f"1095 条按 500/页应 3 页，实际 {len(pages)}"
         client.close()
 
     def test_half_open_boundary(self, tmp_cache_dir: Path) -> None:
@@ -857,7 +899,7 @@ class TestCoverageFunding:
         end = BASE + total * h4 + h4  # 比最后一条事件多一个步长
         now = end + 3_600_000
         server = FakeHistoryServer(server_now_ms=now, funding={"BTCUSDT": events})
-        client = make_client(server.handle, tmp_cache_dir)
+        client = make_client(server.handle, tmp_cache_dir, funding_page_size=100)
         repo = client.historical_repository
 
         r1 = repo.fetch_funding_history("BTCUSDT", BASE, end, limit=150)
@@ -984,7 +1026,7 @@ class TestClientCompatibility:
         # legacy 语义：无 startTime → 假服务器返回 open <= end 的全部 5 根（含端）
         assert len(raw) == 5
         # legacy 路径走短 TTL namespace，不产生覆盖索引
-        assert list((tmp_cache_dir / INDEX_NAMESPACE).glob("*.json")) == []
+        assert list((tmp_cache_dir / "coverage_v1_mainnet").glob("*.json")) == []
         assert (tmp_cache_dir / "futures_klines").is_dir()
         client.close()
 
@@ -1002,8 +1044,8 @@ class TestT4CrossFault:
         client = make_client(server.handle, tmp_cache_dir)
 
         def counts() -> tuple[int, int, int]:
-            idx_files = len(list((tmp_cache_dir / INDEX_NAMESPACE).glob("*.json")))
-            seg_files = len(list((tmp_cache_dir / SEGMENT_NAMESPACE).glob("*.json")))
+            idx_files = len(list((tmp_cache_dir / "coverage_v1_mainnet").glob("*.json")))
+            seg_files = len(list((tmp_cache_dir / "hist_segments_v1_mainnet").glob("*.json")))
             index = read_index(tmp_cache_dir, klines_key("BTCUSDT"))
             seg_count = len(index["segments"]) if index else 0
             return (idx_files, seg_files, seg_count)

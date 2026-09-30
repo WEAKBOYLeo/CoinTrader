@@ -110,6 +110,84 @@ class TestConsistency:
         assert result.can_open is False
         assert any("Spot 余额不一致" in m for m in result.mismatches)
 
+    def test_spot_base_asset_fee_does_not_create_false_mismatch(self, env: dict) -> None:
+        env["store"].record_fill(
+            Fill(
+                fill_id="f-beamx-buy",
+                client_order_id="ct-beamx",
+                symbol="BEAMXUSDT",
+                market=Market.SPOT,
+                side=OrderSide.BUY,
+                quantity=Decimal("29702"),
+                price=Decimal("0.00202"),
+                fee_asset="BEAMX",
+                fee_amount=Decimal("29.702"),
+                ts_ms=1,
+            )
+        )
+        env["spot"].balances_map["BEAMX"] = Decimal("29672.298")
+        env["perp"].positions_list.append(
+            {"symbol": "BEAMXUSDT", "positionSide": "BOTH", "positionAmt": "0"}
+        )
+
+        result = env["reconciler"].run()
+        assert result.consistent is True
+        assert result.can_open is True
+
+    def test_relative_position_tolerance_applies_to_both_legs(self, env: dict) -> None:
+        env["store"].record_fill(spot_fill("BTCUSDT", "1000"))
+        env["store"].record_fill(
+            Fill(
+                fill_id="f-btc-perp",
+                client_order_id="ct-perp",
+                symbol="BTCUSDT",
+                market=Market.PERP,
+                side=OrderSide.SELL,
+                quantity=Decimal("1000"),
+                price=Decimal("100"),
+                fee_asset="USDT",
+                fee_amount=Decimal("0"),
+                ts_ms=2,
+            )
+        )
+        env["spot"].balances_map["BTC"] = Decimal("999.5")
+        env["perp"].positions_list.append(
+            {"symbol": "BTCUSDT", "positionSide": "BOTH", "positionAmt": "-999.5"}
+        )
+
+        result = env["reconciler"].run()
+        assert result.consistent is True
+        assert result.can_open is True
+
+    def test_relative_position_tolerance_exceeded_reports_threshold(self, env: dict) -> None:
+        env["store"].record_fill(spot_fill("BTCUSDT", "1000"))
+        env["store"].record_fill(
+            Fill(
+                fill_id="f-btc-perp-over",
+                client_order_id="ct-perp-over",
+                symbol="BTCUSDT",
+                market=Market.PERP,
+                side=OrderSide.SELL,
+                quantity=Decimal("1000"),
+                price=Decimal("100"),
+                fee_asset="USDT",
+                fee_amount=Decimal("0"),
+                ts_ms=2,
+            )
+        )
+        env["spot"].balances_map["BTC"] = Decimal("998.9")
+        env["perp"].positions_list.append(
+            {"symbol": "BTCUSDT", "positionSide": "BOTH", "positionAmt": "-998.9"}
+        )
+
+        result = env["reconciler"].run()
+        assert result.consistent is False
+        assert result.can_open is False
+        assert all("容差=1.000" in mismatch for mismatch in result.mismatches)
+        positions = result.details["positions"]
+        assert positions["BTCUSDT"]["spot"]["tolerance"] == "1.000"
+        assert positions["BTCUSDT"]["perp"]["tolerance"] == "1.000"
+
     def test_perp_position_mismatch_blocks_open(self, env: dict) -> None:
         env["store"].record_fill(
             Fill(

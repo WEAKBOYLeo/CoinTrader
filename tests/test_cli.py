@@ -618,7 +618,30 @@ class TestPortfolioVolumeCoverage:
                 pass
 
             def futures_exchange_info(self) -> dict[str, object]:
-                return {}
+                return {
+                    "symbols": [
+                        {
+                            "symbol": s,
+                            "status": "TRADING",
+                            "contractType": "PERPETUAL",
+                            "quoteAsset": "USDT",
+                            "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "10"}],
+                        }
+                        for s in ("AAUSDT", "BBUSDT")
+                    ]
+                }
+
+            def spot_exchange_info(self, symbol: object | None = None) -> dict[str, object]:
+                return {
+                    "symbols": [
+                        {
+                            "symbol": s,
+                            "status": "TRADING",
+                            "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "10"}],
+                        }
+                        for s in ("AAUSDT", "BBUSDT")
+                    ]
+                }
 
             def __enter__(self) -> _FakeClient:
                 return self
@@ -686,6 +709,44 @@ class TestPortfolioVolumeCoverage:
             "池内每个币都必须有成交量数据（含重试恢复的币），"
             f"缺: {captured['rates'] - captured['vols']}"
         )
+
+
+class TestRecoveryErrorStatus:
+    def test_status_json_exposes_recovery_error_from_legacy_reconciliation(
+        self, clean_env, tmp_path: Path
+    ) -> None:
+        import json as _json
+
+        from cointrader.cli import cmd_live_status
+        from cointrader.execution.models import ReconciliationResult
+        from cointrader.execution.store import StateStore
+
+        db = tmp_path / "t.sqlite3"
+        store = StateStore(db)
+        store.set_runtime_state("service_state", "RECOVERY")
+        store.set_runtime_state("recovery_reason", "周期对账不一致")
+        store.record_reconciliation(
+            ReconciliationResult(
+                ts_ms=100,
+                consistent=False,
+                can_open=False,
+                mismatches=("BTCUSDT: Spot 余额不一致",),
+                repaired=(),
+                details={"positions": {"BTCUSDT": {"spot": {
+                    "expected": "100", "actual": "99", "difference": "-1"
+                }}}},
+            ),
+            reason="recovery_check",
+        )
+        store.close()
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(f"execution:\n  state_db: {db}\n", encoding="utf-8")
+
+        code, output = run_command(cmd_live_status, config=config_path, json=True)
+        assert code == 0
+        error = _json.loads(output)["recovery_error"]
+        assert error["code"] == "RECONCILIATION_MISMATCH"
+        assert error["last_reconciliation"]["mismatches"] == ["BTCUSDT: Spot 余额不一致"]
 
 
 class TestV5T3ServiceDiagnostics:

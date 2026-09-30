@@ -113,7 +113,8 @@ def make_held(symbol: str = "BTCUSDT", *, age_periods: int = 0,
 def make_strategy(tmp_path: Path, data: FakeStrategyData, *,
                   config: Config | None = None,
                   strategy_version: str = "strat-test-v1",
-                  now_fn: Any = None) -> tuple[LiveStrategy, StateStore]:
+                  now_fn: Any = None,
+                  exclusion_fn: Any = None) -> tuple[LiveStrategy, StateStore]:
     store = StateStore(tmp_path / "trading.sqlite3")
     cfg = config or make_live_config(live_symbols=tuple(data._rates.keys()) or ("BTCUSDT",))  # noqa: SLF001
     strat = LiveStrategy(
@@ -123,6 +124,7 @@ def make_strategy(tmp_path: Path, data: FakeStrategyData, *,
         strategy_version=strategy_version,
         config_hash="cfg-test",
         now_fn=now_fn or (lambda: NOW),
+        exclusion_fn=exclusion_fn,
     )
     return strat, store
 

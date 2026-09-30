@@ -129,6 +129,23 @@ class TestNormalizeQty:
         with pytest.raises(RuleError):
             normalize_qty(Decimal("0.005"), rules, is_market=True)
 
+    def test_market_lot_size_zero_falls_back_to_lot_size(self) -> None:
+        """币安 spot MARKET_LOT_SIZE 实测 stepSize=0/minQty=0 = 无独立约束
+        （市价单仍受 LOT_SIZE 约束，demo 实测）。0 必须回退 LOT_SIZE 口径，
+        不得当 0 步长用（回归：动态池小币开仓 PLAN_FAILED「step 必须为正」）。"""
+        rules = make_rules(
+            step_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            market_step_size=Decimal("0"),
+            market_min_qty=Decimal("0"),
+            market_max_qty=Decimal("2084502"),
+        )
+        assert rules.qty_step(is_market=True) == Decimal("1")
+        assert rules.min_qty_for(is_market=True) == Decimal("1")
+        assert normalize_qty(Decimal("5.7"), rules, is_market=True) == Decimal("5")
+        with pytest.raises(RuleError):
+            normalize_qty(Decimal("0.4"), rules, is_market=True)
+
 
 class TestCheckNotional:
     def test_below_min_notional_rejected(self) -> None:

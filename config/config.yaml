@@ -60,6 +60,34 @@ costs:
   assume_all_taker: true
 
 # ---------------------------------------------------------------------------
+# 交易场地与币池（universe）
+#
+# venue 由 execution.mode 推导，不在此显式配置：
+#   paper / testnet / shadow → demo（testnet 端点即 demo 域名）
+#   live                     → mainnet
+# 此处只声明各 venue 的端点，供 exchangeInfo（币池来源）使用。
+#
+# ⚠️ 回测契约：回测永远使用 **mainnet** 历史（data/coverage.py 的覆盖索引
+# 以 mainnet 为 venue）。本节点不影响回测，也不允许把 demo 池喂给回测。
+# ---------------------------------------------------------------------------
+universe:
+  venues:
+    mainnet:
+      futures_base: https://fapi.binance.com
+      spot_base: https://api.binance.com
+      # 资金费历史分页单页条数。2026-09-28 实测主网 limit=500 正常；
+      # 500/1000 均只返回 500 条，且 RTT 与 100 几乎相同（0.51s vs 0.49s），
+      # 故 500 纯粹是省请求数（一年 8h 结算 12 页 → 3 页）。
+      funding_page_size: 500
+    demo:
+      futures_base: https://demo-fapi.binance.com
+      spot_base: https://demo-api.binance.com
+      # ⚠️ demo 的 /fapi/v1/fundingRate 有更严的 WAF 阈值：实测 limit≤200 为
+      # 200，limit≥210 稳定 403（同一 host 的 klines/exchangeInfo 无此限制，
+      # 故是路由级阈值而非 IP 封禁）。设成 500 会让 demo 全量预热 100% 403。
+      funding_page_size: 200
+
+# ---------------------------------------------------------------------------
 # 回测
 # ---------------------------------------------------------------------------
 backtest:
@@ -119,8 +147,8 @@ strategy:
     max_positions: 3
     # 每个币种的目标名义额占初始资金比例
     per_position_weight: 0.33
-    # 3 天滑动平均日成交额门槛（USDT）
-    min_quote_volume_3d_avg: 1_000_000
+    # 3 天滑动平均日成交额门槛（USDT；实时池同值作 24h 成交额闸门）
+    min_quote_volume_3d_avg: 10_000_000
     # 排除的币种（稳定币对等）
     exclude_bases: ["USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP"]
 
@@ -182,6 +210,8 @@ execution:
   # 对账忽略的平台发放资产（demo 现货账户自带 USDC 5000）
   reconcile_ignore_assets: [USDC]
   reconciliation_interval_seconds: 30
+  # Spot/Perp 持仓对账相对容差：0.001 = 0.1%，另取交易步长下限
+  reconciliation_qty_tolerance_pct: 0.001
   max_market_data_age_seconds: 5.0
   max_leg_slippage_pct: 0.001    # 单腿滑点保护 0.1%
   hedge_tolerance_pct: 0.005     # 两腿数量容差 0.5%
@@ -191,6 +221,10 @@ execution:
   max_consecutive_tick_errors: 10
   # 主循环看门狗心跳超时（秒）：心跳超时 = 主线程挂死 → 非 0 退出，systemd 拉起
   watchdog_timeout_seconds: 300
+  # RECOVERY 卡死升级（秒）：启动后（曾达 RUNNING）持续停留在 RECOVERY 超过该时长
+  # = 自愈路径失效（如用户流 untrusted 卡死）→ 优雅停机退出码 1，systemd 重启重新预检。
+  # 启动阶段的长 RECOVERY（补账/epoch 构建）不计入，不触发本升级。
+  recovery_escalation_seconds: 900
   # WebUI 实时仪表盘：随 live run 启动，只读、独立线程、故障不影响主循环
   # 浏览器访问 http://<本机IP>:8888/
   webui_enabled: true
@@ -205,11 +239,12 @@ execution:
   time_resync_seconds: 300
   # 实时策略候选池（§7.1）：
   #   空列表 = 动态候选池（回测同口径）：全部可交易 USDT 永续（排除 exclude_bases）
-  #            → 24h 成交额 >= selection.min_quote_volume_3d_avg → 按量取 top N；
+  #            → 先跑剔除规则（无现货对/任一侧非 TRADING/最小名义额 > canary）
+  #            → 24h 成交额 >= selection.min_quote_volume_3d_avg（无 top N 上限）；
   #   非空    = 固定候选列表（单 pair 闭环 / 手工选币模式）。
   live_symbols: []
   # 动态候选池最大 symbol 数（0 = 不限；越大 Binance API 权重开销越大）
-  candidate_pool_max_symbols: 100
+  candidate_pool_max_symbols: 0
   # 动态候选池刷新周期（秒）；失败保留旧池
   universe_refresh_seconds: 1800
   # 候选后台刷新有界并发（共享 weight 调度，1..16）；2026-09-21 实测 4 并发

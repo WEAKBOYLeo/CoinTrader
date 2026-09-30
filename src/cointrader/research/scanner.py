@@ -47,6 +47,7 @@ from ..data.funding import (
     trailing_annualized,
 )
 from ..data.klines import fetch_historical_quote_volume_3d_avg, tradable_perpetuals
+from ..data.venue import venue_for_execution_mode
 from ..errors import CoinTraderError, InsufficientDataError
 from ..research.costs import CostModel, LiquidityTier, classify_liquidity
 
@@ -148,7 +149,12 @@ class FundingScanner:
 
     def __init__(self, config: Config, client: BinancePublicClient | None = None) -> None:
         self.config = config
-        self.client = client or BinancePublicClient(config.api, config.data)
+        self.client = client or BinancePublicClient(
+            config.api,
+            config.data,
+            universe=config.universe,
+            venue=venue_for_execution_mode(config.execution.mode),
+        )
         self.cost_model = CostModel(config.costs)
 
     def close(self) -> None:

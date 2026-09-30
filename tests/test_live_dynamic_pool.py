@@ -63,6 +63,30 @@ class TestDynamicPoolSelection:
         assert "EEEUSDT" not in strat.candidate_symbols
         assert len(strat.candidate_symbols) == 4
 
+    def test_exclusion_rules_applied_before_volume(self, tmp_path):
+        # BBB 成交额够高但被剔除规则淘汰（如最小名义额超 canary）→ 不进池
+        strat, _ = make_strategy(
+            tmp_path,
+            _data(),
+            config=_dyn_config(candidate_pool_max_symbols=0),
+            exclusion_fn=lambda s: "最小名义额超canary" if s == "BBBUSDT" else None,
+        )
+        strat.refresh_universe()
+        # max_n=0 = 不限：AAA/CCC/DDD 全进池，BBB 被剔除
+        assert list(strat.candidate_symbols) == ["AAAUSDT", "CCCUSDT", "DDDUSDT"]
+
+    def test_exclusion_runs_before_top_n(self, tmp_path):
+        # 剔除规则**先**于 top N：max_n=2 时 BBB(40M) 被淘汰后 CCC(30M) 补位，
+        # 而不是按旧逻辑（先 top N 后剔除）只留 AAA
+        strat, _ = make_strategy(
+            tmp_path,
+            _data(),
+            config=_dyn_config(candidate_pool_max_symbols=2),
+            exclusion_fn=lambda s: "无现货交易对" if s == "BBBUSDT" else None,
+        )
+        strat.refresh_universe()
+        assert list(strat.candidate_symbols) == ["AAAUSDT", "CCCUSDT"]
+
     def test_universe_refresh_failure_keeps_old_pool(self, tmp_path):
         data = _data()
         strat, _ = make_strategy(tmp_path, data, config=_dyn_config())

@@ -168,6 +168,11 @@ class LedgerQueryService:
     def scan_epochs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return self._ledger.scan_epochs(limit=limit)
 
+    def candidate_snapshots(
+        self, epoch_id: str, *, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        return self._ledger.candidate_snapshots(epoch_id, limit=limit)
+
     def sync_cursors(self, *, limit: int = 1000) -> list[dict[str, Any]]:
         return self._ledger.sync_cursors(limit=limit)
 

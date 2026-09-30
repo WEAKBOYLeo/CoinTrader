@@ -289,9 +289,10 @@ class TestWeightThrottle:
         c.coordinator = make_coordinator(sleeper)
         c.get("/api/v3/time")  # P1 默认：1500+1 <= 2400 放行，观测 1500
         c.get("/api/v3/time", priority=RequestPriority.P1_RECOVERY)  # 仍放行
-        # P4 回填：1500 + 1 > 1200 → 等待（假时钟推进后强放行，不断言等待时长）
+        # P4 回填：1500 + 1 > 1200 → 被预算挡住等待（假时钟推进后强放行）。
+        # 实现分小步轮询（≤ _WINDOW_POLL_SECONDS），故断言总等待而非单次时长。
         c.get("/api/v3/time", priority=RequestPriority.P4_BACKFILL)
-        assert any(s >= 59.0 for s in sleeper.calls), "P4 不得占用保留预算"
+        assert sum(sleeper.calls) >= 59.0, "P4 不得占用保留预算"
 
     def test_418_bans_scope_across_clients(self) -> None:
         """418 后同 scope 的 coordinator 被封禁：任何新请求立即上抛。"""

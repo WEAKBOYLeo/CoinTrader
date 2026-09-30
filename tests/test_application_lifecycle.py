@@ -93,6 +93,79 @@ class TestRunnerDelegation:
         assert ticks["n"] >= 3
 
 
+class TestRecoveryStuckEscalation:
+    """RECOVERY 卡死升级：启动后（曾达 RUNNING）持续 RECOVERY 超过
+    ``recovery_escalation_seconds`` → 优雅停机退出码 1，交 systemd 重启。
+
+    背景缺陷：stale 用户流分支每 tick 提前 return，自动解除分支永远跑不到；
+    进程会无限等待且 can_open=0（VPS 实测卡 14.5h）。升级后重启重新预检+对账。
+    启动阶段的长 RECOVERY（补账/epoch 构建）不计入，不得误杀。
+    """
+
+    def _env(self, tmp_path: Path, escalation: float = 1.0) -> Any:
+        cfg = make_live_config()
+        cfg = replace(
+            cfg, execution=replace(cfg.execution, recovery_escalation_seconds=escalation)
+        )
+        return make_service(
+            tmp_path, LiveFakeData({SYMBOL: make_live_rates(20, "0.0005")}), config=cfg
+        )["svc"]
+
+    def test_elapsed_tracking_across_transitions(self, tmp_path: Path) -> None:
+        svc = self._env(tmp_path)
+        # 初始 RECOVERY（从未 RUNNING）：慢启动合法，不计时
+        assert svc.recovery_elapsed_ms() is None
+        svc.resume_after_checks("测试预检通过", source="test")
+        assert svc._state is ServiceState.RUNNING  # noqa: SLF001
+        assert svc.recovery_elapsed_ms() is None
+        svc.enter_recovery("用户流不新鲜（卡死场景）")
+        assert svc._state is ServiceState.RECOVERY  # noqa: SLF001
+        assert svc.recovery_elapsed_ms() is not None
+        svc.resume_after_checks("恢复", source="test")
+        assert svc.recovery_elapsed_ms() is None
+
+    def test_stuck_recovery_escalates_to_stop(self, tmp_path: Path) -> None:
+        svc = self._env(tmp_path, escalation=1.0)
+        alerts: list[tuple[str, str]] = []
+        svc._on_alert = lambda kind, msg: alerts.append((kind, msg))  # noqa: SLF001
+        svc.resume_after_checks("测试预检通过", source="test")
+        svc.enter_recovery("用户流不新鲜/不可信: perp（卡死）")
+        # 时间跳前 2s > 阈值 1s（白盒注入门控时间戳）
+        svc._recovery_since_ms = int(svc._now() * 1000) - 2000  # noqa: SLF001
+        svc.run_once = lambda: {"state": "RECOVERY"}  # type: ignore[method-assign]
+        assert svc.run_forever(tick_seconds=0.001) is False
+        assert any(k == "RECOVERY_STUCK" for k, _ in alerts)
+        assert svc.state is ServiceState.STOPPED
+
+    def test_short_recovery_not_escalated(self, tmp_path: Path) -> None:
+        svc = self._env(tmp_path, escalation=900.0)
+        svc.resume_after_checks("测试预检通过", source="test")
+        svc.enter_recovery("瞬时用户流抖动")
+        svc.run_once = lambda: {"state": "RECOVERY"}  # type: ignore[method-assign]
+        ticks = {"n": 0}
+
+        def stop_check() -> bool:
+            ticks["n"] += 1
+            return ticks["n"] >= 3
+
+        assert svc.run_forever(tick_seconds=0.001, stop_check=stop_check) is True
+        assert ticks["n"] >= 3
+        assert svc.state is not ServiceState.STOPPED
+
+    def test_initial_recovery_before_running_not_escalated(self, tmp_path: Path) -> None:
+        # 启动阶段长 RECOVERY（补账/epoch 构建合法）：未达过 RUNNING 不升级
+        svc = self._env(tmp_path, escalation=1.0)
+        svc.run_once = lambda: {"state": "RECOVERY"}  # type: ignore[method-assign]
+        ticks = {"n": 0}
+
+        def stop_check() -> bool:
+            ticks["n"] += 1
+            return ticks["n"] >= 3
+
+        assert svc.run_forever(tick_seconds=0.001, stop_check=stop_check) is True
+        assert svc.state is not ServiceState.STOPPED
+
+
 class TestTickLifecycle:
     """runner tick 体：闸门 HALT 同步与恢复。"""
 

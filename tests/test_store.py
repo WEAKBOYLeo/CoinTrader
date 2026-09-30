@@ -111,6 +111,40 @@ class TestFillIdempotency:
         expected = store.expected_positions()
         assert expected["BTCUSDT"]["SPOT"] == Decimal("0.5")
         assert expected["BTCUSDT"]["PERP"] == Decimal("-0.5")
+    def test_expected_positions_accounts_for_spot_base_asset_fees(self, store: StateStore) -> None:
+        """现货手续费以基础币扣除时，期望持仓必须扣掉手续费数量。"""
+        store.record_fill(
+            Fill(
+                fill_id="f-buy-base-fee",
+                client_order_id="ct-buy",
+                symbol="BEAMXUSDT",
+                market=Market.SPOT,
+                side=OrderSide.BUY,
+                quantity=Decimal("29702"),
+                price=Decimal("0.00202"),
+                fee_asset="BEAMX",
+                fee_amount=Decimal("29.702"),
+                ts_ms=1,
+            )
+        )
+        store.record_fill(
+            Fill(
+                fill_id="f-sell-base-fee",
+                client_order_id="ct-sell",
+                symbol="BTCUSDT",
+                market=Market.SPOT,
+                side=OrderSide.SELL,
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                fee_asset="BTC",
+                fee_amount=Decimal("0.001"),
+                ts_ms=2,
+            )
+        )
+
+        expected = store.expected_positions()
+        assert expected["BEAMXUSDT"]["SPOT"] == Decimal("29672.298")
+        assert expected["BTCUSDT"]["SPOT"] == Decimal("-1.001")
 
 
 class TestIntentIdempotency:

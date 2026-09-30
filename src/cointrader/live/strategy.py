@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -329,6 +330,8 @@ class LiveStrategy:
         synchronizer: 可选的 MarketDataSynchronizer；注入后所有排名/开仓/换仓
             绑定其最近 READY epoch（同一 cutoff 横截面），market_data_ready
             未就绪时未持仓候选统一 SKIP MARKET_DATA_NOT_READY。
+        exclusion_fn: 可选剔除规则检查器（无现货对/非 TRADING/最小名义额超
+            canary）；动态池刷新时**先**跑剔除规则再按成交额过滤（与回测同口径）。
     """
 
     def __init__(
@@ -341,6 +344,7 @@ class LiveStrategy:
         config_hash: str = "",
         now_fn: Callable[[], float] = time.time,
         synchronizer: MarketDataSynchronizer | None = None,
+        exclusion_fn: Callable[[str], str | None] | None = None,
     ) -> None:
         self.config = config
         self.data = data
@@ -349,9 +353,14 @@ class LiveStrategy:
         self.config_hash = config_hash
         self._now = now_fn
         self._synchronizer = synchronizer
+        self._exclusion_fn = exclusion_fn
         self.candidates: dict[str, CandidateCache] = {}
         self._universe: list[str] = []
         self._universe_ts_ms = 0
+        # 当前池的 venue 标记。池是按 venue 的 exchangeInfo 选出来的（demo 与主网
+        # 合约清单不同，不能互换），诊断/日志必须把它一并暴露，
+        # 否则“池里怎么少了几个币”会查不出来。
+        self._universe_venue: str = ""
         self._epoch_id: str = ""
         self._evaluator = FundingCarryEvaluator(
             config=config,
@@ -384,15 +393,40 @@ class LiveStrategy:
             return None
         return self._synchronizer.latest_ready()
 
-    def refresh_universe(self) -> None:
-        """刷新候选池（动态模式）：可交易永续 → 24h 成交额门槛 → 按量 top N。
+    @property
+    def universe_venue(self) -> str:
+        """当前候选池的来源 venue（空串 = 未刷新过）。
 
-        固定模式只重置池时间戳（零请求）。动态模式刷新失败保留旧池；
-        池内 symbol 指标缓存的时效由 ``max_candidate_data_age_seconds`` 把关。
+        venue 是**可选诊断项**，不进入 ``StrategyDataProvider`` Protocol：
+        测试里的 fake provider 不必实现它（仅影响池标记，不影响决策）。
+        能取到 provider 的 venue 就用 provider 的（数据源真相），否则回退到
+        按本进程配置推导，保证固定池模式也有标记。
         """
+        if self._universe_venue:
+            return self._universe_venue
+        fn = getattr(self.data, "venue_name", None)
+        if callable(fn):
+            try:
+                return str(fn())
+            except Exception as exc:  # noqa: BLE001 —— 仅诊断字段，不能影响主循环
+                # 数据源的 venue 查询失败（如测试 fake provider 实现异常）不应
+                # 中断主循环；退回空串，由配置推导兜底。
+                logger.debug("venue_name() 查询失败，退回配置推导: %s", exc)
+        return ""
+
+    def refresh_universe(self) -> None:
+        """刷新候选池（动态模式）：可交易永续 → 剔除规则 → 24h 成交额门槛。
+
+        币池来源 = **本 venue 自己的 exchangeInfo**（demo/testnet 与主网合约清单
+        不同，见 ``data/venue.py``）。固定模式只重置池时间戳（零请求）；
+        动态模式刷新失败保留旧池；池内 symbol 指标缓存的时效由
+        ``max_candidate_data_age_seconds`` 把关。
+        """
+        venue = self.universe_venue
         if not self.dynamic_pool:
             self._universe = list(self.config.execution.live_symbols)
             self._universe_ts_ms = int(self._now() * 1000)
+            self._universe_venue = venue
             return
         now_ms = int(self._now() * 1000)
         interval_ms = int(self.config.execution.universe_refresh_seconds * 1000)
@@ -405,16 +439,26 @@ class LiveStrategy:
             logger.warning("动态候选池刷新失败（保留旧池 %d 个）: %s", len(self._universe), exc)
             return
         min_volume = Decimal(str(self.config.strategy.selection.min_quote_volume_3d_avg))
-        pool = [s for s in symbols if Decimal(str(volumes.get(s, 0.0))) >= min_volume]
+        excluded = 0
+        pool: list[str] = []
+        for symbol in symbols:
+            if self._exclusion_fn is not None and self._exclusion_fn(symbol) is not None:
+                excluded += 1
+                continue
+            if Decimal(str(volumes.get(symbol, 0.0))) >= min_volume:
+                pool.append(symbol)
         pool.sort(key=lambda s: volumes.get(s, 0.0), reverse=True)
         max_n = int(self.config.execution.candidate_pool_max_symbols)
         if max_n > 0:
             pool = pool[:max_n]
         self._universe = pool
         self._universe_ts_ms = now_ms
+        self._universe_venue = venue
         logger.info(
-            "动态候选池刷新: %d 个 symbol（universe=%d，24h 成交额>= %.0f，top %s）",
-            len(pool), len(symbols), float(min_volume), max_n if max_n > 0 else "不限",
+            "动态候选池刷新[venue=%s]: %d 个 symbol"
+            "（universe=%d，剔除规则 %d，24h 成交额>= %.0f，top %s）",
+            venue or "?",
+            len(pool), len(symbols), excluded, float(min_volume), max_n if max_n > 0 else "不限",
         )
 
     def prune_universe(self, allowed: set[str]) -> int:
@@ -682,7 +726,9 @@ class LiveStrategy:
         base.update(fields)
         return StrategyDecision(**base)  # type: ignore[arg-type]
 
-    def _to_decision(self, ev: CarryEvaluation, ctx: LiveContext) -> StrategyDecision:
+    def _to_decision(
+        self, ev: CarryEvaluation, ctx: LiveContext, *, gate_now_ms: int | None = None
+    ) -> StrategyDecision:
         scan_epoch_id, decision_cutoff_ms = self._epoch_stamp()
 
         if ev.kind == EvalKind.OPEN:
@@ -713,7 +759,7 @@ class LiveStrategy:
                     config=self.config,
                     reason="funding_carry",
                     strategy_version=self.strategy_version,
-                    now_ms=ctx.now_ms,
+                    now_ms=gate_now_ms if gate_now_ms is not None else ctx.now_ms,
                 )
             except LiveGateBlocked as exc:
                 return self._decision_skip(
@@ -806,9 +852,15 @@ class LiveStrategy:
         return self._to_decision(ev, ctx)
 
     def complete_open(
-        self, symbol: str, ctx: LiveContext, quote: Quote | None
+        self, symbol: str, ctx: LiveContext, quote: Quote | None,
+        *, gate_now_ms: int | None = None,
     ) -> StrategyDecision:
-        """第二阶段：LiveService 获取报价后定案（步骤 13-15）。获取失败 = STALE_QUOTE。"""
+        """第二阶段：LiveService 获取报价后定案（步骤 13-15）。获取失败 = STALE_QUOTE。
+
+        ``gate_now_ms``：新鲜度闸门时刻（当前时间）；未传时回退 tick 开场的
+        ``ctx.now_ms``（慢 tick 会把刚接收的报价误判为未来时间戳，见
+        ``FundingCarryEvaluator.complete_open`` 同参文档）。
+        """
         quote_input = (
             None
             if quote is None
@@ -821,9 +873,10 @@ class LiveStrategy:
             )
         )
         ev = self._evaluator.complete_open(
-            symbol, self._eval_context(ctx), self._eval_candidates(), quote_input
+            symbol, self._eval_context(ctx), self._eval_candidates(), quote_input,
+            gate_now_ms=gate_now_ms,
         )
-        return self._to_decision(ev, ctx)
+        return self._to_decision(ev, ctx, gate_now_ms=gate_now_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -838,14 +891,26 @@ class PublicDataStrategyProvider:
                  now_fn: Callable[[], float] = time.time) -> None:
         from ..data.binance import BinancePublicClient
         from ..data.funding import FundingIntervals, fetch_funding_intervals
+        from ..data.venue import venue_for_execution_mode
 
         self.config = config
         self._now = now_fn
+        # venue 由 execution.mode 推导：paper/testnet/shadow → demo，live → mainnet。
+        # 币池必须来自该 venue 自己的 exchangeInfo（demo 与主网清单不同）。
+        self.venue = venue_for_execution_mode(config.execution.mode)
         if client is None:
-            client = BinancePublicClient(config.api, config.data)
+            client = BinancePublicClient(
+                config.api, config.data, universe=config.universe, venue=self.venue
+            )
         self.client: BinancePublicClient = client  # type: ignore[assignment]
         self._intervals: FundingIntervals | None = None
         self._intervals_fn = fetch_funding_intervals
+        self._premium_lock = threading.Lock()
+        self._premium: dict[str, dict[str, Any]] = {}
+
+    def venue_name(self) -> str:
+        """当前数据源的 venue 名（供日志/诊断/币池标记）。"""
+        return self.venue.value
 
     def tradable_universe(self) -> tuple[str, ...]:
         """全部可交易 USDT 永续（排除 exclude_bases；与回测 scanner 同口径）。"""
@@ -874,6 +939,42 @@ class PublicDataStrategyProvider:
     def close(self) -> None:
         self.client.close()
 
+    def refresh_premium_index(self, symbols: tuple[str, ...] = ()) -> dict[str, dict[str, Any]]:
+        """批量刷新当前费率；只由后台 epoch owner 调用，WebUI 不调用。"""
+        payload = self.client.premium_index()
+        rows = payload if isinstance(payload, list) else [payload]
+        wanted = set(symbols)
+        now_ms = int(self._now() * 1000)
+        updated: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "")
+            if not symbol or (wanted and symbol not in wanted):
+                continue
+            try:
+                updated[symbol] = {
+                    "current_funding_rate": str(Decimal(str(row["lastFundingRate"])))
+                    if row.get("lastFundingRate") is not None else None,
+                    "mark_price": str(Decimal(str(row["markPrice"])))
+                    if row.get("markPrice") is not None else None,
+                    "next_funding_time_ms": int(row["nextFundingTime"])
+                    if row.get("nextFundingTime") is not None else None,
+                    "fetched_ms": now_ms,
+                    "source": "premiumIndex",
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+        if updated:
+            with self._premium_lock:
+                self._premium.update(updated)
+        return self.premium_snapshots()
+
+    def premium_snapshots(self) -> dict[str, dict[str, Any]]:
+        """复制最近批量 premiumIndex 数据，不产生网络请求。"""
+        with self._premium_lock:
+            return {symbol: dict(value) for symbol, value in self._premium.items()}
+
     def funding_interval_hours(self, symbol: str) -> int:
         if self._intervals is None:
             self._intervals = self._intervals_fn(self.client)
@@ -885,12 +986,19 @@ class PublicDataStrategyProvider:
         from ..data.funding import fetch_funding_history
 
         interval = self.funding_interval_hours(symbol)
-        # start 锚到 8h 网格：同一 8h 窗口内缓存键稳定，epoch 重试/重建命中
-        # 磁盘缓存，避免每 pass 重复 3 页拉取触发 WAF 速率拦截
+        # periods 是调用方换算后的原始 funding 事件数；start 锚到 8h 网格，
+        # epoch 的结束时间与 coverage horizon 共用 cutoff。
         span_ms = (periods + 5) * interval * 3600 * 1000
+        anchor_ms = end_ms if end_ms is not None else int(self._now() * 1000)
         _grid = 8 * 3600 * 1000
-        start_ms = (int(self._now() * 1000) - span_ms) // _grid * _grid
-        frame = fetch_funding_history(self.client, symbol, start_ms=start_ms)
+        start_ms = (anchor_ms - span_ms) // _grid * _grid
+        frame = fetch_funding_history(
+            self.client,
+            symbol,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            settled_at_ms=end_ms,
+        )
         rates = frame["funding_rate"]
         marks = frame["mark_price"]
         out: list[tuple[int, Decimal, Decimal]] = []
@@ -918,7 +1026,12 @@ class PublicDataStrategyProvider:
                 close_ms -= bar_ms
             start_ms = close_ms - 18 * bar_ms
             klines = self.client.futures_klines(
-                symbol, "4h", start_ms=start_ms, end_ms=end_ms, limit=20
+                symbol,
+                "4h",
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=20,
+                closed_at_ms=end_ms,
             )
             closed = [k for k in klines if int(k[0]) + bar_ms <= end_ms][-18:]
             if len(closed) < 18:

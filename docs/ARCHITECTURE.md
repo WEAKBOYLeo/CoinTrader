@@ -169,6 +169,41 @@ P2 普通私有、P3 公开行情/候选扫描。软限（默认 80%）以上按
 418 → 单请求后全 scope ban（立即停手）。协调器快照（used/in-flight/frozen/bans）
 供 Web「数据状态」区与日志诊断，不暴露 URL/密钥。
 
+**本地记账与观测时效（2026-09-28 修复）**：
+
+- 部分端点**不返回** `x-mbx-used-weight-1m`（实测 `/fapi/v1/fundingRate` 无该头），
+  只能本地记账。本地窗口起点只在「本窗口第一个请求」锚定，
+  **禁止在每次请求结束时推进** —— 否则滚动条件永不成立、`local_used` 永不归零，
+  累计超 P3 上限后每次请求都白等一个窗口（生产日志实测 60s / 116~118s）。
+- 服务端观测值**会过期**：`observed_used` 只在其年龄 < 一个窗口内有效，
+  过期后退回本地记账。否则同出口 IP 的外部流量曾把服务端记账推到高位后，
+  即使窗口早已滚动，本进程仍按旧值封杀自己。
+- 预算不足时睡眠**分小步（≤2s）**：本地锚点可能早于服务端真实窗口边界，
+  睡满整个剩余窗口会在窗口已滚动后仍白等；分步睡可在下一步看到回落的
+  header 并立即放行。
+
+**请求量（2026-09-28 实测修正）**：资金费历史单次实际返回上限为 500，
+`limit=100/500/1000` 的 RTT 几乎相同（0.49s / 0.51s / 0.62s），
+故分页单页默认 500（配置项 `data.rate_limit.funding_page_size`）。
+旧值 100 对一年 8h 结算需要 11 页而非 3 页，纯浪费请求数。
+早期记录的「大 limit 被 WAF 403 拦截」在当前端点已不成立。
+
+### 3.2.1 venue（交易场地）隔离与回测契约
+
+主网与 Binance Demo Trading 是**两个独立合约清单**，不是镜像。2026-09-28 实测
+`exchangeInfo`：主网 527 个可交易 USDT 永续、demo 528 个；仅主网 65 个
+（PUMPUSDT / XAUTUSDT / ICPUSDT …），仅 demo 66 个（TONUSDT / IPUSDT / LRCUSDT …）。
+
+- venue 由 `execution.mode` 推导（paper/testnet/shadow → demo，live → mainnet），
+  封装在 `data/venue.py`，端点声明在 `config.yaml` 的 `universe` 节。
+- **缓存键必须带 venue**（`BinancePublicClient.ckey()`），历史覆盖 namespace
+  也按 venue 隔离（`coverage_v1_<venue>` / `hist_segments_v1_<venue>`），
+  `CoverageKey.venue` 取客户端 venue。否则两个场地互相污染：先写的一方胜出，
+  表现为「换了 venue 却拿到另一边的数据」或「demo 拉过的历史区间被主网当成已覆盖」。
+- **回测契约（不可违反）**：回测恒用 **mainnet** 历史，数据源只有主网一份。
+  `backtest/` 不接收 venue 参数，也不允许把 demo 池喂给回测 —— demo 的
+  退市合约仍返回行情，用它的池子做回测会得到主网上无法复现的结论。
+
 ### 3.3 缓存策略
 
 - 历史数据**不可变**：资金费历史、已收盘 K 线 → 永久缓存

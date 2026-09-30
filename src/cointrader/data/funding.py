@@ -108,6 +108,7 @@ def fetch_funding_history(
     start_ms: int | None = None,
     end_ms: int | None = None,
     limit: int = 1000,
+    settled_at_ms: int | None = None,
 ) -> pd.DataFrame:
     """拉取单个合约的资金费历史并规范化为 DataFrame。
 
@@ -136,7 +137,13 @@ def fetch_funding_history(
         仅已结算事件（``fundingTime <`` 交易所当前时间）进入可复用历史。
         不改变任何年化/8h 桶计算口径。
     """
-    records = client.funding_history(symbol, start_ms=start_ms, end_ms=end_ms, limit=limit)
+    records = client.funding_history(
+        symbol,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        limit=limit,
+        settled_at_ms=settled_at_ms,
+    )
     if not records:
         raise InsufficientDataError(f"合约 {symbol} 无资金费历史记录")
 

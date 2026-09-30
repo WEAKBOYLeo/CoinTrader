@@ -334,6 +334,9 @@ class _FakeLedger:
     def scan_epochs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return []
 
+    def candidate_snapshots(self, epoch_id: str, *, limit: int = 1000) -> list[dict[str, Any]]:
+        return []
+
     def sync_cursors(self, *, limit: int = 1000) -> list[dict[str, Any]]:
         return []
 

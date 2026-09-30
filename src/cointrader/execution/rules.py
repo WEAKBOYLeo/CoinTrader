@@ -37,7 +37,9 @@ class SymbolRules:
     max_qty: Decimal
     step_size: Decimal
     min_notional: Decimal
-    # 市价单独立数量规则（Spot MARKET_LOT_SIZE；Futures 无则同 LOT_SIZE）
+    # 市价单独立数量规则（Spot MARKET_LOT_SIZE；Futures 无则同 LOT_SIZE）。
+    # ⚠️ 币安 spot 的 MARKET_LOT_SIZE 实测 stepSize=0 / minQty=0：0 表示"无独立
+    # 约束"（市价单实际仍受 LOT_SIZE 步长/最小量约束，demo 实测），不得当 0 用。
     market_step_size: Decimal | None = None
     market_min_qty: Decimal | None = None
     market_max_qty: Decimal | None = None
@@ -46,17 +48,17 @@ class SymbolRules:
     contract_type: str | None = None
 
     def qty_step(self, *, is_market: bool) -> Decimal:
-        if is_market and self.market_step_size is not None:
+        if is_market and self.market_step_size is not None and self.market_step_size > 0:
             return self.market_step_size
         return self.step_size
 
     def min_qty_for(self, *, is_market: bool) -> Decimal:
-        if is_market and self.market_min_qty is not None:
+        if is_market and self.market_min_qty is not None and self.market_min_qty > 0:
             return self.market_min_qty
         return self.min_qty
 
     def max_qty_for(self, *, is_market: bool) -> Decimal:
-        if is_market and self.market_max_qty is not None:
+        if is_market and self.market_max_qty is not None and self.market_max_qty > 0:
             return self.market_max_qty
         return self.max_qty
 

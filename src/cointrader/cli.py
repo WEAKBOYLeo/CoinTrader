@@ -34,6 +34,7 @@ from . import __version__
 from .config import EXECUTION_MODES, Config, load_config
 from .errors import ConfigError
 from .logging_setup import setup_logging
+from .observability.recovery import recovery_error_from_runtime
 from .research.costs import CostModel, LiquidityTier, pessimistic_config
 from .research.reports import write_portfolio_reports
 from .secrets import describe_security_posture, load_credentials, load_dotenv
@@ -182,11 +183,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_ping(args: argparse.Namespace) -> int:
     """币安连通性与时钟偏移自检（需要联网）。"""
     from .data.binance import BinancePublicClient
+    from .data.venue import venue_for_execution_mode
 
     config = load_config(args.config)
     _print_security_banner()
+    venue = venue_for_execution_mode(config.execution.mode)
 
-    with BinancePublicClient(config.api, config.data) as client:
+    with BinancePublicClient(
+        config.api,
+        config.data,
+        universe=config.universe,
+        venue=venue,
+    ) as client:
         try:
             health = client.health_check()
         except Exception as exc:  # noqa: BLE001
@@ -392,6 +400,7 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
     from .data.binance import BinancePublicClient
     from .data.funding import fetch_funding_history, fetch_funding_intervals
     from .data.klines import fetch_historical_quote_volume_3d_avg, tradable_perpetuals
+    from .data.venue import MAINNET_VENUE
 
     config = _apply_rolling_override(load_config(args.config), args)
     min_volume_override = getattr(args, "min_volume", None)
@@ -423,13 +432,34 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
     # 不传足量时分页会取满 limit 即停，4h/1h 结算币的近期数据会被静默截断。
     funding_record_limit = int(config.backtest.history_days * 24) + 2 * 24
 
-    with BinancePublicClient(config.api, config.data) as client:
+    with BinancePublicClient(
+        config.api,
+        config.data,
+        universe=config.universe,
+        venue=MAINNET_VENUE,
+    ) as client:
         funding_intervals = fetch_funding_intervals(client)
         if automatic_selection:
+            from .data.klines import make_pair_exclusion_checker
+
+            futures_info = client.futures_exchange_info()
             symbols = tradable_perpetuals(
-                client.futures_exchange_info(),
+                futures_info,
                 exclude_bases=config.strategy.selection.exclude_bases,
             )
+            # 剔除规则前置（与实时候选池同口径）：无现货对/任一侧非 TRADING/
+            # 最小名义额 > canary_notional → 直接出局，不进 365 天数据拉取
+            checker = make_pair_exclusion_checker(
+                futures_info,
+                client.spot_exchange_info(),
+                canary_notional=float(config.execution.canary_notional),
+            )
+            kept = [s for s in symbols if checker(s) is None]
+            print(
+                f"  剔除规则: {len(symbols)} → {len(kept)} 个"
+                f"（无现货对/非TRADING/最小名义额>canary {config.execution.canary_notional:.0f} USDT）"
+            )
+            symbols = kept
             max_symbols = getattr(args, "max_symbols", None)
             if max_symbols is not None:
                 if max_symbols <= 0:
@@ -773,8 +803,14 @@ def _fetch_live_quotes(config: Config, symbols: list[str]) -> dict:
         from decimal import Decimal
 
         from .data.binance import BinancePublicClient
+        from .data.venue import venue_for_execution_mode
 
-        with BinancePublicClient(config.api, config.data) as client:
+        with BinancePublicClient(
+            config.api,
+            config.data,
+            universe=config.universe,
+            venue=venue_for_execution_mode(config.execution.mode),
+        ) as client:
             out = {}
             for symbol in symbols:
                 try:
@@ -808,6 +844,7 @@ def cmd_live_status(args: argparse.Namespace) -> int:
         latest_run = store.latest_run_session()
         recon_rows = store.reconciliation_runs(limit=1)
         recon = recon_rows[0] if recon_rows else None
+        recovery_error = recovery_error_from_runtime(runtime, recon, now_ms=int(time.time() * 1000))
         acct_rows = store.account_snapshots(limit=2)
         acct = acct_rows[0] if acct_rows else None
         alerts = [e for e in store.exchange_events(limit=20) if str(e.get("event_type")) == "alert"]
@@ -816,6 +853,7 @@ def cmd_live_status(args: argparse.Namespace) -> int:
             "now_ms": now_ms,
             "service_state": runtime.get("service_state", {}).get("value"),
             "recovery_reason": runtime.get("recovery_reason", {}).get("value", ""),
+            "recovery_error": recovery_error,
             "run_id": runtime.get("run_id", {}).get("value") or (latest_run or {}).get("run_id"),
             "run": latest_run,
             "mode": runtime.get("mode", {}).get("value"),
@@ -860,6 +898,28 @@ def cmd_live_status(args: argparse.Namespace) -> int:
         return _print_json(payload)
     print(f"  服务状态     : {payload['service_state'] or '未知'}"
           + (f"（{payload['recovery_reason']}）" if payload.get("recovery_reason") else ""))
+    recovery_error = payload.get("recovery_error")
+    if recovery_error:
+        print("  Recovery 错误:")
+        print(f"    code       : {recovery_error.get('code', 'UNKNOWN')}")
+        print(f"    message    : {recovery_error.get('message', 'UNKNOWN')}")
+        details = recovery_error.get("details") or {}
+        affected = recovery_error.get("affected") or []
+        if affected:
+            for row in affected[:5]:
+                print(
+                    "    对象       : "
+                    f"{row.get('symbol', 'UNKNOWN')}/{row.get('market', 'UNKNOWN')} "
+                    f"期望={row.get('expected', 'UNKNOWN')} "
+                    f"实际={row.get('actual', 'UNKNOWN')} "
+                    f"差额={row.get('difference', 'UNKNOWN')} "
+                    f"容差={row.get('tolerance') if row.get('tolerance') is not None else 'UNKNOWN'}"
+                )
+        elif details:
+            print(f"    details    : {json.dumps(details, ensure_ascii=False, default=str)}")
+        print(f"    首次进入   : {recovery_error.get('entered_at_ms', 'UNKNOWN')}")
+        print(f"    最近重试   : {recovery_error.get('last_retry_at_ms', 'UNKNOWN')}")
+        print(f"    重试次数   : {recovery_error.get('retry_count', 'UNKNOWN')}")
     print(f"  run_id       : {payload['run_id'] or '无'}")
     print(f"  模式         : {payload['mode'] or '未知'}（来源: {payload['mode_source']}，当前解析: {payload['resolved_mode']}）")
     print(f"  端点选择     : {payload['endpoints']['label']}（spot={payload['endpoints']['spot']} perp={payload['endpoints']['futures']}）")
@@ -1317,9 +1377,15 @@ def cmd_live_doctor(args: argparse.Namespace) -> int:
 
     # 时钟偏移（公共接口，无私有请求）
     from .data.binance import BinancePublicClient
+    from .data.venue import venue_for_execution_mode
 
     try:
-        with BinancePublicClient(config.api, config.data) as client:  # type: ignore[arg-type]
+        with BinancePublicClient(
+            config.api,
+            config.data,
+            universe=config.universe,
+            venue=venue_for_execution_mode(mode),
+        ) as client:  # type: ignore[arg-type]
             spot_offset = client.spot_time() - int(time.time() * 1000)
             perp_offset = client.futures_time() - int(time.time() * 1000)
         limit = exc_cfg.server_time_offset_limit_ms

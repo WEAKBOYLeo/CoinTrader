@@ -384,6 +384,8 @@ class FakeStrategyData:
         self._universe_fail = universe_fail
         self.universe_calls = 0
         self.funding_calls = 0
+        self.funding_periods: list[tuple[str, int]] = []
+        self.volume_calls = 0
         self.now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
     def rates(self, symbol: str) -> list[tuple[int, Decimal, Decimal]]:
@@ -397,6 +399,7 @@ class FakeStrategyData:
     ) -> list[tuple[int, Decimal, Decimal]]:
         raw = self._rates.get(symbol, [])
         self.funding_calls += 1
+        self.funding_periods.append((symbol, periods))
         cutoff = end_ms if end_ms is not None else self.now_ms
         settled = [(ts, r, m) for (ts, r, m) in raw if ts <= cutoff]
         return settled[-periods:]
@@ -406,6 +409,7 @@ class FakeStrategyData:
 
     def quote_volume_3d_avg(self, symbol: str, *, end_ms: int | None = None) -> Decimal:  # noqa: ARG002
         """静态成交额 fake：end_ms 无时间轴语义，忽略。"""
+        self.volume_calls += 1
         return self._volume.get(symbol, Decimal("10000000"))
 
     def set_universe_fail(self, fail: bool) -> None:

@@ -500,15 +500,24 @@ class FundingCarryEvaluator:
         ctx: EvalContext,
         candidates: Mapping[str, CandidateInput],
         quote: QuoteInput | None,
+        *,
+        gate_now_ms: int | None = None,
     ) -> CarryEvaluation:
-        """第二阶段：调用方获取报价后定案（步骤 13-15）。获取失败 = STALE_QUOTE。"""
+        """第二阶段：调用方获取报价后定案（步骤 13-15）。获取失败 = STALE_QUOTE。
+
+        ``gate_now_ms``：新鲜度闸门时刻（获取报价后的当前时间）。报价刚接收时
+        用 tick 开场的 ``ctx.now_ms`` 比年龄，慢 tick（候选刷新/限流/403 重试）
+        会把新鲜报价误判为"未来时间戳"；传入闸门时刻则只要求报价相对定案时刻
+        新鲜，与 runner 提交前重验（``_entry_quote_verdict`` 用当前 now）同口径。
+        """
         if quote is None:
             return self._skip(symbol, Reason.STALE_QUOTE, "无新鲜报价（本轮获取失败）")
         candidate = candidates.get(symbol)
         if candidate is None:
             return self._skip(symbol, Reason.INSUFFICIENT_HISTORY, "候选指标缓存缺失（前置检查后异常）")
         trailing, streak = self.entry_metrics(candidate)
-        return self._open_with_quote(symbol, ctx, quote, candidate, trailing, streak)
+        return self._open_with_quote(symbol, ctx, quote, candidate, trailing, streak,
+                                     gate_now_ms=gate_now_ms)
 
     def _open_with_quote(
         self,
@@ -518,6 +527,8 @@ class FundingCarryEvaluator:
         candidate: CandidateInput,
         trailing: Decimal,
         streak: int,
+        *,
+        gate_now_ms: int | None = None,
     ) -> CarryEvaluation:
         """开仓第二阶段（§7.2 步骤 13-15）：报价新鲜度 → 名义额/基差。
 
@@ -528,7 +539,8 @@ class FundingCarryEvaluator:
         entry = self.config.strategy.entry
         min_trailing = Decimal(str(entry.min_trailing_annualized))
         max_quote_age_ms = int(self.config.execution.max_market_data_age_seconds * 1000)
-        age = ctx.now_ms - quote.ts_ms
+        gate_now = gate_now_ms if gate_now_ms is not None else ctx.now_ms
+        age = gate_now - quote.ts_ms
         if age < 0 or age > max_quote_age_ms:
             return self._skip(symbol, Reason.STALE_QUOTE, f"报价年龄 {age}ms > {max_quote_age_ms}ms")
         if quote.spot_price <= 0 or quote.perp_price <= 0:

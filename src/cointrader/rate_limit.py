@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 _WINDOW_SECONDS = 60.0
 #: 让步/轮询等待的最小值，避免紧密循环烧 CPU。
 _MIN_WAIT_SECONDS = 0.05
+#: 预算不足时的最大单次睡眠。服务端分钟窗口按墙上时钟滚动，而本地锚点
+#: （最后一次 header 观测时刻 / 本地窗口起点）可能早于真实边界；睡满整个
+#: 剩余窗口会让本进程在窗口已经滚动后仍白等。分小步睡，每步后重新评估
+#: 观测值，窗口一滚动就能立刻放行。
+_WINDOW_POLL_SECONDS = 2.0
 #: 未知端点的保守默认 weight（宁高勿低，响应头观测值会覆盖估算）。
 DEFAULT_ENDPOINT_WEIGHT = 10
 
@@ -186,11 +191,23 @@ class RateLimitCoordinator:
     def effective_used(self, scope: RateLimitScope) -> int:
         """当前已用（含 in-flight）的估算值，仅用于诊断。"""
         with self._lock:
-            return self._effective_used_locked(self._states[scope])
+            return self._effective_used_locked(self._states[scope], self._clock())
 
-    @staticmethod
-    def _effective_used_locked(st: _ScopeState) -> int:
-        return (st.observed_used if st.observed_used is not None else st.local_used) + st.in_flight
+    def _effective_used_locked(self, st: _ScopeState, now: float) -> int:
+        """当前已用权重 = 新鲜的服务端观测（或本地记账）+ in-flight。
+
+        ⚠️ 观测值**会过期**。``x-mbx-used-weight-1m`` 描述的是服务端当前分钟
+        窗口；一旦观测超过一个窗口，那个值就属于已滚动的旧窗口，继续按它
+        封杀会让本进程被与当前无关的历史流量卡死：外部 IP 流量曾把
+        ``observed_used`` 推到接近上限后，即使服务端窗口早已滚动，仍会
+        每次 acquire 都等 60s（与日志里的现象一致）。过期后退回本地记账。
+        （``snapshot()`` 仍会带上旧值并标 STALE/age，占位符信息不丢。）
+        """
+        if st.observed_used is not None:
+            if st.observed_at and now - st.observed_at < _WINDOW_SECONDS:
+                return st.observed_used + st.in_flight
+            return st.local_used + st.in_flight
+        return st.local_used + st.in_flight
 
     # -- 核心：permit 申请 ---------------------------------------------------
 
@@ -281,10 +298,22 @@ class RateLimitCoordinator:
         with self._lock:
             st = self._states[scope]
             st.in_flight = max(0, st.in_flight - weight)
-            # 没有服务端 header 时本地记账：完成请求计入 local_used
+            # 没有服务端 header 时本地记账：完成请求计入 local_used。
+            #
+            # ⚠️ 窗口起点只在**本地窗口的第一个请求**锚定，绝不在这里推进。
+            # 旧实现每次 release 都执行 `st.window_start = now`，使
+            # `_wait_needed_locked` 的本地滚动条件（now - window_start >= 60s）
+            # 永远不成立 —— 窗口跟着每个请求往后漂，local_used 永不归零。
+            # 一旦累计超过 P3 的 cap（2400×(0.80-0.30)=1200），每次 acquire
+            # 都判定“本窗口已满”并等 60s；并发请求各自推后起点还会叠加成
+            # 116~118s 的等待（生产日志实测）。主要打击不回
+            # `x-mbx-used-weight-1m` 头的端点（如 /fapi/v1/fundingRate），
+            # 也就是价格与资金费拉取 —— 正是预热最慢的那条路径。
             if st.observed_used is None:
+                if st.local_used == 0:
+                    # 窗口起点 = 本窗口第一个本地记账请求时刻
+                    st.window_start = self._clock()
                 st.local_used += weight
-            st.window_start = self._clock()
 
     def _wait_needed_locked(
         self, st: _ScopeState, scope: RateLimitScope, priority: RequestPriority, weight: int
@@ -307,10 +336,24 @@ class RateLimitCoordinator:
             st.window_start = now
         # 预算
         cap = self.cap_for(scope, priority)
-        if self._effective_used_locked(st) + weight > cap:
-            anchor = st.observed_at if st.observed_used is not None else max(st.window_start, 1.0)
+        if self._effective_used_locked(st, now) + weight > cap:
+            # 锚点：仍是新鲜观测就用观测时刻；否则用本地窗口起点。
+            obs_fresh = (
+                st.observed_used is not None
+                and st.observed_at
+                and now - st.observed_at < _WINDOW_SECONDS
+            )
+            if obs_fresh:
+                anchor = st.observed_at
+            else:
+                anchor = max(st.window_start or now, now - _WINDOW_SECONDS)
             eta = anchor + _WINDOW_SECONDS
-            return max(_MIN_WAIT_SECONDS, eta - now), "budget"
+            # 最多睡到下一个可能滚动点。睡满整个剩余窗口是不必要的：
+            # 服务端的分钟窗口从墙上时钟边界滚动，而我们本地观测的锚点可能
+            # 比真实边界早——睡满会让本进程在窗口已滚动后仍白等（实测 60s）。
+            # 只睡一小步，下一轮会重新看到已回落的 header 并立即放行。
+            wait = min(max(_MIN_WAIT_SECONDS, eta - now), _WINDOW_POLL_SECONDS)
+            return wait, "budget"
         # 公平性：存在先等待的高优先级请求时让步
         for wait_priority, count in st.waiting.items():
             if count > 0 and wait_priority < priority:

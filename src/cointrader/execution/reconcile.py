@@ -36,8 +36,10 @@ __all__ = ["Reconciler"]
 #: 本地非终态订单中，需要与交易所开放订单比对的集合
 NON_TERMINAL = ("NEW", "PARTIALLY_FILLED", "UNKNOWN")
 
-#: 持仓数量容差（绝对值）。低于该值视为零（灰尘仓位）。
+#: 持仓数量容差下限。低于该值视为零（灰尘仓位）。
 QTY_EPSILON = Decimal("0.000001")
+#: 用户确认的持仓相对容差：两腿统一按期望数量的 0.1% 放宽。
+RELATIVE_QTY_TOLERANCE = Decimal("0.001")
 
 
 class Reconciler:
@@ -50,10 +52,14 @@ class Reconciler:
         futures: FuturesAdapter,
         *,
         ignore_assets: Sequence[str] = (),
+        relative_qty_tolerance: Decimal = RELATIVE_QTY_TOLERANCE,
     ) -> None:
+        if relative_qty_tolerance < 0:
+            raise ValueError("relative_qty_tolerance 必须 >= 0")
         self.store = store
         self.spot = spot
         self.futures = futures
+        self._relative_qty_tolerance = relative_qty_tolerance
         # 平台发放/非策略资产（如 demo 的 USDC）：无本地期望持仓时不参与对账
         self._ignore_assets = frozenset(a.upper() for a in ignore_assets)
 
@@ -265,18 +271,27 @@ class Reconciler:
 
         for symbol in sorted(symbols):
             base = symbol.replace("USDT", "")
-            # 不可交易灰尘容忍：低于一个 step 的余额无法再下最小单，
-            # 平仓手续费扣减后必然存在（demo 实测 0.0007 扣费后 0.0006993）。
-            # 对账容差 = 基础 epsilon 与该 symbol 最小可交易 step 取大，
-            # 否则 step 以下的灰尘余额会被永久判为不一致 → 卡在 RECOVERY。
-            tolerance_spot = QTY_EPSILON
-            tolerance_perp = QTY_EPSILON
+            # 不可交易灰尘容忍：低于一个 step 的余额无法再下最小单。
+            # 同时按期望数量的 0.1% 放宽两腿容差，吸收小额手续费/执行残差；
+            # 超过该阈值仍进入 RECOVERY。规则查询必须使用完整 symbol，
+            # 避免把 BEAMXUSDT 错拼成 BEAMXUSDTUSDT。
+            rule_symbol = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+            tolerance_spot = max(
+                QTY_EPSILON,
+                abs(expected.get(symbol, {}).get("SPOT", Decimal("0")))
+                * self._relative_qty_tolerance,
+            )
+            tolerance_perp = max(
+                QTY_EPSILON,
+                abs(expected.get(symbol, {}).get("PERP", Decimal("0")))
+                * self._relative_qty_tolerance,
+            )
             if hasattr(self.spot, "rule"):
                 with contextlib.suppress(KeyError):
-                    tolerance_spot = max(tolerance_spot, self.spot.rule(f"{symbol}USDT").step_size)
+                    tolerance_spot = max(tolerance_spot, self.spot.rule(rule_symbol).step_size)
             if hasattr(self.futures, "rule"):
                 with contextlib.suppress(KeyError):
-                    tolerance_perp = max(tolerance_perp, self.futures.rule(f"{symbol}USDT").step_size)
+                    tolerance_perp = max(tolerance_perp, self.futures.rule(rule_symbol).step_size)
             exp_entry = expected.get(symbol)
             if exp_entry is None:
                 # 余额派生的独立 symbol（无同名单元）：
@@ -290,7 +305,8 @@ class Reconciler:
             diff_spot = act_spot - exp_spot
             if abs(diff_spot) > tolerance_spot:
                 mismatches.append(
-                    f"{symbol}: Spot 余额不一致 本地期望={exp_spot} 交易所={act_spot} 差={diff_spot}"
+                    f"{symbol}: Spot 余额不一致 本地期望={exp_spot} 交易所={act_spot} "
+                    f"差={diff_spot} 容差={tolerance_spot}"
                 )
 
             exp_perp = expected.get(symbol, {}).get("PERP", Decimal("0"))
@@ -298,11 +314,24 @@ class Reconciler:
             diff_perp = act_perp - exp_perp
             if abs(diff_perp) > tolerance_perp:
                 mismatches.append(
-                    f"{symbol}: 永续持仓不一致 本地期望={exp_perp} 交易所={act_perp} 差={diff_perp}"
+                    f"{symbol}: 永续持仓不一致 本地期望={exp_perp} 交易所={act_perp} "
+                    f"差={diff_perp} 容差={tolerance_perp}"
                 )
 
             details[symbol] = {
-                "spot": {"expected": str(exp_spot), "actual": str(act_spot)},
-                "perp": {"expected": str(exp_perp), "actual": str(act_perp)},
+                "spot": {
+                    "expected": str(exp_spot),
+                    "actual": str(act_spot),
+                    "difference": str(diff_spot),
+                    "tolerance": str(tolerance_spot),
+                    "within_tolerance": abs(diff_spot) <= tolerance_spot,
+                },
+                "perp": {
+                    "expected": str(exp_perp),
+                    "actual": str(act_perp),
+                    "difference": str(diff_perp),
+                    "tolerance": str(tolerance_perp),
+                    "within_tolerance": abs(diff_perp) <= tolerance_perp,
+                },
             }
         return mismatches, repaired, details

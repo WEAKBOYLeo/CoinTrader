@@ -507,14 +507,25 @@ class StateStore:
         ]
 
     def expected_positions(self) -> dict[str, dict[str, Decimal]]:
-        """从 fills 汇总本地期望持仓：{symbol: {SPOT: qty, PERP: qty(负=空)}}。"""
+        """从 fills 汇总本地期望持仓：{symbol: {SPOT: qty, PERP: qty(负=空)}}。
+
+        币安现货成交的手续费可能以基础币扣除。此时交易所余额变化不等于
+        ``quantity``：买入增加 ``quantity - fee``，卖出减少 ``quantity + fee``。
+        该手续费必须进入本地事实汇总，否则对账会永久把真实余额判成少币。
+        """
         with self._lock:
-            rows = self._conn.execute("SELECT symbol, market, side, quantity FROM fills").fetchall()
+            rows = self._conn.execute(
+                "SELECT symbol, market, side, quantity, fee_asset, fee_amount FROM fills"
+            ).fetchall()
         out: dict[str, dict[str, Decimal]] = {}
-        for symbol, market, side, qty_text in rows:
+        for symbol, market, side, qty_text, fee_asset, fee_amount_text in rows:
             qty = Decimal(str(qty_text))
             if side == "SELL":
                 qty = -qty
+            if market == "SPOT" and str(symbol).endswith("USDT"):
+                base_asset = str(symbol)[:-4]
+                if str(fee_asset or "").upper() == base_asset.upper():
+                    qty -= Decimal(str(fee_amount_text or "0"))
             slot = out.setdefault(symbol, {"SPOT": Decimal("0"), "PERP": Decimal("0")})
             slot[market] = slot.get(market, Decimal("0")) + qty
         return out
@@ -1152,6 +1163,35 @@ class StateStore:
 
     def scan_epochs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return self._query_table("scan_epochs", since_ms=None, limit=limit)
+
+    def candidate_snapshots(
+        self, epoch_id: str, *, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        """读取指定 epoch 的候选快照；只读、无交易所 IO。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT epoch_id, symbol, interval_hours, rates_json, mark_prices_json, "
+                "timestamps_json, expected_last_funding_ms, volume_window_end_ms, "
+                "quote_volume_3d_avg, fetched_ms, error "
+                "FROM candidate_snapshots WHERE epoch_id = ? ORDER BY symbol LIMIT ?",
+                (epoch_id, int(limit)),
+            )
+            rows = cur.fetchall()
+            names = [d[0] for d in cur.description]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(zip(names, row, strict=False))
+            for field_name in ("rates_json", "mark_prices_json", "timestamps_json"):
+                raw = item.pop(field_name)
+                try:
+                    item[field_name.removesuffix("_json")] = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    item[field_name.removesuffix("_json")] = []
+            item["volume_status"] = "FAILED" if item.get("error") else (
+                "FETCHED" if item.get("quote_volume_3d_avg") not in (None, "") else "UNKNOWN"
+            )
+            result.append(item)
+        return result
 
 
     # -- PnL 账本（§8.4） ---------------------------------------------------

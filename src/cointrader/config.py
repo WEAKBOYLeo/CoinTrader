@@ -20,6 +20,9 @@ from typing import Any
 
 import yaml
 
+# Venue 是纯枚举（无 IO、不 import data layer 其他模块），config 可以直接引用：
+# 端点选择与 execution.mode 推导共用同一套 venue 名，避免两处字符串真相。
+from .data.venue import Venue
 from .errors import ConfigError
 
 logger = logging.getLogger(__name__)
@@ -79,6 +82,74 @@ class CacheTTLConfig:
     premium_index: int = 5
     exchange_info: int = 3600
     funding_info: int = 86400
+
+
+@dataclass(frozen=True, slots=True)
+class UniverseConfig:
+    """交易场地端点与币池来源（config.yaml ``universe`` 节）。
+
+    venue 本身由 ``execution.mode`` 推导（``data/venue.py``），不在此重复配置，
+    避免两处真相。这里只声明各 venue 的端点，供 ``exchangeInfo``（币池来源）使用。
+
+    ⚠️ 回测不受本配置影响：回测恒用 mainnet 历史。见 ``data/venue.py`` 模块文档。
+    """
+
+    mainnet_futures_base: str = "https://fapi.binance.com"
+    mainnet_spot_base: str = "https://api.binance.com"
+    demo_futures_base: str = "https://demo-fapi.binance.com"
+    demo_spot_base: str = "https://demo-api.binance.com"
+
+    # 资金费历史分页单页条数 —— **按 venue 分别配置**。
+    #
+    # 2026-09-28 实测（同一出口 IP，交替重试确认稳定）：
+    #   主网 /fapi/v1/fundingRate: limit=500 → 200（>500 被服务端钳到 500）
+    #   demo /fapi/v1/fundingRate: limit≤200 → 200，limit≥210 → **403**
+    # 同一 host 的 klines/exchangeInfo 无此限制 —— 是 fundingRate 路由级的
+    # WAF 阈值，不是 IP 封禁。用一个全局值必然踩雷：取 500 则 demo 全量预热
+    # 100% 403（实测 40 币全部重试耗尽）。
+    mainnet_funding_page_size: int = 500
+    demo_funding_page_size: int = 200
+
+    def futures_base_for(self, venue: str) -> str:
+        """该 venue 的永续端点。"""
+        return (
+            self.demo_futures_base
+            if venue == Venue.DEMO.value
+            else self.mainnet_futures_base
+        )
+
+    def spot_base_for(self, venue: str) -> str:
+        """该 venue 的现货端点。"""
+        return self.demo_spot_base if venue == Venue.DEMO.value else self.mainnet_spot_base
+
+    def funding_page_size_for(self, venue: str) -> int:
+        """该 venue 的资金费分页单页条数（demo 的 WAF 阈值更低）。"""
+        return (
+            self.demo_funding_page_size
+            if venue == Venue.DEMO.value
+            else self.mainnet_funding_page_size
+        )
+
+    def __post_init__(self) -> None:
+        for name in (
+            "mainnet_futures_base",
+            "mainnet_spot_base",
+            "demo_futures_base",
+            "demo_spot_base",
+        ):
+            url = getattr(self, name)
+            if not url.startswith("https://"):
+                # 明文端点会泄露 symbol 查询内容，且与 api 节校验口径一致
+                raise ConfigError(f"universe.{name} 必须使用 https，当前: {url}")
+        for name, maximum in (
+            ("mainnet_funding_page_size", 500),
+            ("demo_funding_page_size", 200),
+        ):
+            value = getattr(self, name)
+            # 服务端单次返回上限 500；demo fundingRate 的 WAF 阈值为 200。
+            # 按 venue 校验，避免误配后全量预热稳定触发 403。
+            if not 1 <= value <= maximum:
+                raise ConfigError(f"universe.{name} 必须在 [1,{maximum}]，当前 {value}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +407,8 @@ class ExecutionConfig:
     # 对账忽略的非策略资产（如 demo 平台发放的 USDC）；只跳过无本地期望持仓的 symbol
     reconcile_ignore_assets: list[str] = field(default_factory=list)
     reconciliation_interval_seconds: int = 30
+    # Spot/Perp 持仓对账相对容差；0.001 = 0.1%，另取交易步长下限
+    reconciliation_qty_tolerance_pct: float = 0.001
     max_market_data_age_seconds: float = 5.0
     max_leg_slippage_pct: float = 0.001
     hedge_tolerance_pct: float = 0.005
@@ -353,6 +426,11 @@ class ExecutionConfig:
     # 看门狗以非 0 码终止进程，systemd Restart=always 拉起后从账本恢复。
     # 必须大于正常单轮最坏耗时（对账/候选刷新/权重休眠），默认 300s。
     watchdog_timeout_seconds: float = 300.0
+    # RECOVERY 卡死升级阈值（秒）：启动后（曾达 RUNNING）持续停留在 RECOVERY
+    # 超过该时长，判定自愈路径失效（如用户流 untrusted 卡死短路了自动解除），
+    # 优雅停机并以退出码 1 结束，交给 systemd Restart 重新预检+对账。
+    # 启动阶段（从未 RUNNING）不计入，避免慢启动（补账/epoch 构建）误杀。
+    recovery_escalation_seconds: float = 900.0
     # WebUI 实时仪表盘（live run 进程内独立守护线程；只读，故障与主循环隔离）
     webui_enabled: bool = True
     webui_host: str = "0.0.0.0"  # noqa: S104 —— 需局域网/tailscale 访问，见 config.yaml 注释
@@ -398,6 +476,15 @@ class ExecutionConfig:
         if self.max_consecutive_tick_errors < 1:
             raise ConfigError(
                 f"execution.max_consecutive_tick_errors 必须 >= 1，当前 {self.max_consecutive_tick_errors}"
+            )
+        if self.recovery_escalation_seconds <= 0:
+            raise ConfigError(
+                f"execution.recovery_escalation_seconds 必须 > 0，当前 {self.recovery_escalation_seconds}"
+            )
+        if self.reconciliation_qty_tolerance_pct < 0:
+            raise ConfigError(
+                "execution.reconciliation_qty_tolerance_pct 必须 >= 0，"
+                f"当前 {self.reconciliation_qty_tolerance_pct}"
             )
         if not 1_000 <= self.recv_window_ms <= 60_000:
             raise ConfigError(f"recv_window_ms 必须在 [1000, 60000]，当前 {self.recv_window_ms}")
@@ -477,6 +564,7 @@ class Config:
     api: ApiConfig
     logging: LoggingConfig
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    universe: UniverseConfig = field(default_factory=UniverseConfig)
     source_path: Path | None = None
 
     def resolved_path(self, path: Path) -> Path:
@@ -593,6 +681,9 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         user_stream_fresh_seconds=float(sec.get("user_stream_fresh_seconds", 15.0)),
         reconcile_ignore_assets=[str(a).upper() for a in sec.get("reconcile_ignore_assets", [])],
         reconciliation_interval_seconds=int(sec.get("reconciliation_interval_seconds", 30)),
+        reconciliation_qty_tolerance_pct=float(
+            sec.get("reconciliation_qty_tolerance_pct", 0.001)
+        ),
         max_market_data_age_seconds=float(sec.get("max_market_data_age_seconds", 5.0)),
         max_leg_slippage_pct=float(sec.get("max_leg_slippage_pct", 0.001)),
         hedge_tolerance_pct=float(sec.get("hedge_tolerance_pct", 0.005)),
@@ -615,10 +706,30 @@ def _build_execution(raw: dict[str, Any]) -> ExecutionConfig:
         snapshot_interval_seconds=int(sec.get("snapshot_interval_seconds", 30)),
         max_consecutive_tick_errors=int(sec.get("max_consecutive_tick_errors", 10)),
         watchdog_timeout_seconds=float(sec.get("watchdog_timeout_seconds", 300.0)),
+        recovery_escalation_seconds=float(sec.get("recovery_escalation_seconds", 900.0)),
         webui_enabled=bool(sec.get("webui_enabled", True)),
         webui_host=str(sec.get("webui_host", "0.0.0.0")),  # noqa: S104
         webui_port=int(sec.get("webui_port", 8888)),
         report_dir=Path(sec.get("report_dir", "reports/live")),
+    )
+
+
+def _build_universe(raw: dict[str, Any]) -> UniverseConfig:
+    """构建 ``universe`` 节。缺失整节时用默认端点（保持旧配置可加载）。"""
+    sec = _section(raw, "universe")
+    venues = _section(sec, "venues")
+    mainnet = _section(venues, "mainnet")
+    demo = _section(venues, "demo")
+    d = UniverseConfig()
+    return UniverseConfig(
+        mainnet_futures_base=str(mainnet.get("futures_base", d.mainnet_futures_base)),
+        mainnet_spot_base=str(mainnet.get("spot_base", d.mainnet_spot_base)),
+        demo_futures_base=str(demo.get("futures_base", d.demo_futures_base)),
+        demo_spot_base=str(demo.get("spot_base", d.demo_spot_base)),
+        mainnet_funding_page_size=int(
+            mainnet.get("funding_page_size", d.mainnet_funding_page_size)
+        ),
+        demo_funding_page_size=int(demo.get("funding_page_size", d.demo_funding_page_size)),
     )
 
 
@@ -686,6 +797,7 @@ def load_config(path: str | Path | None = None) -> Config:
         api=_build_api(raw),
         logging=_build_logging(raw),
         execution=_build_execution(raw),
+        universe=_build_universe(raw),
         source_path=path.resolve(),
     )
 
@@ -705,5 +817,6 @@ __all__ = [
     "RiskConfig",
     "SelectionConfig",
     "StrategyConfig",
+    "UniverseConfig",
     "load_config",
 ]

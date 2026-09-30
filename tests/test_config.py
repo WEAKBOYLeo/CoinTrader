@@ -48,6 +48,8 @@ class TestLoadConfig:
         assert config.strategy.exit.exit_annualized_rate == pytest.approx(0.03)
         assert config.strategy.exit.late_exit_annualized_rate == pytest.approx(0.10)
         assert config.strategy.exit.replacement_premium_under_30 == pytest.approx(1.0)
+        assert config.universe.mainnet_funding_page_size == 500
+        assert config.universe.demo_funding_page_size == 200
     def test_missing_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError, match="不存在"):
             load_config(tmp_path / "nonexistent.yaml")

@@ -18,7 +18,7 @@ import logging
 import time
 from collections.abc import Callable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..domain.market import DataQuality
 from ..domain.risk import ApprovedIntent
@@ -37,6 +37,25 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型
 logger = logging.getLogger(__name__)
 
 __all__ = ["ServiceRunner"]
+
+
+class _PhaseTimer:
+    """tick 分阶段耗时诊断：单阶段 >10s 告警（限流排队/403 重试/网络卡点定位）。"""
+
+    def __init__(self, name: str, now_fn: Callable[[], float]) -> None:
+        self._name = name
+        self._now = now_fn
+        self._t0 = 0.0
+
+    def __enter__(self) -> _PhaseTimer:
+        self._t0 = self._now()
+        return self
+
+    def __exit__(self, *exc: object) -> Literal[False]:
+        elapsed = self._now() - self._t0
+        if elapsed > 10.0:
+            logger.warning("【tick 阶段耗时】%s: %.1fs", self._name, elapsed)
+        return False
 
 
 class ServiceRunner:
@@ -89,7 +108,15 @@ class ServiceRunner:
         stale = [s for s in svc.streams if not s.is_fresh]
         if stale:
             detail = ", ".join(f"{s.market}（代次 {s.generation}）" for s in stale)
-            svc.enter_recovery(f"用户流不新鲜/不可信: {detail}")
+            reason = f"用户流不新鲜/不可信: {detail}"
+            svc.enter_recovery(reason)
+            svc._update_recovery_diagnostic(
+                reason,
+                code="USER_STREAM_UNTRUSTED",
+                details={"streams": [{"market": s.market, "generation": s.generation} for s in stale]},
+                retry=False,
+            )
+            svc._persist_runtime_state()
             return {"state": "RECOVERY", "reason": svc._recovery_reason}
 
         # RECOVERY 自动解除（长跑自愈）：全部用户流恢复新鲜后做一次恢复对账，
@@ -99,6 +126,8 @@ class ServiceRunner:
             interval_ms = int(svc.config.execution.reconciliation_interval_seconds * 1000)
             if now_ms - svc._last_reconcile_ms < interval_ms:
                 return {"state": "RECOVERY", "reason": svc._recovery_reason}
+            svc._record_recovery_retry(now_ms)
+            svc._persist_runtime_state()
             bundle = None
             if svc.exch_sync is not None:
                 try:
@@ -114,6 +143,11 @@ class ServiceRunner:
                     svc._ledger_sync_error = "; ".join(bad[:3])
                 except SyncCaptureError as exc:
                     svc._recovery_reason = f"capture 失败: {exc}"
+                    svc._update_recovery_diagnostic(
+                        svc._recovery_reason,
+                        code="EXCHANGE_CAPTURE_FAILED",
+                        retry=False,
+                    )
                     svc._persist_runtime_state()
                     return {"state": "RECOVERY", "reason": svc._recovery_reason}
             result = svc.reconciler.run(reason="recovery_check", snapshot=bundle)
@@ -127,6 +161,19 @@ class ServiceRunner:
                         if not svc._ledger_sync_ok
                         else f"风控闸门未恢复: {svc.gate.state.value}"
                     )
+                )
+                code = (
+                    "RECONCILIATION_MISMATCH"
+                    if not result.can_open
+                    else "LEDGER_SYNC_FAILED"
+                    if not svc._ledger_sync_ok
+                    else "RISK_GATE"
+                )
+                svc._update_recovery_diagnostic(
+                    svc._recovery_reason,
+                    code=code,
+                    details={"mismatches": list(result.mismatches)},
+                    retry=False,
                 )
                 svc._persist_runtime_state()
                 return {"state": "RECOVERY", "reason": svc._recovery_reason}
@@ -166,41 +213,45 @@ class ServiceRunner:
         # 周期性对账（§8.5；T3：复用短期 capture bundle + 增量 facts 同步）
         interval_ms = int(svc.config.execution.reconciliation_interval_seconds * 1000)
         if now_ms - svc._last_reconcile_ms >= interval_ms:
-            if not svc._periodic_reconcile(now_ms):
-                svc._persist_runtime_state()
-                return {"state": "RECOVERY", "reason": svc._recovery_reason}
+            with _PhaseTimer("reconcile", svc._now):
+                if not svc._periodic_reconcile(now_ms):
+                    svc._persist_runtime_state()
+                    return {"state": "RECOVERY", "reason": svc._recovery_reason}
             # 对账通过后以交易所真实持仓为准（§7.3 去重基础）
-            svc._refresh_held()
+            with _PhaseTimer("refresh_held", svc._now):
+                svc._refresh_held()
 
         # 周期性采样：账户快照 / 持仓快照 / 资金费（§8.5 至少 30s）
         snapshot_ms = int(svc.config.execution.snapshot_interval_seconds * 1000)
         if svc.strategy is not None and now_ms - svc._last_snapshot_ms >= snapshot_ms:
-            svc._last_snapshot_ms = now_ms
-            bundle = None
-            if svc.exch_sync is not None:
+            with _PhaseTimer("snapshot", svc._now):
+                svc._last_snapshot_ms = now_ms
+                bundle = None
+                if svc.exch_sync is not None:
+                    try:
+                        # 复用窗口内返回同一 bundle（single-flight），不重复拉 API
+                        bundle = svc.exch_sync.capture()
+                    except SyncCaptureError:
+                        bundle = None
                 try:
-                    # 复用窗口内返回同一 bundle（single-flight），不重复拉 API
-                    bundle = svc.exch_sync.capture()
-                except SyncCaptureError:
-                    bundle = None
-            try:
-                svc._refresh_account_state(source="periodic", bundle=bundle)
-            except (AccountStateError, StoreError) as exc:
-                svc._account_result = None
-                svc.store.record_risk_decision("ACCOUNT_STATE", False, str(exc))
-                svc._on_alert("ACCOUNT_STATE_UNKNOWN", f"账户快照失败: {exc}（开仓将被拒绝）")
-            quotes = svc._fetch_quotes()
-            try:
-                svc._sample_position_snapshots(quotes)
-                svc._collect_funding_cashflows()
-            except StoreError as exc:
-                svc.enter_recovery(f"账本写入失败: {exc}")
-                return {"state": "RECOVERY", "reason": svc._recovery_reason}
+                    svc._refresh_account_state(source="periodic", bundle=bundle)
+                except (AccountStateError, StoreError) as exc:
+                    svc._account_result = None
+                    svc.store.record_risk_decision("ACCOUNT_STATE", False, str(exc))
+                    svc._on_alert("ACCOUNT_STATE_UNKNOWN", f"账户快照失败: {exc}（开仓将被拒绝）")
+                quotes = svc._fetch_quotes()
+                try:
+                    svc._sample_position_snapshots(quotes)
+                    svc._collect_funding_cashflows()
+                except StoreError as exc:
+                    svc.enter_recovery(f"账本写入失败: {exc}")
+                    return {"state": "RECOVERY", "reason": svc._recovery_reason}
 
         # 候选刷新：每 tick 调用；strategy 内部按各币结算周期判超龄、按分钟限流量，
         # 无超龄币时纯内存判断（§7.1）
         if svc.strategy is not None:
-            svc.strategy.refresh_candidates()
+            with _PhaseTimer("refresh_candidates", svc._now):
+                svc.strategy.refresh_candidates()
 
         # 无策略协调器：兼容旧 signal_provider 路径（仅测试/过渡期）
         if svc.strategy is None:
@@ -221,17 +272,25 @@ class ServiceRunner:
             return {"state": "RUNNING", "opened": opened, "skipped": skipped, "closed": closed}
 
         # ---- 实时策略路径（工作包一） ----
-        ctx = svc._build_context(now_ms)
+        with _PhaseTimer("build_context", svc._now):
+            ctx = svc._build_context(now_ms)
         try:
-            decisions = svc.strategy.evaluate(ctx)
+            with _PhaseTimer("evaluate", svc._now):
+                decisions = svc.strategy.evaluate(ctx)
             # 动态候选池：PENDING_QUOTE 中间态 → 按需获取新鲜报价后定案；
             # 中间态本身不落账本，只记录最终决策（每 symbol 每轮仍恰好一条）。
             resolved: list[StrategyDecision] = []
-            for decision in decisions:
-                if decision.decision_kind is DecisionKind.PENDING_QUOTE:
-                    quote = svc._quote_fetcher(decision.symbol)
-                    decision = svc.strategy.complete_open(decision.symbol, ctx, quote)
-                resolved.append(decision)
+            with _PhaseTimer("pending_quotes", svc._now):
+                for decision in decisions:
+                    if decision.decision_kind is DecisionKind.PENDING_QUOTE:
+                        quote = svc._quote_fetcher(decision.symbol)
+                        # 闸门时刻 = 定案时的当前时间（非 tick 开场的 ctx.now）：
+                        # 慢 tick（限流/403 重试）下刚接收的报价不得被误判未来时间戳
+                        decision = svc.strategy.complete_open(
+                            decision.symbol, ctx, quote,
+                            gate_now_ms=int(svc._now() * 1000),
+                        )
+                    resolved.append(decision)
             for decision in resolved:
                 svc.store.record_signal_decision(decision)
             decisions = resolved
@@ -273,13 +332,16 @@ class ServiceRunner:
 
             # -- 风险审批（先写 RiskDecision，fail closed） --
             try:
+                # 先取市场快照（内部取报价，可能耗时 10-70s），**之后**再取当前时间：
+                # 参数求值顺序若先算 now_ms 会早于快照生成时刻 → 误判无前瞻违规
+                market = None if intent.is_closing else svc._market_snapshot_for(
+                    symbol, int(svc._now() * 1000)
+                )
                 decision = svc._risk_kernel.approve(
                     intent,
-                    now_ms=now_ms,
+                    now_ms=int(svc._now() * 1000),  # 审批时刻 = 快照生成后的当前
                     safety=svc._safety_state(now_ms),
-                    market=None if intent.is_closing else svc._market_snapshot_for(
-                        symbol, now_ms
-                    ),
+                    market=market,
                     account=None if intent.is_closing else svc._account_snapshot(now_ms),
                     risk_state=svc._risk_state_fn(),
                 )
@@ -452,11 +514,17 @@ class ServiceRunner:
         时优雅停机并返回 False（CLI 以退出码 1 结束，交给 systemd 重启）。
         任一轮成功则计数清零。
 
+        RECOVERY 卡死升级（``execution.recovery_escalation_seconds``）：启动后
+        （曾达 RUNNING）持续停留在 RECOVERY 超过阈值 = 自愈路径失效（如用户流
+        untrusted 卡死短路了自动解除），优雅停机并以退出码 1 结束，systemd
+        重启后重新预检+对账。启动阶段的长 RECOVERY（补账/epoch 构建）不计入。
+
         Returns:
             True = 正常停止（stop_check/外部信号）；False = 连续 tick 失败超限。
         """
         svc = self._service
         max_errors = svc.config.execution.max_consecutive_tick_errors
+        escalation_ms = int(svc.config.execution.recovery_escalation_seconds * 1000)
         consecutive_errors = 0
         from ..live.watchdog import LoopWatchdog
 
@@ -483,6 +551,19 @@ class ServiceRunner:
                         return False
                 else:
                     consecutive_errors = 0
+                    # RECOVERY 卡死升级：tick 正常返回 RECOVERY 但自愈分支永远
+                    # 跑不到（如 stale 分支每 tick 提前 return）时，进程会无限
+                    # 等待。超过阈值就停机交 systemd 重启（重新预检+对账）。
+                    elapsed = svc.recovery_elapsed_ms()
+                    if elapsed is not None and elapsed >= escalation_ms:
+                        svc._on_alert(
+                            "RECOVERY_STUCK",
+                            f"RECOVERY 持续 {elapsed / 1000:.0f}s 超过阈值 "
+                            f"{escalation_ms / 1000:.0f}s，自愈失效，优雅停机等待守护进程重启。"
+                            f"原因: {svc._recovery_reason}",
+                        )
+                        svc.stop()
+                        return False
                 time.sleep(tick_seconds)
         finally:
             watchdog.stop()

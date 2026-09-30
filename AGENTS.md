@@ -21,6 +21,9 @@ uv run cointrader backtest   # 组合回测，报告默认写 reports/backtest/
 
 ## 硬性规则
 
+## 硬性规则
+
+- **venue 与回测契约**：币池来源按 venue 隔离（`src/cointrader/data/venue.py`）。venue 由 `execution.mode` 推导（paper/testnet/shadow → demo，live → mainnet），**不显式配置**。demo 与主网是两个独立合约清单（实测 527 vs 528，各 65/66 个互不相同），所以缓存键（`client.ckey()`）与历史覆盖 namespace（`coverage_v1_<venue>` / `hist_segments_v1_<venue>`）都必须带 venue；新增任何缓存键一律走 `ckey()`，禁止裸 `make_key()`。**回测恒用 mainnet 历史**，`backtest/` 不得接收 venue 参数，也不允许把 demo 池喂给回测。
 - 提交前 `uv run pytest` 必须全绿；`tests/test_safety.py`（安全静态扫描）与 `tests/test_no_lookahead.py`（前瞻偏差证伪）失败即未完成。
 - 不要引入让下层包依赖 `execution` 的改动；会破坏依赖方向约束。
 - 费率假设变更必须同步改 `research/costs.py` 及其测试。

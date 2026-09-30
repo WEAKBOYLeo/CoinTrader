@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -49,11 +50,13 @@ from ..execution.sync import ExchangeStateSynchronizer, SyncCaptureError
 from ..execution.user_stream import PollingUserStream, UserStream
 from ..market_data.service import MarketDataService
 from ..observability.control import ControlPublisher
+from ..observability.recovery import classify_recovery_reason
 from ..portfolio.planner import PortfolioPlanner
 from ..rate_limit import rate_limit_diagnostics_to_dict
 from ..reporting.pnl import PnlAggregator
 from ..risk.state_machine import SafetyStateMachine
 from ..strategy.adapter import decisions_to_proposal
+from ..strategy.funding_carry import CandidateInput, FundingCarryEvaluator
 from .account_state import AccountStateBuilder, AccountStateError, AccountStateResult
 from .market_sync import MarketDataSynchronizer
 from .portfolio import Signal
@@ -227,6 +230,15 @@ class LiveService:
         self._control = ControlPublisher(subscribers=(self._apply_control_command,))
         self._state = ServiceState.RECOVERY
         self._recovery_reason = ""
+        self._recovery_entered_ms: int | None = None
+        self._recovery_last_retry_ms: int | None = None
+        self._recovery_retry_count = 0
+        self._recovery_diagnostic: dict[str, Any] = {}
+        # RECOVERY 卡死升级：只在曾达 RUNNING 后开始计时（启动预检/补账的
+        # 长 RECOVERY 是合法的，不得误杀）；每次 RECOVERY→非 RECOVERY→RECOVERY
+        # 重新起算，RUNNING 时清零。
+        self._recovery_since_ms: int | None = None
+        self._reached_running = False
         self._last_reconcile_ms = 0
         self._started = False
         # T3：scan epoch 同步器（选币闸门）与交易所事实同步器（账本恢复）
@@ -247,6 +259,16 @@ class LiveService:
             return ServiceState.HALTED
         return self._state
 
+    def recovery_elapsed_ms(self) -> int | None:
+        """启动后（曾达 RUNNING）持续停留在 RECOVERY 的毫秒数；未计时返回 None。
+
+        供 runner 的 RECOVERY 卡死升级判定（``recovery_escalation_seconds``）：
+        自愈路径失效（如用户流 untrusted 卡死）时不再无限等待，停机交 systemd 重启。
+        """
+        if not self._reached_running or self._recovery_since_ms is None:
+            return None
+        return max(0, int(self._now() * 1000) - self._recovery_since_ms)
+
     # -- 控制面（T4：SafetyStateMachine 唯一写入者） ------------------------
 
     def _apply_control_command(self, cmd: ControlCommand) -> None:
@@ -263,17 +285,60 @@ class LiveService:
         mapped = _SAFETY_TO_SERVICE[self._safety_sm.state.state]
         if mapped is not self._state:
             self._state = mapped
+            if mapped is ServiceState.RUNNING:
+                self._reached_running = True
+                self._recovery_since_ms = None
+            elif mapped is ServiceState.RECOVERY:
+                if self._reached_running:
+                    self._recovery_since_ms = int(self._now() * 1000)
             self._persist_runtime_state()
 
     def _publish_recovery(self, reason: str, *, source: str = "service") -> None:
         self._control.recovery(reason=reason or "未指定原因（fail closed）", source=source)
+
+    def _update_recovery_diagnostic(
+        self,
+        reason: str | None = None,
+        *,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+        retry: bool = True,
+    ) -> None:
+        """更新当前 Recovery 错误块；不改变安全状态迁移。"""
+        now_ms = int(self._now() * 1000)
+        if self._recovery_entered_ms is None:
+            self._recovery_entered_ms = now_ms
+        if retry:
+            self._recovery_last_retry_ms = now_ms
+            self._recovery_retry_count += 1
+        message = reason or self._recovery_reason or "未指定原因（fail closed）"
+        self._recovery_diagnostic = {
+            "code": code or classify_recovery_reason(message),
+            "message": message,
+            "entered_at_ms": self._recovery_entered_ms,
+            "last_retry_at_ms": self._recovery_last_retry_ms,
+            "retry_count": self._recovery_retry_count,
+            "details": details or {},
+        }
+
+    def _record_recovery_retry(self, now_ms: int | None = None) -> None:
+        """记录一次恢复检查尝试，供 WebUI/CLI 展示最近重试时间。"""
+        if self._recovery_entered_ms is None:
+            self._recovery_entered_ms = now_ms or int(self._now() * 1000)
+        self._recovery_last_retry_ms = now_ms or int(self._now() * 1000)
+        self._recovery_retry_count += 1
+        if self._recovery_diagnostic:
+            self._recovery_diagnostic["last_retry_at_ms"] = self._recovery_last_retry_ms
+            self._recovery_diagnostic["retry_count"] = self._recovery_retry_count
 
     def enter_recovery(self, reason: str) -> None:
         """进入 RECOVERY：禁止开新仓。幂等；经 ControlPublisher → 状态机。"""
         if self._safety_sm.state.state is SafetyStateKind.STOPPED:
             return
         self._recovery_reason = reason
-        if self._safety_sm.state.state is not SafetyStateKind.RECOVERY:
+        already_recovering = self._safety_sm.state.state is SafetyStateKind.RECOVERY
+        self._update_recovery_diagnostic(reason, retry=not already_recovering)
+        if not already_recovering:
             self._publish_recovery(reason)
         self._on_alert("RECOVERY", reason)
         self._persist_runtime_state()
@@ -295,6 +360,11 @@ class LiveService:
             )
         self._control.resume_after_checks(reason=reason or "预检+对账通过", source=source)
         self._recovery_reason = ""
+        self._recovery_entered_ms = None
+        self._recovery_last_retry_ms = None
+        self._recovery_retry_count = 0
+        self._recovery_diagnostic = {}
+        self._persist_runtime_state()
 
     def apply_gate_state(self) -> None:
         """风控闸门（含 KILL_SWITCH 文件）→ 控制面命令（加严方向）。
@@ -408,7 +478,7 @@ class LiveService:
             }
         # T4：市场数据就绪度（epoch status/coverage/cutoff）
         market_data: dict[str, Any] | None = None
-        if self.strategy is not None and self.synchronizer is not None:
+        if self.synchronizer is not None:
             market_data = self._market_data_readiness(now_ms)
         market_data_envelope: dict[str, Any] | None = None
         if market_data is not None:
@@ -438,6 +508,7 @@ class LiveService:
         return {
             "state": self.state.value,
             "recovery_reason": self._recovery_reason,
+            "recovery_error": dict(self._recovery_diagnostic) if self._recovery_diagnostic else None,
             "run_id": self.run_id or None,
             "mode": self.mode,
             "can_open": self.can_open,
@@ -468,6 +539,7 @@ class LiveService:
             "rate_limits_envelope": rate_limits_envelope,
             "market_data": market_data,
             "market_data_envelope": market_data_envelope,
+            "pool": self._pool_snapshot(now_ms),
             "freshness": freshness,
             "freshness_envelope": {
                 "source": "LiveService.web_snapshot（服务内存，仅诊断）",
@@ -567,6 +639,13 @@ class LiveService:
                     cutoff_ms = epochs[0].get("decision_cutoff_ms")
             except Exception:  # noqa: BLE001
                 cutoff_ms = None
+            stage_reader = getattr(synchronizer, "stage_readiness", None)
+            stages = stage_reader(now_ms) if callable(stage_reader) else {
+                "stages": [],
+                "as_of_ms": now_ms,
+                "age_ms": None,
+                "freshness": "UNKNOWN",
+            }
             return {
                 "epoch_id": str(rd.epoch_id),
                 "status": str(rd.status.value),
@@ -579,10 +658,195 @@ class LiveService:
                 "age_ms": int(rd.age_ms),
                 "reason": str(rd.reason or ""),
                 "decision_cutoff_ms": cutoff_ms,
+                "stages": stages.get("stages", []),
+                "stages_as_of_ms": stages.get("as_of_ms"),
+                "stages_age_ms": stages.get("age_ms"),
+                "stages_freshness": stages.get("freshness", "UNKNOWN"),
             }
         except Exception:  # noqa: BLE001
             logger.debug("epoch 就绪度快照失败", exc_info=True)
             return None
+
+    def _pool_snapshot(self, now_ms: int) -> dict[str, Any] | None:
+        """币池页面只读 projection：epoch、端点健康、阶段和最终候选。"""
+        synchronizer = self.synchronizer
+        if synchronizer is None:
+            return None
+        try:
+            from ..data.venue import venue_for_execution_mode
+
+            data = getattr(self.strategy, "data", None)
+            venue = ""
+            venue_fn = getattr(data, "venue_name", None)
+            if callable(venue_fn):
+                venue = str(venue_fn())
+            if not venue:
+                venue = venue_for_execution_mode(self.config.execution.mode).value
+
+            readiness = synchronizer.readiness(now_ms)
+            latest = synchronizer.latest()
+            if readiness is None:
+                return {
+                    "as_of_ms": now_ms,
+                    "venue": venue,
+                    "epoch": None,
+                    "api_sources": self._pool_api_sources(now_ms),
+                    "stages": [],
+                    "candidates": [],
+                    "quality": "UNKNOWN",
+                    "error": "尚无 scan epoch",
+                }
+            epoch_status = readiness.status.value
+            epoch = {
+                "id": readiness.epoch_id,
+                "status": epoch_status,
+                "created_ms": latest.created_ms if latest and latest.epoch_id == readiness.epoch_id else None,
+                "completed_ms": latest.completed_ms if latest and latest.epoch_id == readiness.epoch_id else None,
+                "decision_cutoff_ms": latest.decision_cutoff_ms if latest and latest.epoch_id == readiness.epoch_id else None,
+                "age_ms": readiness.age_ms,
+                "reason": readiness.reason,
+                "expected": readiness.expected,
+                "completed": readiness.completed,
+                "excluded_count": readiness.excluded_count,
+                "failed_count": readiness.failed_count,
+            }
+            stage_data = synchronizer.stage_readiness(now_ms)
+            candidates = self._pool_candidates(synchronizer, readiness, now_ms)
+            quality = "OK" if readiness.can_rank else (
+                "STALE" if epoch_status == "EXPIRED" else "DEGRADED"
+            )
+            return {
+                "as_of_ms": now_ms,
+                "venue": venue,
+                "epoch": epoch,
+                "api_sources": self._pool_api_sources(now_ms),
+                "stages": stage_data.get("stages", []),
+                "stages_as_of_ms": stage_data.get("as_of_ms"),
+                "stages_age_ms": stage_data.get("age_ms"),
+                "stages_freshness": stage_data.get("freshness", "UNKNOWN"),
+                "candidates": candidates,
+                "quality": quality,
+                "error": readiness.reason if not readiness.can_rank else "",
+            }
+        except Exception as exc:  # noqa: BLE001 —— 币池块局部降级
+            logger.debug("币池 projection 构建失败", exc_info=True)
+            return {
+                "as_of_ms": now_ms,
+                "venue": "",
+                "epoch": None,
+                "api_sources": None,
+                "stages": [],
+                "candidates": [],
+                "quality": "UNKNOWN",
+                "error": f"币池诊断不可用: {type(exc).__name__}",
+            }
+
+    def _pool_api_sources(self, now_ms: int) -> list[dict[str, Any]] | None:
+        data = getattr(self.strategy, "data", None)
+        client = getattr(data, "client", None)
+        stats = getattr(client, "stats", None)
+        reader = getattr(stats, "endpoint_health", None)
+        if not callable(reader):
+            return None
+        try:
+            result = reader(now_ms=now_ms)
+            return result if isinstance(result, list) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _pool_candidates(
+        self, synchronizer: MarketDataSynchronizer, readiness: Any, now_ms: int
+    ) -> list[dict[str, Any]]:
+        if not readiness.can_rank:
+            return []
+        snapshots = synchronizer.snapshots_for(readiness.epoch_id)
+        premium = synchronizer.premium_snapshots()
+        evaluator = FundingCarryEvaluator(config=self.config, now_fn=self._now)
+        entry = self.config.strategy.entry
+        selection = self.config.strategy.selection
+        threshold = max(
+            Decimal(str(entry.min_trailing_annualized)),
+            Decimal(str(entry.min_annualized_rate)),
+        )
+        rows: list[dict[str, Any]] = []
+        for symbol, snap in sorted(snapshots.items()):
+            if snap.error or snap.volume_status != "FETCHED":
+                continue
+            if snap.quote_volume_3d_avg < Decimal(str(selection.min_quote_volume_3d_avg)):
+                continue
+            candidate = CandidateInput(
+                symbol=symbol,
+                rates=snap.rates,
+                mark_prices=snap.mark_prices,
+                timestamps=snap.timestamps,
+                interval_hours=snap.interval_hours,
+                volume_3d_avg=snap.quote_volume_3d_avg,
+                refreshed_ts_ms=snap.fetched_ms,
+            )
+            trailing, streak = evaluator.entry_metrics(candidate)
+            if trailing < threshold or streak < entry.min_consecutive_positive:
+                continue
+            avg = (
+                sum(snap.rates[-entry.lookback_periods:], Decimal("0"))
+                / Decimal(entry.lookback_periods)
+                if len(snap.rates) >= entry.lookback_periods else None
+            )
+            live = premium.get(symbol, {})
+            blockers = self._pool_open_blockers()
+            if self.can_open:
+                blockers.extend(("仍需提交前双腿报价 freshness", "持仓槽位/去重条件需在决策时确认"))
+            current_epoch = synchronizer.latest()
+            cutoff_ms = (
+                current_epoch.decision_cutoff_ms
+                if current_epoch is not None and current_epoch.epoch_id == readiness.epoch_id
+                else None
+            )
+            rows.append({
+                "symbol": symbol,
+                "pool_status": "READY",
+                "current_funding_rate": live.get("current_funding_rate"),
+                "latest_settled_rate": str(snap.latest_settled_rate) if snap.latest_settled_rate is not None else None,
+                "average_rate_8h": str(avg) if avg is not None else None,
+                "trailing_annualized": str(trailing),
+                "threshold_min_trailing_annualized": str(entry.min_trailing_annualized),
+                "threshold_min_annualized_rate": str(entry.min_annualized_rate),
+                "effective_threshold": str(threshold),
+                "threshold_distance": str(max(threshold - trailing, Decimal("0"))),
+                "threshold_excess": str(max(trailing - threshold, Decimal("0"))),
+                "consecutive_positive_periods": streak,
+                "required_consecutive_positive": entry.min_consecutive_positive,
+                "quote_volume_3d_avg": str(snap.quote_volume_3d_avg),
+                "quote_volume_threshold": str(selection.min_quote_volume_3d_avg),
+                "volume_status": snap.volume_status,
+                "open_qualification": "POOL_PASS_NOT_OPEN_GUARANTEE",
+                "open_blockers": blockers,
+                "funding_updated_ms": snap.fetched_ms,
+                "latest_settled_ms": snap.latest_settled_ms,
+                "premium_fetched_ms": live.get("fetched_ms"),
+                "next_funding_time_ms": live.get("next_funding_time_ms"),
+                "volume_window_end_ms": snap.volume_window_end_ms,
+                "settle_interval_hours": snap.settle_interval_hours,
+                "epoch_id": readiness.epoch_id,
+                "decision_cutoff_ms": cutoff_ms,
+            })
+        rows.sort(key=lambda row: (-Decimal(row["trailing_annualized"]), row["symbol"]))
+        return rows
+
+    def _pool_open_blockers(self) -> list[str]:
+        blockers: list[str] = []
+        if self.state is not ServiceState.RUNNING:
+            blockers.append(f"服务状态 {self.state.value}")
+        if not self._reconcile_ok:
+            blockers.append("最近对账未通过")
+        if not self._ledger_sync_ok:
+            blockers.append("账本事实同步未通过")
+        if self._account_result is None or not self._account_result.complete:
+            blockers.append("账户快照未知/不完整")
+        if self.gate.state is not HaltState.NORMAL:
+            blockers.append(f"风控闸门 {self.gate.state.value}")
+        if not all(s.is_fresh for s in self.streams):
+            blockers.append("用户流/账户数据不新鲜")
+        return blockers
 
     def _check_leverage_margin(
         self, symbol: str, want_lev: int, want_margin: str
@@ -739,7 +1003,15 @@ class LiveService:
         self._last_reconcile_ms = now_ms
         self._reconcile_ok = result.can_open
         if not result.can_open:
-            self.enter_recovery(f"周期对账不一致: {list(result.mismatches)}")
+            reason = f"周期对账不一致: {list(result.mismatches)}"
+            self.enter_recovery(reason)
+            self._update_recovery_diagnostic(
+                reason,
+                code="RECONCILIATION_MISMATCH",
+                details={"mismatches": list(result.mismatches)},
+                retry=False,
+            )
+            self._persist_runtime_state()
             return False
         return True
 
@@ -883,11 +1155,24 @@ class LiveService:
             self.store.set_runtime_state("run_id", self.run_id)
             self.store.set_runtime_state("service_state", self.state.value)
             self.store.set_runtime_state("recovery_reason", self._recovery_reason)
+            self.store.set_runtime_state(
+                "recovery_diagnostic",
+                json.dumps(self._recovery_diagnostic, ensure_ascii=False, default=str),
+            )
+            self.store.set_runtime_state(
+                "recovery_last_retry_ms",
+                str(self._recovery_last_retry_ms or ""),
+            )
+            self.store.set_runtime_state("recovery_retry_count", str(self._recovery_retry_count))
             self.store.set_runtime_state("last_reconcile_ms", str(self._last_reconcile_ms))
             self.store.set_runtime_state(
                 "account_snapshot_ms", str(self._account_result.ts_ms if self._account_result else 0)
             )
             self.store.set_runtime_state("can_open", "1" if (self._reconcile_ok and self._state is ServiceState.RUNNING) else "0")
+            if self._recovery_since_ms is not None:
+                self.store.set_runtime_state("recovery_since_ms", str(self._recovery_since_ms))
+            else:
+                self.store.set_runtime_state("recovery_since_ms", "")
             self.store.set_runtime_state("mode", self.mode)
             if self._account_result is not None:
                 self.store.set_runtime_state(
@@ -1267,9 +1552,13 @@ class LiveService:
             quote = self._quote_fetcher(symbol)
         except Exception:  # noqa: BLE001 - 报价获取失败 = 市场事实不可信
             quote = None
+        # 新鲜度用**当前时钟**判定（非调用方传入的 tick 时刻）：报价在取数期间
+        # 可能耗时 10-70s（限流排队/403 重试），用取数前的 now 比较会把刚接收的
+        # 报价误判为"未来时间戳"。now_ms 只用于快照元数据。
+        gate_now_ms = int(self._now() * 1000)
         if (
             quote is None
-            or quote.ts_ms > now_ms
+            or quote.ts_ms > gate_now_ms
             or quote.spot_price is None
             or quote.perp_price is None
         ):
@@ -1292,7 +1581,10 @@ class LiveService:
             )
         return MarketSnapshot(
             snapshot_id=f"quote-{symbol}-{quote.ts_ms}",
-            generated_at_ms=now_ms,
+            # 不变量 decision_cutoff_ms <= generated_at_ms：快照生成时刻用取数后
+            # 时钟（gate_now_ms ≥ quote.ts_ms）；用 tick 开场的 now_ms 会在慢取数
+            # 下被 quote.ts_ms 反超 → 审批异常（实测 RISK_ERROR）。
+            generated_at_ms=gate_now_ms,
             decision_cutoff_ms=quote.ts_ms,
             quality=DataQuality.FRESH,
             quotes=(
@@ -1498,13 +1790,28 @@ def _make_quote_fetcher(public_client: Any) -> Callable[[str], Quote | None]:
     """
 
     def fetch(symbol: str) -> Quote | None:
+        from ..rate_limit import RequestPriority
+
+        # 提交前报价 = 下单关键路径：P0 优先级，不与 P3 候选刷新抢预算排队
         try:
-            spot_price = public_client.spot_price(symbol)
+            t0 = time.time()
+            spot_price = public_client.spot_price(
+                symbol, priority=RequestPriority.P0_CRITICAL
+            )
+            t1 = time.time()
             spot_received_ms = int(time.time() * 1000)
-            perp_payload = public_client.premium_index(symbol)
+            perp_payload = public_client.premium_index(
+                symbol, priority=RequestPriority.P0_CRITICAL
+            )
             # premiumIndex 无 lastPrice；用永续标记价（markPrice，标准参考价）
             perp_price = Decimal(str(perp_payload["markPrice"]))
             perp_received_ms = int(time.time() * 1000)
+            total = time.time() - t0
+            if total > 5.0:
+                logger.warning(
+                    "报价获取耗时 %.1fs（spot %.2fs / perp %.2fs）: %s",
+                    total, t1 - t0, time.time() - t1, symbol,
+                )
             return Quote(
                 spot_price=Decimal(str(spot_price)),
                 perp_price=perp_price,
@@ -1544,6 +1851,7 @@ def build_live_context(  # noqa: PLR0913
     futures_url = futures_base or (api.futures_testnet_base if is_testnet else api.futures_base)
 
     from ..data.binance import BinancePublicClient
+    from ..data.venue import venue_for_execution_mode
     from ..rate_limit import RateLimitCoordinator, RateLimitScope
 
     # T1/T3：同一进程全部 Spot/Futures 请求共享一个限流协调器
@@ -1559,7 +1867,22 @@ def build_live_context(  # noqa: PLR0913
         freeze_seconds=float(data_cfg.rate_limit_freeze_seconds),
         ban_seconds=float(data_cfg.ip_ban_seconds),
     )
-    public_client = BinancePublicClient(api, config.data, rate_limiter=coordinator)
+    public_client = BinancePublicClient(
+        api,
+        config.data,
+        universe=config.universe,
+        # 显式按实际签名端点推导 venue，而不是只看 exc.mode：
+        # 调用方可传入自定义 base（如经典 testnet），端点与 mode 必须一致。
+        venue=venue_for_execution_mode(exc.mode),
+        rate_limiter=coordinator,
+    )
+    logger.info(
+        "公开数据 venue=%s（futures=%s spot=%s，is_testnet=%s）",
+        public_client.venue_name,
+        public_client.futures_base,
+        public_client.spot_base,
+        is_testnet,
+    )
     config_hash = ""
     if config.source_path is not None:
         try:
@@ -1610,7 +1933,13 @@ def build_live_context(  # noqa: PLR0913
         order_ack_timeout_seconds=exc.order_ack_timeout_seconds,
         poll_interval_seconds=0.25,
     )
-    reconciler = Reconciler(store, spot, futures, ignore_assets=exc.reconcile_ignore_assets)
+    reconciler = Reconciler(
+        store,
+        spot,
+        futures,
+        ignore_assets=exc.reconcile_ignore_assets,
+        relative_qty_tolerance=Decimal(str(exc.reconciliation_qty_tolerance_pct)),
+    )
     exch_sync = ExchangeStateSynchronizer(
         store=store, spot=spot, futures=futures, config=config
     )
@@ -1650,9 +1979,88 @@ def build_live_context(  # noqa: PLR0913
                 return f"{name}最小名义额{min_notional}超canary"
         return None
 
+    def _long_history_symbols() -> set[str]:
+        """返回仍需退出指标的 symbol；失败时保守回退空集。"""
+        symbols: set[str] = set()
+        try:
+            symbols.update(
+                str(row["symbol"])
+                for row in store.current_positions()
+                if row.get("symbol")
+            )
+            symbols.update(str(symbol) for symbol in store.expected_positions())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取持仓长历史 symbol 失败: %s", exc)
+        return symbols
+
     # T2/T3：scan epoch 同步器（后台有界并发，交易主循环只读 READY 快照）
-    synchronizer = MarketDataSynchronizer(config=config, data=provider,
-                                          exclusion_fn=_pair_exclusion_reason)
+    def _persist_scan_epoch(epoch: Any, snapshots: Any) -> None:
+        evaluator = FundingCarryEvaluator(config=config)
+        entry_cfg = config.strategy.entry
+        min_volume = Decimal(str(config.strategy.selection.min_quote_volume_3d_avg))
+        threshold = max(
+            Decimal(str(entry_cfg.min_trailing_annualized)),
+            Decimal(str(entry_cfg.min_annualized_rate)),
+        )
+        final_rows = []
+        for snap in snapshots.values():
+            if snap.error or snap.volume_status != "FETCHED" or snap.quote_volume_3d_avg < min_volume:
+                continue
+            candidate = CandidateInput(
+                symbol=snap.symbol,
+                rates=snap.rates,
+                mark_prices=snap.mark_prices,
+                timestamps=snap.timestamps,
+                interval_hours=snap.interval_hours,
+                volume_3d_avg=snap.quote_volume_3d_avg,
+                refreshed_ts_ms=snap.fetched_ms,
+            )
+            trailing, streak = evaluator.entry_metrics(candidate)
+            if trailing < threshold or streak < entry_cfg.min_consecutive_positive:
+                continue
+            final_rows.append(snap)
+        snapshot_rows = [
+            {
+                "symbol": snap.symbol,
+                "interval_hours": snap.interval_hours,
+                "rates": snap.rates,
+                "mark_prices": snap.mark_prices,
+                "timestamps": snap.timestamps,
+                "expected_last_funding_ms": snap.expected_last_funding_ms,
+                "volume_window_end_ms": snap.volume_window_end_ms,
+                "quote_volume_3d_avg": snap.quote_volume_3d_avg,
+                "fetched_ms": snap.fetched_ms,
+                "error": snap.error,
+                "volume_status": snap.volume_status,
+                "settle_interval_hours": snap.settle_interval_hours,
+                "latest_settled_rate": snap.latest_settled_rate,
+                "latest_settled_ms": snap.latest_settled_ms,
+            }
+            for snap in final_rows
+        ]
+        store.record_scan_epoch(
+            epoch_id=epoch.epoch_id,
+            universe_snapshot_ts_ms=epoch.universe_snapshot_ts_ms,
+            decision_cutoff_ms=epoch.decision_cutoff_ms,
+            status=epoch.status.value,
+            expected=epoch.expected_symbols,
+            excluded=dict(epoch.excluded),
+            failed=dict(epoch.failed),
+            created_ms=epoch.created_ms,
+            completed_ms=epoch.completed_ms,
+            expires_ms=epoch.expires_ms,
+            error=epoch.error,
+            snapshots=snapshot_rows,
+        )
+
+    synchronizer = MarketDataSynchronizer(
+        config=config,
+        data=provider,
+        server_time_fn=public_client.futures_time,
+        exclusion_fn=_pair_exclusion_reason,
+        long_history_symbols_fn=_long_history_symbols,
+        epoch_persist_fn=_persist_scan_epoch,
+    )
 
     service = LiveService(
         config=config,
@@ -1669,6 +2077,7 @@ def build_live_context(  # noqa: PLR0913
             strategy_version=executor.strategy_version,
             config_hash=config_hash,
             synchronizer=synchronizer,
+            exclusion_fn=_pair_exclusion_reason,
         ),
         account_builder=AccountStateBuilder(
             config=config, store=store, candidate_symbols=tuple(exc.live_symbols)

@@ -122,6 +122,56 @@ def _ctx(clock: dict, held=None):
     return make_context(held=held or {}, now_ms=clock["t"])
 
 
+class TestTwoPhaseFetch:
+    def test_stages_report_filter_counts_and_status(self, tmp_path: Path) -> None:
+        rates = {"PASSUSDT": RATE_OK, "FAILUSDT": "0.0001"}
+        _, sync, data, _ = _env(tmp_path, rates)
+
+        sync.build_once()
+
+        epoch = sync.latest_ready()
+        assert epoch is not None and epoch.status is ScanEpochStatus.READY
+        assert data.funding_calls == 2
+        assert data.volume_calls == 1
+        stages = {stage["id"]: stage for stage in sync.stage_readiness(NOW_MS)["stages"]}
+        assert stages["universe"]["status"] == "DONE"
+        assert stages["volume_24h"]["output_count"] == 2
+        assert stages["funding_signal"]["output_count"] == 1
+        assert stages["volume_3d"]["output_count"] == 1
+        assert stages["ready"]["output_count"] == 2
+
+    def test_held_symbol_uses_full_exit_window(self, tmp_path: Path) -> None:
+        rates = {"HELDUSDT": RATE_OK, "NEWUSDT": RATE_OK}
+        data = EpochFakeData(
+            {s: make_live_rates(50, rate) for s, rate in rates.items()},
+            universe=tuple(rates),
+            volumes_24h={s: 50e6 for s in rates},
+            now_ms=NOW_MS,
+        )
+        cfg = make_live_config(
+            live_symbols=(),
+            exit_overrides={"exit_lookback_periods": 30},
+            exec_overrides={
+                "candidate_pool_max_symbols": 10,
+                "candidate_refresh_concurrency": 2,
+            },
+        )
+        sync = MarketDataSynchronizer(
+            config=cfg,
+            data=data,
+            server_time_fn=lambda: NOW_MS,
+            now_fn=lambda: NOW,
+            long_history_symbols_fn=lambda: {"HELDUSDT"},
+        )
+
+        sync.build_once()
+
+        requested = dict(data.funding_periods)
+        assert requested["HELDUSDT"] > requested["NEWUSDT"]
+        assert requested["NEWUSDT"] == (4 + 3 + 5)
+        assert requested["HELDUSDT"] == (30 + 5)
+
+
 class TestEpochCompleteness:
     def test_ready_requires_full_cross_section_and_ranks_true_top(
         self, tmp_path
@@ -476,12 +526,17 @@ class TestEightHourNormalization:
             volumes_24h={"FASTUSDT": 50e6},
             now_ms=NOW_MS,
         )
-        cfg = _cfg()
+        cfg = make_live_config(
+            live_symbols=(),
+            exit_overrides={"exit_lookback_periods": 80},
+            exec_overrides={"candidate_pool_max_symbols": 10},
+        )
         sync = MarketDataSynchronizer(
             config=cfg,
             data=data,
             server_time_fn=lambda: cutoff_ms,
             now_fn=lambda: clock["t"],
+            long_history_symbols_fn=lambda: {"FASTUSDT"},
         )
         sync.build_once()
         epoch = sync.latest_ready()

@@ -257,10 +257,10 @@ class TestQuoteFetcher:
         from cointrader.live.service import _make_quote_fetcher
 
         class _FakePublic:
-            def spot_price(self, symbol: str) -> str:  # noqa: ARG002
+            def spot_price(self, symbol: str, **_kw: object) -> str:  # noqa: ARG002
                 return "81000.00"
 
-            def premium_index(self, symbol: str) -> dict:  # noqa: ARG002
+            def premium_index(self, symbol: str, **_kw: object) -> dict:  # noqa: ARG002
                 # 真实 premiumIndex 响应字段（无 lastPrice）
                 return {
                     "symbol": "BTCUSDT",
@@ -280,7 +280,7 @@ class TestQuoteFetcher:
         from cointrader.live.service import _make_quote_fetcher
 
         class _Boom:
-            def spot_price(self, symbol: str):  # noqa: ARG002
+            def spot_price(self, symbol: str, **_kw: object):  # noqa: ARG002
                 raise RuntimeError("api down")
 
         assert _make_quote_fetcher(_Boom())("BTCUSDT") is None
